@@ -1,0 +1,3 @@
+OLGW,10.44.110.154,root,password
+LMF,10.44.110.156,root,password
+PRGW,10.55.110.6,root,password

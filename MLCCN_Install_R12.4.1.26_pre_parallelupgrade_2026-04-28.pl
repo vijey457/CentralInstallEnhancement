@@ -1,0 +1,13346 @@
+#!/usr/bin/perl
+
+use strict;
+#use warnings;
+#use diagnostics;
+use Term::ANSIColor;
+use Term::ANSIColor qw(:constants);
+use File::Basename;
+use File::Path;
+use File::Copy;
+use File::Find;
+use Cwd;
+use Socket;
+use threads;
+use threads::shared;
+use Thread::Semaphore;
+no warnings 'threads';
+
+local $Term::ANSIColor::AUTORESET = 1;
+use constant false => 0;
+use constant true  => 1;
+use constant listen_port => 12345;
+use constant mlccn => "mlccn";
+use constant mer => "mer";
+use constant tsmlccn => "tsmlccn";
+
+use constant LOGFATAL  => 1;
+use constant LOGERROR  => 2;
+use constant LOGINFO   => 4;
+use constant LOGCONS   => 8;
+
+# classes used
+package surecord;
+sub new {
+	my $class = shift;
+	bless {
+		'version' => "",
+			'compname' => "",
+			'sg' => "",
+			'mode' => "",
+			'nodes' => [()],
+			'apps' => [()],
+			'exes' => [()],
+	}, $class;
+}
+
+package main;
+
+# global settings for this release
+my $gLksctp		= true;
+
+my $gContinueOnPrecheckFail = $ENV{NOPRECHECK};
+my $logEnabled = $ENV{LOGENABLED};
+my $gOnlyConfig = $ENV{ONLYCFG};
+
+my $gIsUpgrade			= false;
+my $gProduct			= &getProduct();
+my $gProductLegacy		= "MLC";
+my $gProductLc			= lc($gProduct);
+my $gUser				= "polaris";
+my $gGroup				= "polaris";
+my $gBaseDir            = "/Disk";
+my $gRednNodesDir       = "nodes";
+my $gHomeBaseDir		= "$gBaseDir/home";
+my $gHomeDir			= "$gHomeBaseDir/$gUser";
+my $gBasePath			= "$gHomeDir/$gProductLc";
+my $gReleasePath		= "$gBasePath/release";
+my $gActiverRelLink		= "$gBasePath/active";
+my $gBinDir				= "bin";
+my $gCfgDir				= "cfg";
+my $gActiveBinDir		= "$gActiverRelLink/$gBinDir";
+my $gPkgDir				= "package";
+my $gLibDir				= "lib";
+my $gCompletedFile		= ".done";
+my $gUseOpensafFile		= ".opensaf";
+my $gOsafStartFile 		= "/etc/init.d/opensafd";
+my $gMlcCleanFile       = "/etc/init.d/mlcclean";
+my $gStartSctpFile		= ".sctp";
+my $gBasePortAppMgr 	= 10000;
+if($gProductLc eq tsmlccn) {
+	$gBasePortAppMgr 	= 12000;
+	$gProductLegacy		= "TSMLC";
+}
+my $gBasePort 		= $gBasePortAppMgr + 1000;
+my $gEphemeralStartPort	= 50000;
+my $gEphemeralEndPort	= 65535;
+my $gIniFile 			= "PDEApp.ini";
+my $gDiaIniFile 		= "dia.ini";
+my $gAlarmIniFile 		= "alarmdef.ini";
+my $gLicFilePrefix		= "PLT_LicenseDecoder_";
+my $gInitTabFile		= "/etc/inittab";
+my $gActiveKey			= "active";
+my $gInstalledKey		= "installed";
+my $gInstallApp 		= sprintf("%s_Install", $gProduct);
+my $gAppMgrName			= "AppMgr";
+my $gMlcDaemon			= sprintf("%sdaemon", $gProductLc);
+my $gLogsMgrName		= "LogsManager";
+my $gBRMName		    = "BRM";
+my $gStartAppName		= "startApp";
+my $gVirtIpConfigure	= "VirtIPConfigure";
+my $gLogRetentionPeriod = 30;
+my @gPMList = ();
+my $gPatchVerFile		= ".patchver";
+
+my %gPortNumbers;
+my $localmac="";
+# this keeps track of the current port index used
+# leave first 10 ports for hard coded ports used in applications
+my $gPortIndex			= 9;
+my $gMaxPortAppIndex	= 200;
+my $gCentralizedOp = false;
+my $gPeerSockFd;
+
+# -----------------------------------------------------------------------
+# Thread-safety primitives (parallel node dispatch)
+# $gStatusFileMutex : serialises read-modify-write of .status_<cmd> files
+#                      so concurrent threads don't corrupt progress state.
+# $gConsoleMutex    : serialises STDOUT so per-node log lines don't
+#                      interleave across threads.
+# -----------------------------------------------------------------------
+my $gStatusFileMutex :shared = 1;
+my $gConsoleMutex    :shared = 1;
+my %gRemoteCleanupUid      :shared; # ip => uid      — nodes with /tmp/.install pending cleanup
+my %gRemoteCleanupPassword :shared; # ip => password — nodes with /tmp/.install pending cleanup
+my $gQueryMlcFile          :shared = ""; # set once query_mlc.py is located; used by signalHandler
+my $gRemoteInstallDir               = "/tmp/.install"; # remote staging dir; also used by signalHandler
+
+# Commands dispatched in parallel to all nodes in the config file.
+# patch* / activate / upgrade are intentionally kept sequential:
+#   patch  - has ordered global-pre / per-node / global-post phases.
+#   activate / upgrade - interactive; one answer applies to every node.
+my %gParallelCmds = map { $_ => 1 }
+    qw(install uninstall showreleases start stop restart);
+
+my $gLDirPath = `/bin/pwd`;
+chomp $gLDirPath;
+
+my $gHostName = `/bin/hostname`;
+chomp $gHostName;
+my $gProcessor =`/bin/uname -p`;
+chomp $gProcessor;
+my $gOs =`/bin/uname -s`;
+chomp $gOs;
+my $gIsLinux = false;
+my $gUsingOpensaf = false;
+#Virtualization related params
+my $gUsingVMware = false;
+my $gVMwareIniFile = "/root/.visdkrc";
+my $gVMwareVMname;
+my $gVMwareFile  = ".vmware";
+if($gOs eq "Linux") {
+	$gIsLinux = true;
+}
+
+my $kernel=`uname -r | cut -d "-" -f 1 | cut -d "." -f1`;
+chomp $kernel;
+
+#7 means rhel 7 and above
+my $gRhelVer = 0;
+if($kernel >= 3) {
+	$gRhelVer = 7;
+} elsif($kernel == 2) {
+	$gRhelVer = 6;
+}
+
+my $gNumNodes = 0;
+my $gNodeCnt = 0;
+my $gIsController = false;
+my $gLogFile = sprintf("%s_polaris_%s.log", $gHostName, $gProductLc);
+
+my %startCmdData = (
+	"function" => \&procStart,
+	"root" => true,
+	"connection" => false,
+	"status" => true,
+);
+
+my %stopCmdData = (
+	"function" => \&procStop,
+	"root" => true,
+	"connection" => false,
+	"status" => true,
+);
+
+my %statusCmdData = (
+	"function" => \&procStatus,
+	"root" => false,
+	"transferinstall" => true,
+	"connection" => false,
+	"status" => false,
+);
+
+my %restartCmdData = (
+	"function" => \&procReStart,
+	"root" => true,
+	"connection" => false,
+	"status" => true,
+);
+
+my %installCmdData = (
+	"function" => \&procInstall,
+	"root" => true,
+	"connection" => true,
+	"status" => true,
+);
+
+my %patchCmdData = (
+	"function" => \&procPatch,
+	"subcmds" => "patch_global_pre,patch,patch_global_post",
+	"root" => true,
+	"connection" => false,
+	"status" => true,
+);
+
+my %activateCmdData = (
+	"function" => \&procActivate,
+	"root" => true,
+	"transferinstall" => true,
+	"connection" => true,
+	"status" => true,
+);
+
+my %upgradeCmdData = (
+	"function" => \&procUpgrade,
+	"root" => true,
+	"connection" => true,
+	"status" => true,
+);
+
+my %uninstallCmdData = (
+	"function" => \&procUninstall,
+	"root" => true,
+	"transferinstall" => true,
+	"connection" => true,
+	"status" => true,
+);
+
+my %showrelCmdData = (
+	"function" => \&procShowRel,
+	"root" => true,
+	"transferinstall" => true,
+	"connection" => false,
+	"status" => false,
+);
+
+my %configuerCmdData = (
+	"function" => \&procConfigure,
+	"root" => false,
+	"transferinstall" => true,
+	"connection" => false,
+	"status" => false,
+);
+
+
+my %installCmds = (
+	"start" => \%startCmdData,
+	"stop" => \%stopCmdData,
+	"status" => \%statusCmdData,
+	"restart" => \%restartCmdData,
+	"install" => \%installCmdData,
+	"patch_global_pre" => \%patchCmdData,
+	"patch" => \%patchCmdData,
+	"patch_global_post" => \%patchCmdData,
+	"activate" => \%activateCmdData,
+	"upgrade" => \%upgradeCmdData,
+	"uninstall"=> \%uninstallCmdData,
+	"showreleases" => \%showrelCmdData,
+);
+
+my @prgwDomainToString = (
+	"",
+	"GSM-CS",
+	"GSM-PS",
+	"UMTS-CS",
+	"UMTS-PS",
+	"LTE",
+	"CORENETWORK",
+	"LTE-PW",
+	"NR-PW"
+);
+
+# optional only for dev testing
+if ($gOnlyConfig ne "") {
+	$installCmds{"configure"} = \%configuerCmdData,
+}
+
+
+my %gPltSstDetail = (
+# name as it appears in the license file
+	"LicName" => "PLT",
+# name as it appears in the package file
+	"PkgPrefix" => "PLT_",
+# list of apps contained in the package file
+# The order of the  applications should be as in the h file PlatformDefs.h
+#usesnmp code
+#"Apps" => [ ($gAppMgrName, "OamProxy", "OamAgent", "OamManager", "SnmpMaster", "SnmpTrapAgent", "NetSnmpSubAgent", $gLogsMgrName) ],
+	"Apps" => [ ($gAppMgrName, "OamClient", $gLogsMgrName, $gBRMName) ],
+# list of apps/configs contained in the package file which have to be linked without
+# release number
+# usesnmp code
+#"Configs" => [ ("oam_control.sh", "snmpd", $gStartAppName, $gVirtIpConfigure, "suctl", "mlcutils") ],
+	"Configs" => [ ($gStartAppName, $gMlcDaemon, $gVirtIpConfigure, "mlcutils", "mlcclean", "suctl", "query_mlc.py", "NetworkFileParser.pl","IsMaxResetOver") ],
+# subsystem specific installation
+	"InstallFunc" => \&pltInstall,
+	"ConfigFunc" => \&pltConfig,
+# actual mode, subsystem instance read from license file populated duration installation
+	"Mode" => "",
+	"Instance" => "",
+# actual package name to be populated during installation
+	"PkgName" => ""
+);
+
+my %gSgwSstDetail = ();
+		%gSgwSstDetail = (
+			"LicName" => "SGW",
+			"PkgPrefix" => "SGW_",
+			"Apps" => [ ("SGWApp", "Mtp2Convertor", "SgwOamApp", "M3UA", "SIGTRANStack", "SS7Stack", "TSGWApp", "TCPGWApp") ],
+			"Configs" => [ ("StackCfg", "stackPortGen.pl", "xmldata") ],
+			"InstallFunc" => \&sgwInstall,
+			"ConfigFunc" => \&sgwConfig,
+			"Mode" => "",
+			"Instance" => "",
+			"PkgName" => ""
+			);
+
+my %gMdbSstDetail = (
+		"LicName" => "MDB",
+		"PkgPrefix" => "MDB_",
+		"Apps" => [ ("MdbApp") ],
+		"InstallFunc" => \&mdbInstall,
+		"ConfigFunc" => \&mdbConfig,
+		"Mode" => "",
+		"Instance" => "",
+		"PkgName" => ""
+		);
+
+my %gMlsSstDetail = (
+		"LicName" => "MLS",
+		"PkgPrefix" => "MLS_",
+		"Apps" => [ ("MiMSPApp", "MiGmlcGw", "OamAggregator", "MiLCSClientHandler", "MiPolicyMgr") ],
+		"InstallFunc" => \&mlsInstall,
+		"ConfigFunc" => \&mlsConfig,
+		"Mode" => "",
+		"Instance" => "",
+		"PkgName" => ""
+		);
+
+my %gPrgwSstDetail = (
+		"LicName" => "PRGW",
+		"PkgPrefix" => "PRGW_",
+# do not add anyother application in the begining as the PRGWAgent is accessed using index 0
+# also STS(renamed from SSS) is indexed by 1, and SSH by 2.
+# add any new applications at the end
+
+		"Apps" => [ ("PRGWAgent", "STS", "SSH", "NRPROBE", "LTEPROBE", "GSMPROBE", "ERApp") ],
+		"Configs" => [ ("MLSEventsMapping.txt", "MLSUmtsEventsMapping.txt", "MLSLteEventsMapping.txt", "MLSCoreNetworkEventsMapping.txt","TA_MODEL_TYPE_1.txt", "TA_MODEL_TYPE_2.txt") ],
+		"InstallFunc" => \&prgwInstall,
+		"ConfigFunc" => \&prgwConfig,
+		"Mode" => "",
+		"Instance" => "",
+		"PkgName" => ""
+		);
+
+my %gPrgwMerSstDetail = (
+		"LicName" => "PRGW",
+		"PkgPrefix" => "PRGW_",
+# do not add anyother application in the begining as the PRGWAgent is accessed using index 0
+# also STS(renamed from SSS) is indexed by 1, and SSH by 2.
+# add any new applications at the end
+
+		"Apps" => [ ("PRGWAgent", "ERApp") ],
+		"Configs" => [ ("SMSAppEventsMapping.txt", "SMSAppUmtsEventsMapping.txt", "SMSAppLteEventsMapping.txt") ],
+		"InstallFunc" => \&prgwMerInstall,
+		"ConfigFunc" => \&prgwMerConfig,
+		"Mode" => "",
+		"Instance" => "",
+		"PkgName" => ""
+		);
+
+my %gLdsSstDetail = (
+		"LicName" => "LDS",
+		"PkgPrefix" => "LDS_",
+# do not add any other application in the begining as the GsmCallManager and UmtsCallManager
+# is accessed using index 1, 2 and 3.
+		"Apps" => [ ("LocReqDisp", "GsmCallManager", "UmtsCallManager", "LdsLteCm", "GsmLEApp", 
+				"UmtsLEApp", "LdsLteWLEApp", "LdsLteHLEApp", "LdsPm", "LdsDbBe", "LdsNrCm", "LdsNrWLEApp") ],
+		"Configs" => [ ("TA_MODEL_TYPE_1.txt", "TA_MODEL_TYPE_2.txt") ],
+		"InstallFunc" => \&ldsInstall,
+		"ConfigFunc" => \&ldsConfig,
+		"Mode" => "",
+		"Instance" => "",
+		"PkgName" => ""
+		);
+
+my %gOlgwSstDetail = (
+		"LicName" => "OLGW",
+		"PkgPrefix" => "OLGW_",
+		"Apps" => [ ("AppServer", "LCSI") ],
+		"Configs" => [ ("olgwinit", "ipqosconf.cfg") ],
+		"InstallFunc" => \&olgwInstall,
+		"ConfigFunc" => \&olgwConfig,
+		"Mode" => "",
+		"Instance" => "",
+		"PkgName" => ""
+		);
+
+my %gTlrSstDetail = (
+		"LicName" => "TLR",
+		"PkgPrefix" => "TLR_",
+		"Apps" => [ ("TlrApp") ],
+		"Configs" => [ () ],
+		"InstallFunc" => \&tlrInstall,
+		"ConfigFunc" => \&tlrConfig,
+		"Mode" => "",
+		"Instance" => "",
+		"PkgName" => ""
+		);
+
+my %gAdsSstDetail = (
+		"LicName" => "ADS",
+		"PkgPrefix" => "ADS_",
+		"Apps" => [ ("AgpsServer", "OtdoaAds") ],
+		"Configs" => [ ("RgpsFtpClient.sh", "LeicaRinexCopy.sh") ],
+		"InstallFunc" => \&adsInstall,
+		"ConfigFunc" => \&adsConfig,
+		"Mode" => "",
+		"Instance" => "",
+		"PkgName" => ""
+		);
+
+my %gAdmSstDetail = (
+		"LicName" => "ADM",
+		"PkgPrefix" => "ADM_",
+		"Apps" => [ ("WLDM", "WSDM") ],
+		"Configs" => [ ("exceltocsv.py") ],
+		"InstallFunc" => \&admInstall,
+		"ConfigFunc" => \&admConfig,
+		"Mode" => "",
+		"Instance" => "",
+		"PkgName" => ""
+		);
+
+my %gOamSstDetail = (
+		"LicName" => "OAM",
+		"PkgPrefix" => "OAM_",
+		"Apps" => [ () ],
+		"Configs" => [ () ],
+		"InstallFunc" => \&oamInstall,
+		"ConfigFunc" => \&oamConfig,
+		"Mode" => "",
+		"Instance" => "",
+		"PkgName" => ""
+		);
+
+my %gCgwSstDetail = (
+		"LicName" => "CGW",
+		"PkgPrefix" => "CGW_",
+		"Apps" => [ ("CaGwApp") ],
+		"Configs" => [ () ],
+		"InstallFunc" => \&cgwInstall,
+		"ConfigFunc" => \&cgwConfig,
+		"Mode" => "",
+		"Instance" => "",
+		"PkgName" => ""
+		);
+
+my %gHVGwSstDetail = (
+		"LicName" => "HVGW",
+		"PkgPrefix" => "HVGW_",
+		"Apps" => [ ("HVlrGwApp") ],
+		"Configs" => [ () ],
+		"InstallFunc" => \&hvgwInstall,
+		"ConfigFunc" => \&hvgwConfig,
+		"Mode" => "",
+		"Instance" => "",
+		"PkgName" => ""
+		);
+
+my @ssts = (
+		\%gSgwSstDetail,
+		\%gMdbSstDetail,
+		\%gMlsSstDetail,
+		\%gPrgwSstDetail,
+		\%gLdsSstDetail,
+		\%gOlgwSstDetail,
+		\%gOamSstDetail,
+		\%gCgwSstDetail,
+		\%gHVGwSstDetail,
+		\%gTlrSstDetail,
+		\%gAdsSstDetail,
+		\%gAdmSstDetail,
+		\%gPltSstDetail
+		);
+if($gProductLc eq "mer") {
+	@ssts = (
+		\%gPrgwMerSstDetail,
+		\%gPltSstDetail
+		);
+}
+
+my %gCompToVersion = ();
+
+my $gCdtPath			= "$gBasePath/CDTs/";
+my $gCdtPathGsm			= "$gBasePath/CDTs/GSM/";
+my $gCdtPathUmts		= "$gBasePath/CDTs/UMTS/";
+my $gCdtPathLte			= "$gBasePath/CDTs/LTE/";
+my $gCdtPathNr			= "$gBasePath/CDTs/NR/";
+my $gPsdPath			= "$gBasePath/PSD/";
+my $gPsdPathGsm			= "$gBasePath/PSD/GSM";
+my $gPsdPathUmts		= "$gBasePath/PSD/UMTS";
+my $gPsdPathLte			= "$gBasePath/PSD/LTE";
+my $gPsdPathNr			= "$gBasePath/PSD/NR";
+
+my $gLogsDirPath		= "$gBasePath/logs";
+my $gHVlrDumpDir		= "$gLogsDirPath/hvlrdump";
+my $gCoreDir			= "$gLogsDirPath/coredump";
+my $crLogDir			= "$gLogsDirPath/LocationResult";
+my $pidFileDir			= "$gLogsDirPath/PID";
+my $msgLogDir			= "$gLogsDirPath/MsgLog";
+my $fpupdateLogDir		= "$gLogsDirPath/FPUpdates";
+my %appPairMap = ();
+my $appPairMapPopulated = 0;
+
+my $gPromptsFile = ".prompts";
+my %gPromptToInput = ();
+my $gPromptPrev = "";
+my $gPromptValuePrev = "";
+
+
+my $cpCmd = "/bin/cp";
+my $svcadmCmd = "/usr/sbin/svcadm";
+my $rmCmd = "/bin/rm";
+my $lnCmd = "/bin/ln";
+my $chownCmd = "/bin/chown";
+my $idCmd = "/usr/bin/id";
+my $mvCmd = "/bin/mv";
+my $usrAddCmd = "/usr/sbin/useradd";
+my $grpAddCmd = "/usr/sbin/groupadd";
+my $usrModCmd = "/usr/sbin/usermod";
+my $killCmd = "/usr/bin/kill";
+my $crontabCmd = "/usr/bin/crontab";
+my $logadmCmd = "/usr/sbin/logadm";
+my $touchCmd = "/bin/touch";
+my $chmodCmd = "/bin/chmod";
+my $mkdirCmd = "/bin/mkdir";
+my $passwdCmd = "/usr/bin/passwd";
+my $gunzipCmd = "/usr/bin/gunzip";
+my $gzipCmd = "/usr/bin/gzip";
+my $tarCmd	= "/bin/tar";
+my $initCmd   = "/sbin/init";
+my $initctlCmd   = "/sbin/initctl";
+my $systemctlCmd   = "/usr/bin/systemctl";
+my $shareCmd  = "/usr/sbin/share";
+my $coreadmCmd  = "/usr/bin/coreadm";
+my $qcxConfCmd = "/usr/net/Adax/qcx/qcx_conf";
+my $mountCmd = "/usr/bin/mount";
+my $umountCmd = "usr/bin/umount";
+
+my $logCmd				= "> /dev/null 2> /dev/null";
+my $scriptLogFile		= sprintf("%s/%sinstall.log", $gLogsDirPath, $gProductLc);
+my $logfileCmd			= ">> $scriptLogFile 2>> $scriptLogFile";
+
+$SIG{INT}  = \&signalHandler;
+$SIG{TERM} = \&signalHandler;
+
+sub signalHandler ()
+{
+	logToFile("\nOperation aborted — cleaning up remote nodes", LOGINFO | LOGCONS);
+
+	# SSH to every node that has /tmp/.install set up and remove it.
+	# We iterate a snapshot so the hash can't change under us.
+	my @ips;
+	{ lock(%gRemoteCleanupUid); @ips = keys %gRemoteCleanupUid; }
+	foreach my $ip (@ips) {
+		my ($uid, $password);
+		{ lock(%gRemoteCleanupUid);      $uid      = $gRemoteCleanupUid{$ip}      // ""; }
+		{ lock(%gRemoteCleanupPassword); $password = $gRemoteCleanupPassword{$ip} // ""; }
+		next if $uid eq "";
+		if ($gQueryMlcFile ne "") {
+			my $cleanCmd = sprintf("%s ssh %s %s %s 30 \"rm -rf %s\"",
+				$gQueryMlcFile, $ip, $uid, $password, $gRemoteInstallDir);
+			logToFile("Cleaning up $ip ...", LOGINFO | LOGCONS);
+			system($cleanCmd);
+		}
+	}
+
+	logToFile("Remote cleanup complete. Exiting.", LOGINFO | LOGCONS);
+	exit(1);
+}
+
+
+# Perl trim function to remove whitespace from the start and end of the string
+sub trimmer($)
+{
+	my $string = shift;
+	$string =~ s/^\s+//;
+	$string =~ s/\s+$//;
+	return $string;
+}
+
+sub getPromptInput($)
+{
+	my $prompt = shift;
+	my $input = "";
+	if ($gCentralizedOp == true) {
+		send($gPeerSockFd, $prompt, 0);
+		my $ret = recv($gPeerSockFd, $input, 2000 , 0);
+		if($input eq "N-U-L-L") {
+			$input = "";
+		}
+	} else {
+		if (exists $gPromptToInput{$prompt}) {
+			$input = $gPromptToInput{$prompt};
+		} else {
+			print "$prompt : ";
+			$input = <STDIN>;
+			chomp $input;
+			$input = trimmer($input);
+			$gPromptToInput{$prompt} = $input;
+			if($gPromptPrev ne "") {
+				if (open(CONF, ">>",$gPromptsFile)) {
+					print CONF "$gPromptPrev\n";
+					print CONF "$gPromptValuePrev\n";
+					close (CONF);
+				}
+			}
+			$gPromptPrev = $prompt;
+			$gPromptValuePrev = $input;
+		}
+	}
+
+	return $input;
+}
+
+sub logToFile($$)
+{
+	my $log = shift;
+	my $severity = shift;
+
+	# check if only console print is required.
+	# is yes...don't log to file.
+	if($severity != LOGCONS)
+	{
+		my $logfd;
+		open($logfd, ">>",$scriptLogFile);
+		my $timestamp = `date`;
+		chomp $timestamp;
+		print $logfd "[$timestamp] ";
+		print $logfd "$log\n";
+		close($logfd);
+	}
+
+	my $colour = 'white';
+	if (($severity & LOGFATAL) != 0) {
+		$colour = 'red';
+		if ($gCentralizedOp == true) {
+			$log = sprintf("FATAL;%sFATAL;", $log);
+		} else {
+			$log = sprintf("%s", $log);
+		}
+	} elsif (($severity & LOGERROR) != 0) {
+		$colour = 'red';
+	} elsif (($severity & LOGINFO) != 0)  {
+		$colour = 'green';
+	}
+
+	my $printOnScreen = false;
+	if (($severity & LOGCONS) != 0) {
+		$printOnScreen = true;
+	}
+
+	if($printOnScreen || (defined $logEnabled && $logEnabled eq "true")) {
+		lock($gConsoleMutex);   # prevent interleaved output from parallel threads
+		if($gCentralizedOp == true) {
+			print "$log\n";
+		} else {
+			#print color($colour), ON_BLACK "$log\n";
+			print "$log\n";
+		}
+	}
+
+	if(($severity & LOGFATAL) == 1) {
+		if (threads->tid() != 0) {
+			threads->exit(1);   # terminate only this worker thread; let others continue
+		}
+		exit(1);   # main thread: terminate whole process as before
+	}
+}
+
+sub System($$$)
+{
+	my $cmd = shift;
+	my $die = shift;
+	my $errorMsg = shift;
+	my @entries = ();
+	if ( system("$cmd $logCmd") == 0 )
+	{
+		return 0;
+	}
+	else
+	{
+		if($die eq 0)
+		{
+			@entries = split(' ', $cmd);
+			if($logEnabled ne "")
+			{
+				logToFile("ERROR:: Running $cmd $logCmd failed", LOGERROR | LOGCONS);
+			}
+			return -1;
+		}
+		else
+		{
+			if ($errorMsg eq "")
+			{
+				@entries = split(' ', $cmd);
+				if($logEnabled ne "") {
+					logToFile("FATAL:: Running command $entries[0] failed", LOGFATAL | LOGCONS);
+				} else {
+					logToFile("", LOGFATAL | LOGCONS);
+				}
+				return -1;
+			}
+			else
+			{
+				@entries = split(' ', $cmd);
+				if($logEnabled ne "")
+				{
+					logToFile("FATAL:: $errorMsg", LOGFATAL | LOGCONS);
+				}
+				else
+				{
+					logToFile("", LOGFATAL | LOGCONS);
+				}
+				return -1;
+			}
+
+		}
+	}
+}
+
+sub getAppInstanceId($$$$$) {
+	my $sstname = shift;
+	my $appname = shift;
+	my $licconfig = shift;
+	my $pltinstance = shift;
+	my $sstinstance = shift;
+
+	my $section = sprintf("PLATFORM_%d", $pltinstance);
+	my $retval = 0;
+
+ 	foreach my $parminfo (@{$licconfig->{$section}}) {
+		my @values = split(":", $parminfo->{'name'});
+		if($values[0] eq $sstname && $values[1] eq $appname && $values[2] eq $sstinstance) {
+			$retval = $values[3];
+		}
+	}
+	return $retval;
+}
+
+sub writeConfigVal($$$$$)
+{
+	my $configHash = shift;
+	my $section = shift;
+	my $key = shift;
+	my $val = shift;
+	my $override = shift;
+
+	#my %paraminfo = ();
+	#$paraminfo{'name'} = $key;
+	#$paraminfo{'value'} = $val;
+
+	if($override == true) {
+		#push @{$configHash->{$section}}, \%paraminfo ;
+		&setParam($configHash, $section, $key, $val);
+		return;
+	}
+
+	# if override not set to true, update  only if  old value is
+	# not present
+	my $oldval = &getParam($configHash, $section, $key);
+	if(!defined($oldval)) {
+		&setParam($configHash, $section, $key, $val);
+		return;
+	}
+}
+
+# TCP standard has "simultaneous open" feature :).
+# The implication of the feature, client trying to connect to local port, when the port is from ephemeral range, can occasionally connect to itself (see here).
+# So client think it's connected to server, while it actually connected to itself. From other side, server can not open its server port, since it's occupied/stolen by client.
+# clients constantly tries to connect to local server. Eventually client connects to itself.
+# Don't use ephemeral ports for server ports. Agree ephemeral port range and configure it on your machines (see ephemeral range)
+
+sub setupStart {
+	System("/sbin/sysctl -w kernel.core_pattern=core.%e.%p > /dev/null", 0 , "could not set kernel.core_pattern");
+	System("/sbin/sysctl -w net.core.wmem_max=160000000", 0 , "could not set net.core.wmem_max");
+	System("/sbin/sysctl -w net.core.rmem_max=160000000", 0 , "could not set net.core.rmem_max");
+	System("/sbin/sysctl -w net.core.wmem_default=160000000", 0 , "could not set net.core.wmem_default");
+	System("/sbin/sysctl -w net.core.rmem_default=160000000", 0 , "could not set net.core.rmem_default");
+	System("/sbin/sysctl -w net.ipv4.tcp_mem='16000000 16000000 16000000'", 0 , "could not set net.ipv4.tcp_mem");
+	System("/sbin/sysctl -w net.ipv4.tcp_wmem='16000000 16000000 16000000'", 0 , "could not set net.ipv4.tcp_wmem");
+	System("/sbin/sysctl -w net.ipv4.tcp_rmem='16000000 16000000 16000000'", 0 , "could not set net.ipv4.tcp_rmem");
+	System("/sbin/sysctl -w net.ipv4.udp_mem='16000000 16000000 16000000'", 0 , "could not set net.ipv4.udp_mem");
+	System("/sbin/sysctl -w net.sctp.rto_initial=1000", 0 , "Could not set net.sctp.rto_initial");
+	System("/sbin/sysctl -w net.core.wmem_default=4293760", 0 , "Could not set net.core.wmem_default");
+	System("/sbin/sysctl -w net.ipv4.ip_local_port_range=\"$gEphemeralStartPort $gEphemeralEndPort\"", 1 , "Counld not set emphemeral port ranges");
+
+# check the sysconf entry for local port range.
+	my $sysconfFile = "/etc/sysctl.conf";
+	my $sysconfEntry = "net.ipv4.ip_local_port_range";
+
+# do not use the sub System here as redirection to a log file doesn't work.
+	open(SYSCONF, "<", $sysconfFile) or die "Could not open $sysconfFile";
+	my @entries=<SYSCONF>;
+	close (SYSCONF);
+
+	open(SYSCONF, ">", $sysconfFile) or die "Could not open $sysconfFile.";
+	my $found = false;
+	foreach my $line (@entries)
+	{
+		if ($line =~ /$sysconfEntry/)
+		{
+			print SYSCONF "$sysconfEntry = $gEphemeralStartPort $gEphemeralEndPort\n";
+			$found = true;
+		}
+		else
+		{
+			print SYSCONF $line;
+		}
+	}
+
+	if($found == false) {
+		print SYSCONF "$sysconfEntry = $gEphemeralStartPort $gEphemeralEndPort\n";
+	}
+	close (SYSCONF);
+
+# log the emphemeral port range to <product>_install.log
+        logToFile ("/sbin/sysctl net.ipv4.ip_local_port_range", LOGINFO);
+        if(system("/sbin/sysctl net.ipv4.ip_local_port_range >> \"$scriptLogFile\"") != 0) {
+			logToFile ("Could not get emphemeral port range", LOGCONS);
+        }
+#print "local port range successfully set up\n";
+}
+
+
+sub setupPaths()
+{
+	$gReleasePath		= "$gBasePath/release"  ;
+	$gCdtPathGsm		= "$gBasePath/CDTs/GSM/";
+	$gCdtPathUmts		= "$gBasePath/CDTs/UMTS/";
+	$gCdtPathLte		= "$gBasePath/CDTs/LTE/";
+	$gCdtPathNr		= "$gBasePath/CDTs/NR/";
+	$gPsdPathGsm		= "$gBasePath/PSD/GSM";
+	$gPsdPathUmts		= "$gBasePath/PSD/UMTS";
+	$gPsdPathLte		= "$gBasePath/PSD/LTE";
+	$gPsdPathNr		= "$gBasePath/PSD/NR";
+
+
+	$gActiverRelLink	= "$gBasePath/active";
+	$gActiveBinDir		= "$gActiverRelLink/$gBinDir";
+
+
+	$gLogsDirPath		= "$gBasePath/logs";
+	$crLogDir			= "$gLogsDirPath/LocationResult";
+	$pidFileDir			= "$gLogsDirPath/PID";
+	$msgLogDir			= "$gLogsDirPath/MsgLog";
+	$fpupdateLogDir		= "$gLogsDirPath/FPUpdates";
+	$scriptLogFile		= sprintf("%s/%sinstall.log", $gLogsDirPath, $gProductLc);
+	$gCoreDir			= "$gLogsDirPath/coredump";
+}
+
+sub checkRootAndExit()
+{
+	if($gIsLinux == true) {
+		my $return = `$idCmd -u`;
+		if ($return == 0) {
+		} else {
+			logToFile("Run the script as root user", LOGFATAL | LOGCONS);
+		}
+	} else {
+		if (system("$idCmd | /usr/bin/grep \"(root)\" $logCmd") == 0) {
+		} else {
+			logToFile("Run the script as root user", LOGFATAL | LOGCONS);
+		}
+	}
+}
+
+sub printHelpAndExit()
+{
+	# -p switch is not exposed to user hence not displayed in help
+	print "Usage: $0 [-c=<configuration file>] [-o=abort] <COMMAND>\n\n";
+
+	print "COMMAND can be one of the following\n";
+	print "---------------------------------------------------------\n";
+	print "install       : Installs $gProduct binaries\n";
+	print "upgrade       : Upgrades to new release\n";
+	print "patch         : Applies patch\n";
+	print "start         : Starts $gProduct binaries\n";
+	print "stop          : Stops $gProduct binaries\n";
+	print "status        : Shows status of $gProduct binaries\n";
+	print "restart       : Stops and starts $gProduct binaries\n";
+	print "activate      : Activates the installed release\n";
+	print "uninstall     : Uninstalls selected $gProduct release(s)\n";
+	print "showreleases  : Show current installed release(s)\n";
+	print "-h            : Displays Command line options\n";
+	print "---------------------------------------------------------\n";
+
+	exit();
+}
+
+sub readPrompt($)
+{
+	my $promptHash = shift;
+	# each switch requries a paramter except for command
+	my $numArgs = $#ARGV + 1;
+	my $cnt = 0;
+	for(; $cnt < $numArgs; $cnt++) {
+		my @values = split("=", $ARGV[$cnt]);
+		chomp(@values);
+
+		if($ARGV[$cnt] =~ /^-/) {
+			# configuration switch is provided.
+			$promptHash->{$values[0]} = $values[1];
+		} else {
+			$promptHash->{"cmd"} = $values[0];
+		}
+	}
+
+	if ($promptHash->{"cmd"} eq "")	{
+		logToFile("Invalid command line parameter(s)", LOGERROR | LOGCONS);
+		printHelpAndExit();
+	}
+
+	if ($promptHash->{"cmd"} eq "-h")	{
+		printHelpAndExit();
+	}
+}
+
+sub Start()
+{
+	logToFile ("$0 @ARGV", LOGINFO);
+
+	my %prompts = ();
+	my %files = ();
+	readPrompt(\%prompts);
+
+	#30894 - Create and give permission to LocResult directory
+	my $logPath = "";
+	my %iniConfig = ();
+	my $iniFile = "$gActiveBinDir/PDEApp.ini";
+	if(-f $iniFile) {
+		&readIniFile($iniFile, \%iniConfig, true);
+		$logPath = &getParam(\%iniConfig, "LOGGER", "LogFolder");
+
+		my $locResDir = sprintf("%s/LocationResult", $logPath);
+		if(-d $locResDir){
+			#Dont create LocRes directory as it already exists
+		}else{
+			#Create and set the mode for LocResult file
+			system("$mkdirCmd -p $locResDir 2> /dev/null > /dev/null") ;
+			# BUG-902: commenting all change modes, as it takes log of time over nas. 
+			# On need selective directories can be added
+			#system("$chmodCmd -R 0755 $locResDir", 0, "Could not change permission of CallResults path");
+		}
+		
+		#Create and set mode for KPI files
+                my $kpiDir = sprintf("%s/KPI", $logPath);		
+		if(-d $kpiDir){
+			#Dont create kpi directory as it already exists
+		}else{
+			system("$mkdirCmd -p $kpiDir 2> /dev/null > /dev/null") ;
+			# BUG-902: commenting all change modes, as it takes log of time over nas. 
+			# On need selective directories can be added
+            #system("$chmodCmd -R 0755 $kpiDir", 0, "Could not change permission of kpi path");
+		}
+	}
+
+	my $abort = $prompts{"-o"};
+	if ($abort ne "")	{
+		if ($abort eq "abort") {
+			my $abrtCmd = $prompts{"cmd"};
+			if ($abrtCmd ne "") {
+				my $statusFile = sprintf(".status_%s", $abrtCmd);
+				if(-f $statusFile) {
+					unlink($statusFile);
+				} else {
+					logToFile("Operation not on-going", LOGFATAL | LOGCONS);
+				}
+				unlink($gPromptsFile);
+				logToFile("Command $abrtCmd aborted", LOGCONS);
+			} else {
+				logToFile("Command not provided for abort", LOGFATAL | LOGCONS);
+			}
+		} else {
+			logToFile("Invalid option:$abort", LOGFATAL | LOGCONS);
+		}
+		return;
+	}
+
+	# check if install/upgrade/activate has to be perfomred on multiple
+	# machines
+	my $configFile = $prompts{"-c"};
+	if ($configFile ne "")	{
+		# read the configuration file
+		# format is ipaddress,login id, login password
+
+		my @entries = ();
+		if (open(CONF, "<",$configFile)) {
+			@entries=<CONF>;
+			close (CONF);
+		} else {
+			logToFile("$configFile open failed", LOGFATAL | LOGCONS);
+		}
+
+		# TBD read status file to get current status of progress.
+		# start from the blade which failed.
+		# status file format
+		# ipaddress,status
+		# status can be success, failure
+
+		my @remoteMCs = ();
+		foreach my $line (@entries) {
+			if($line =~ /^#/) {
+				next;
+			}
+			my @values = split(',', $line);
+			chomp(@values);
+			my %paraminfo = ();
+
+			my $fields = scalar(@values);
+			if($fields == 4) {
+				$paraminfo{'name'} = trimmer($values[0]);
+				$paraminfo{'ip'} = trimmer($values[1]);
+				$paraminfo{'uid'} = trimmer($values[2]);
+				$paraminfo{'password'} = trimmer($values[3]);
+				push (@remoteMCs, \%paraminfo);
+			}
+		}
+
+		my $numremote = scalar(@remoteMCs);
+		if($numremote == 0) {
+			logToFile("$configFile has no valid entries", LOGFATAL | LOGCONS);
+		}
+
+		my @cmdarr = ();
+		my $cmdData = $installCmds{$prompts{"cmd"}};
+		if ($cmdData->{'subcmds'} ne "") {
+			@cmdarr = split(",", $cmdData->{'subcmds'});
+		} else {
+			push(@cmdarr, $prompts{"cmd"});
+		}
+
+		my $numcmds = scalar(@cmdarr);
+
+
+		# TBD read status file to get current status of progress.
+		# start from the blade which failed.
+		# status file format
+		# ipaddress,status
+		# status can be success, failure
+		my ($sec, $min, $hr, $day, $mon, $year) = localtime();
+		my $logFile = sprintf("%s_%d%02d%02d_%02d%02d%02d.log", $prompts{"cmd"}, $year, $mon, $day, $hr, $min, $sec);
+		$files{'log'} = $logFile;
+
+
+		my @statusFileArr = ();
+		foreach my $cmd (@cmdarr) {
+
+			$prompts{"cmd"} = $cmd;
+			my $statusFile = sprintf(".status_%s", $prompts{"cmd"});
+			$files{'status'} = $statusFile;
+			push (@statusFileArr, $statusFile);
+
+			@entries = ();
+			if (open(CONF, "<", $statusFile)) {
+				@entries=<CONF>;
+				close (CONF);
+			}
+
+			foreach my $param (@remoteMCs) {
+					$param->{'status'} = "";
+			}
+
+			foreach my $line (@entries) {
+				my @values = split('@', $line);
+				chomp(@values);
+				foreach my $param (@remoteMCs) {
+					if($param->{'ip'} eq $values[0]) {
+						$param->{'status'} = $values[1];
+					}
+				}
+			}
+
+			@entries = ();
+			if (open(CONF, "<",$gPromptsFile)) {
+				@entries=<CONF>;
+				close (CONF);
+			}
+			chomp(@entries);
+
+			my $key = "";
+			foreach my $entry (@entries) {
+				#first line is prompt
+				#following line is value
+				if ($key eq "") {
+					$key = $entry;
+				} else {
+					$gPromptToInput{$key} = $entry;
+					$key = "";
+				}
+			}
+			&handleRemoteOp(\%prompts, \@remoteMCs, \%files);
+		}
+
+		foreach my $file (@statusFileArr) {
+			unlink($file);
+		}
+		unlink($gPromptsFile);
+	} else {
+		&handleLocalStart(\%prompts);
+	}
+
+	exit(0);
+}
+
+sub acceptAndRecv($) {
+	my $sockFd = shift;
+
+	#accept for connection and read messages from peer.
+	my $client_addr;
+	while ($client_addr = accept($gPeerSockFd, $sockFd)) {
+		# send them a message, close connection
+		my ($port, $ip) = sockaddr_in ($client_addr);
+		#$ip = inet_ntoa($ip);
+		#print "Connection recieved from $ip:$port\n";
+
+		while (true) {
+			my $clientMsg;
+			my $ret = recv($gPeerSockFd, $clientMsg, 2000 , 0);
+			if($clientMsg ne "") {
+				my $input = &getPromptInput($clientMsg);
+				if($input eq "") {
+					$input = "N-U-L-L";
+				}
+				send($gPeerSockFd, $input, 0);
+			} else {
+				last;
+			}
+		}
+		#print "Connection closed from $ip:$port\n";
+
+	   close $gPeerSockFd;
+	}
+}
+
+sub setUpServer()
+{
+	#listen on the socket. If non-local IP address is available
+	#from PDEApp.ini use that else prompt it.
+	my $ip = "";
+	my %iniConfig = ();
+	my $iniFile = "$gActiveBinDir/PDEApp.ini";
+	if(-f $iniFile) {
+		&readIniFile($iniFile, \%iniConfig, true);
+		$ip = &getParam(\%iniConfig, "PLATFORM_SVCS", "NodeIPAddress");
+		if($ip eq "127.0.0.1") {
+			$ip = "";
+		}
+	}
+
+	if($ip eq "") {
+		$ip = getIp("Enter node IP address", true, false);
+	}
+	my $port = listen_port;
+	my $proto = getprotobyname('tcp');
+
+	# create a socket, make it reusable
+	my $sockFd;
+	socket($sockFd, PF_INET, SOCK_STREAM, $proto) or die "Can't open socket $!\n";
+	setsockopt($sockFd, SOL_SOCKET, SO_REUSEADDR, 1) or die "Can't set socket option to SO_REUSEADDR $!\n";
+	if (bind( $sockFd, pack_sockaddr_in($port, inet_aton($ip)))) {
+	} else {
+		logToFile("Bind on $ip:$port failed", LOGFATAL | LOGCONS);
+	}
+
+	listen($sockFd, 5) or die "listen: $!";
+
+	my $thread = threads->create(\&acceptAndRecv, $sockFd)->detach();   # runs independently; controller never joins it
+	return ($ip, $sockFd);
+}
+
+sub handleRemoteOp($$$) {
+	my $prompts = shift;
+	my $remoteMCs = shift;
+	my $files = shift;
+
+	my $command = $prompts->{"cmd"};
+	if(!(exists $installCmds{$command})) {
+		logToFile("Invalid command line parameter(s)", LOGERROR | LOGCONS);
+		printHelpAndExit();
+	}
+
+	logToFile("COMMAND: $command", LOGINFO | LOGCONS);
+
+	my $cmdData = $installCmds{$command};
+	my $selfIp;
+	my $sockFd;
+	if ($cmdData->{'connection'} == true) {
+		($selfIp, $sockFd) = &setUpServer();
+	}
+
+	#untar PLT package to get query_mlc package.
+	#install query_mlc package
+	#find package tar file for commands install, upgrade
+	#untar the package remotely for commands install, upgrade
+	#cp the NodeLicense.lic file for install, upgrade
+	#execute the command
+	my $tardir = &untarPltPkg();
+	chdir($tardir);
+	# install python preconditions for mlc query scripts for GT HA
+	System("./pexpect_install", 1, "Cound not install pexpect");
+	chdir($gLDirPath);
+
+	my $queryMlcFile = &getFileNameFromPltDir($tardir, "query_mlc.py");
+	if($queryMlcFile eq "") {
+		logToFile ("query_mlc.py not present", LOGFATAL | LOGCONS);
+	}
+	$files->{'query'} = $queryMlcFile;
+	$gQueryMlcFile    = $queryMlcFile;  # make available to signalHandler
+
+	# ---------------------------------------------------------------
+	# Dispatch: parallel for listed commands, sequential for the rest.
+	# ---------------------------------------------------------------
+	if (exists $gParallelCmds{$command}) {
+		my $nodeCount = scalar(@{$remoteMCs});
+		logToFile(
+			"PARALLEL: dispatching $command to $nodeCount node(s) concurrently",
+			LOGINFO | LOGCONS);
+
+		my @workerThreads;
+		foreach my $param (@{$remoteMCs}) {
+			my $t = threads->create(
+				\&startOnMachine,
+				$prompts, $param, $files, $selfIp
+			);
+			push @workerThreads, $t;
+		}
+
+		# Block until every node thread finishes; collect per-thread failures.
+		my $failCount = 0;
+		foreach my $t (@workerThreads) {
+			$t->join();
+			if (defined $t->error()) {
+				logToFile("Thread error: " . $t->error(), LOGERROR | LOGCONS);
+				$failCount++;
+			}
+		}
+
+		if ($failCount > 0) {
+			logToFile(
+				"PARALLEL: $command completed - $failCount of $nodeCount node(s) FAILED (see above)",
+				LOGINFO | LOGCONS);
+		} else {
+			logToFile(
+				"PARALLEL: all $nodeCount node(s) completed $command successfully",
+				LOGINFO | LOGCONS);
+		}
+
+	} else {
+		# Sequential path -- preserved for patch / activate / upgrade.
+		foreach my $param (@{$remoteMCs}) {
+			startOnMachine($prompts, $param, $files, $selfIp);
+		}
+	}
+
+	unlink($gPromptsFile);
+
+	if(defined $sockFd) {
+		close $sockFd;
+	}
+}
+
+sub updateStatusFile ($$$)
+{
+	my $ipaddr = shift;
+	my $entry = shift;
+	my $statusFile = shift;
+
+	# Serialise concurrent status-file updates from parallel threads.
+	# lock() releases automatically when the sub returns (scope-based).
+	lock($gStatusFileMutex);
+
+	my @entries = ();
+	if (open(CONF, "<",$statusFile)) {
+		@entries=<CONF>;
+		close (CONF);
+	}
+
+	my $done = false;
+	open(CONF, ">",$statusFile);
+	foreach my $line (@entries) {
+		my @values = split('@', $line);
+		chomp(@values);
+		if($values[0] eq $ipaddr) {
+			print CONF "$ipaddr\@$entry\n";
+			$done = true;
+		} else {
+			print CONF $line;
+		}
+	}
+	# add the line if this was not present.
+	if($done == false) {
+		print CONF "$ipaddr\@$entry\n";
+	}
+	close (CONF);
+
+}
+
+sub executeRemoteCmd($$$$)
+{
+	my $queryMlcFile = shift;
+	my $inputCmd = shift;
+	my $logresult = shift;
+	my $logfd = shift;
+
+	my $execCmd = sprintf("%s %s", $queryMlcFile, $inputCmd);
+	my $cmdop = `$execCmd`;
+
+	my $failed = "";
+	chomp($cmdop);
+	if($cmdop =~ /^invalid password/) {
+		$failed = "invalid password";
+	} elsif ($cmdop =~ /^timed?out/) {
+		$failed = "ssh timedout";
+	} elsif ($cmdop =~ /FATAL;/i) {
+		my @errArray = split("FATAL;", $cmdop);
+		chomp(@errArray);
+		$failed = $errArray[1];
+	} elsif ($cmdop =~ /No such file or directory/i) {
+		$failed = "$gProduct not installed";
+	} elsif ($cmdop =~ /No route to host/i) {
+		$failed = "Not rechable";
+	} elsif ($cmdop =~ /Host key verification failed/i) {
+		$failed = "Host key verification failed. Check ~/.ssh/known_hosts";
+	}
+
+	if ($logresult == true) {
+		print $logfd "Command input::\n$execCmd\n";
+		print $logfd "Command output::\n$cmdop\n";
+	} else {
+		print $logfd "Command input::\n$execCmd\n";
+		print $logfd "Command output::\nDone\n";
+	}
+
+	return ($failed, $cmdop);
+}
+
+
+sub startOnMachine($$$$$)
+{
+	my $prompts = shift;
+	my $peerData = shift;
+	my $files = shift;
+	my $selfIp = shift;
+
+	my $ipaddr = $peerData->{'ip'};
+	my $queryMlcFile = $files->{'query'};
+	my $statusFile = $files->{'status'};
+	my $logFile = $files->{'log'};
+	my $logfd;
+	open($logfd, ">>",$logFile);
+
+	my $command = $prompts->{"cmd"};
+	my $cmdData = $installCmds{$command};
+	my $filter = LOGINFO | LOGCONS;
+	my $loghdr = "$peerData->{'name'} ($ipaddr) STATUS:";
+	my $logstr = "<=========================================================>\n$loghdr";
+
+	if ($cmdData->{'status'} == true) {
+		if ($peerData->{'status'} eq "") {
+			$logstr = sprintf("%s Begin", $logstr);
+		} elsif ($peerData->{'status'} eq "done") {
+			$logstr = sprintf("%s Completed\n", $logstr);
+			logToFile($logstr, $filter);
+			return;
+		} elsif ($peerData->{'status'} =~ /^Failed/) {
+			$filter = LOGERROR | LOGCONS;
+			$logstr = sprintf("%s %s. Restarting", $logstr, $peerData->{'status'});
+		}
+	} else {
+		$logstr = sprintf("%s Begin", $logstr);
+	}
+
+	logToFile($logstr, $filter);
+	my $timestamp = `date`;
+	chomp $timestamp;
+	print $logfd "[$timestamp] $logstr\n";
+
+	# invoke scp to transfer tar file from local to remote.
+	# package is transferred to /tmp of remote.
+	# after transfer untar.
+	# then transfer nodelicense.lic.
+	# Invoke the command
+	my $remoteInstallDir = "/tmp/.install";
+	my $relDir = basename($gLDirPath);
+	my $peercmd = sprintf("rm -rf $remoteInstallDir; mkdir -p $remoteInstallDir", $relDir);
+	my $execCmd = sprintf("ssh %s %s %s 30 \"%s\"", $ipaddr, $peerData->{'uid'}, $peerData->{'password'}, $peercmd);
+	my ($failed, $cmdop) = &executeRemoteCmd($queryMlcFile, $execCmd, false, $logfd);
+	if( $failed ne "") {
+		logToFile("$loghdr Failed ($failed)\n", LOGERROR | LOGCONS);
+		# update the status file and abort the operation.
+		if ($cmdData->{'status'} == true) {
+			my $entry = sprintf("Failed (%s)", $failed);
+			&updateStatusFile($ipaddr, $entry, $statusFile);
+			logToFile("Operation aborted", LOGFATAL | LOGCONS);
+		}
+		return;
+	}
+	# /tmp/.install now exists on remote — register for signal-handler cleanup.
+	{ lock(%gRemoteCleanupUid);      $gRemoteCleanupUid{$ipaddr}      = $peerData->{'uid'}; }
+	{ lock(%gRemoteCleanupPassword); $gRemoteCleanupPassword{$ipaddr} = $peerData->{'password'}; }
+	my $installCmd = basename($0);
+	if ($cmdData->{'transferinstall'} == true) {
+		$execCmd = sprintf("cmd \"scp %s %s@%s:%s\" %s %s 120",
+			$installCmd, $peerData->{'uid'}, $ipaddr, $remoteInstallDir, $peerData->{'uid'}, $peerData->{'password'});
+	} else {
+		$execCmd = sprintf("cmd \"scp -r %s %s@%s:%s\" %s %s 120",
+			$gLDirPath, $peerData->{'uid'}, $ipaddr, $remoteInstallDir, $peerData->{'uid'}, $peerData->{'password'});
+	}
+
+	($failed, $cmdop) = &executeRemoteCmd($queryMlcFile, $execCmd, false, $logfd);
+	if( $failed ne "") {
+		logToFile("$loghdr Failed ($failed)\n", LOGERROR | LOGCONS);
+		# update the status file and abort the operation.
+		if ($cmdData->{'status'} == true) {
+			my $entry = sprintf("Failed (%s)", $failed);
+			&updateStatusFile($ipaddr, $entry, $statusFile);
+			logToFile("Operation aborted", LOGFATAL | LOGCONS);
+		}
+		return;
+	}
+
+	if ($cmdData->{'transferinstall'} == true) {
+		$peercmd = sprintf("cd %s; ./%s -a=%s:%d %s",
+			$remoteInstallDir, $installCmd, $selfIp, listen_port, $command);
+	} else {
+		$peercmd = sprintf("cd %s/%s; ./%s -a=%s:%d %s",
+			$remoteInstallDir, $relDir, $installCmd, $selfIp, listen_port, $command);
+	}
+	my $execCmd = sprintf("ssh %s %s %s 300 \"%s\"", $ipaddr, $peerData->{'uid'}, $peerData->{'password'}, $peercmd);
+	($failed, $cmdop) = &executeRemoteCmd($queryMlcFile, $execCmd, true, $logfd);
+	my $installFailed = $failed;   # save install outcome before cleanup overwrites $failed
+	if( $installFailed ne "") {
+		logToFile("$loghdr Failed ($installFailed)\n", LOGERROR | LOGCONS);
+		# update the status file — cleanup runs below before aborting.
+		if ($cmdData->{'status'} == true) {
+			my $entry = sprintf("Failed (%s)", $installFailed);
+			&updateStatusFile($ipaddr, $entry, $statusFile);
+		}
+	} else {
+		if ($cmdData->{'status'} == true) {
+			my $entry = "done";
+			&updateStatusFile($ipaddr, $entry, $statusFile);
+		} else {
+			logToFile("$cmdop", LOGCONS);
+		}
+		logToFile("$loghdr Completed\n", LOGINFO | LOGCONS);
+		print $logfd "$loghdr Completed\n";
+	}
+
+	#clean up remote machine — must always run, even on install failure,
+	#before any thread-terminating LOGFATAL call below.
+	my $peercmd = sprintf("rm -rf $remoteInstallDir", $relDir);
+	my $execCmd = sprintf("ssh %s %s %s 30 \"%s\"", $ipaddr, $peerData->{'uid'}, $peerData->{'password'}, $peercmd);
+	my ($failed, $cmdop) = &executeRemoteCmd($queryMlcFile, $execCmd, false, $logfd);
+	# /tmp/.install removed — deregister so signalHandler skips this node.
+	{ lock(%gRemoteCleanupUid);      delete $gRemoteCleanupUid{$ipaddr}; }
+	{ lock(%gRemoteCleanupPassword); delete $gRemoteCleanupPassword{$ipaddr}; }
+
+	# Now safe to abort the thread — cleanup has already happened.
+	if ($installFailed ne "" && $cmdData->{'status'} == true) {
+		logToFile("Operation aborted", LOGFATAL | LOGCONS);
+	}
+}
+
+sub connectAndRecv($) {
+	my $ipAndPort = shift;
+
+	my ($ip, $port) = split(":", $ipAndPort);
+	my $proto = getprotobyname('tcp');
+
+	# create a socket, make it reusable
+	socket($gPeerSockFd, PF_INET, SOCK_STREAM, $proto) or die "Can't open socket $!\n";
+	if (connect( $gPeerSockFd, pack_sockaddr_in($port, inet_aton($ip)))) {
+	} else {
+		logToFile("Connect on $ip:$port failed", LOGFATAL | LOGCONS);
+	}
+
+}
+
+sub handleLocalStart($)
+{
+	my $prompts = shift;
+
+	my $command = $prompts->{"cmd"};
+	my $cmdData = $installCmds{$command};
+
+	if(exists $prompts->{"-a"}) {
+		$gCentralizedOp = true;
+		if($cmdData->{'connection'} == true) {
+
+			my $ipAndPort = $prompts->{"-a"};
+			#my $thread = new Thread \&connectAndRecv, $ipAndPort;
+			&connectAndRecv($ipAndPort);
+		}
+	}
+
+	my $function = $cmdData->{'function'};
+	if(exists $installCmds{$command}) {
+		if (exists $cmdData->{'function'}) {
+			if ($cmdData->{'root'} == true) {
+				&checkRootAndExit();
+			}
+			$function->($prompts);
+		} else {
+			logToFile ("Command $command: No function available", LOGFATAL | LOGCONS);
+		}
+	} else {
+		logToFile ("Invalid command line parameter(s)", LOGERROR | LOGCONS);
+		printHelpAndExit();
+	}
+}
+
+sub updateBaseDir()
+{
+
+	if ( $gActiveBinDir =~ /polaris/) {
+		return;
+	}
+
+	my $relPathRedn = sprintf("/%sredn/release", $gProductLegacy);
+	my $legRelPathRedn = sprintf("/%sredn/release", lc($gProductLegacy));
+	my $legRelPath = sprintf("%s/%s/release", $gHomeDir, lc($gProductLegacy));
+
+	if($gIsUpgrade == true) {
+		my $installPath = sprintf("%s/%s/active", $gHomeDir, lc($gProductLegacy));
+		if( -l $installPath )  {
+			if(-l $gBasePath || -d $gBasePath) {
+				# this would be result of previous upgrade from mlc->mlccn
+				# no need to delete soft link
+			} else {
+				my $oldinstallPath = sprintf("%s/%s", $gHomeDir, lc($gProductLegacy));
+				#System("$rmCmd -rf $gBasePath", 1, "Could not delete link for active release");
+				System("$lnCmd -s $oldinstallPath $gBasePath", 1, "Could not create soft link for Release");
+			}
+
+			my $basePath	= "/${gProductLc}redn";
+			$installPath = sprintf("/%sredn/active", lc($gProductLegacy));
+			if( -l $installPath )  {
+				if(-l $basePath || -d $basePath) {
+			# this would be result of previous upgrade from mlc->mlccn
+				# no need to delete soft link
+			} else {
+				my $oldinstallPath = sprintf("/%sredn", lc($gProductLegacy));
+				#System("$rmCmd -rf $basePath", 1, "Could not delete link for active release");
+				System("$lnCmd -s $oldinstallPath $basePath", 1, "Could not create soft link for Release");
+			}
+		}
+
+		} else {
+			$gProductLegacy = "";
+		}
+	}
+}
+
+sub procStart ($)
+{
+	my $prompts = shift;
+	$gActiveBinDir = $gLDirPath;
+	&updateBaseDir();
+
+	&startForCurrentRelease($prompts);
+}
+
+sub procStop ($)
+{
+	my $prompts = shift;
+	$gActiveBinDir = $gLDirPath;
+	&updateBaseDir();
+
+	&stopForCurrentRelease($prompts);
+}
+
+sub procStatus ($)
+{
+	my $prompts = shift;
+	$gActiveBinDir = $gLDirPath;
+	&updateBaseDir();
+
+	&statusForCurrentRelease($prompts);
+}
+
+sub procReStart ($)
+{
+	my $prompts = shift;
+	$gActiveBinDir = $gLDirPath;
+	&updateBaseDir();
+
+	&stopForCurrentRelease($prompts);
+	sleep(1);
+	&startForCurrentRelease($prompts);
+}
+
+sub procInstall ($)
+{
+	my $prompts = shift;
+	&installMlc($prompts);
+}
+
+sub procPatch ($)
+{
+	my $prompts = shift;
+	&patchMlc($prompts);
+}
+
+sub procActivate ($)
+{
+	my $prompts = shift;
+	$gActiveBinDir = $gLDirPath;
+	&updateBaseDir();
+
+	&activateMlc($prompts);
+}
+
+sub procUpgrade ($)
+{
+	my $prompts = shift;
+	$gIsUpgrade = true;
+	$gActiveBinDir = $gLDirPath;
+
+	&updateBaseDir();
+
+	&upgradeMLC($prompts);
+}
+
+sub procUninstall ($)
+{
+	my $prompts = shift;
+	$gActiveBinDir = $gLDirPath;
+	&updateBaseDir();
+
+	&uninstallMlc($prompts);
+}
+
+sub procShowRel ($)
+{
+	my $prompts = shift;
+	$gActiveBinDir = $gLDirPath;
+	&updateBaseDir();
+
+	&showReleases($prompts);
+}
+
+sub procConfigure ($)
+{
+	my $prompts = shift;
+	&configureMlc($prompts);
+}
+
+sub handleMountCmd($) {
+
+	my $mountPath = shift;
+
+	if (-d $gBasePath) {
+		# check if /Disk is already mounted. if not unmount and mount again
+		my @mounts = `$mountCmd`;
+		my $found = false;
+		foreach my $mount (@mounts) {
+			my @field = split(" ", $mount);
+			if($field[2] eq $gBasePath) {
+				$found = true;
+				#logToFile("$gBasePath is mounted from $field[0]. Unmounting $gBasePath from $mountPath", true);
+				System("$umountCmd  $gBasePath", 1, "$umountCmd  $gBasePath failed");
+			}
+		}
+
+		#if($found == false) {
+		#	logToFile("$gBasePath is configured as mount path. $gBasePath is created on local disk.", true);
+		#	exit(0);
+	} else {
+		System("$mkdirCmd -p $gBasePath", 1, "$mkdirCmd  $gBasePath failed");
+	}
+
+	System("$mountCmd  $mountPath $gBasePath", 1, "$mountCmd  $mountPath $gBasePath failed");
+	logToFile("$gBasePath mount success", LOGINFO | LOGCONS);
+	return;
+}
+
+sub activateMlc()
+{
+	my $promptHash = shift;
+
+	&getBaseInstallPath(false);
+
+	my $appMgrLinkName = sprintf("%s_%s", $gProduct, $gAppMgrName);
+	my $foundAPPMGR = `/bin/ps -ef | /bin/grep $appMgrLinkName| /bin/grep -v grep `;
+	chomp($foundAPPMGR);
+	if( $foundAPPMGR =~ m/AppMgr/i) {
+		logToFile ("Please stop $gProduct applications to proceed", LOGFATAL | LOGCONS);
+	}
+
+	chdir("/tmp");
+	my @relDataArr;
+	my %relHash = getInstalledReleases(\@relDataArr);
+	my $hashSize = scalar(keys( %relHash ));
+	if( $hashSize == 0) {
+		logToFile ("No software release available", LOGFATAL | LOGCONS);
+	}
+
+	my $prompt = "Enter release to activate";
+	my $cnt = 1;
+	my @rels = ();
+	my $activeRel = "";
+	foreach my $release (@relDataArr) {
+		if($release->{'type'} ne $gActiveKey) {
+			if($cnt == 1) {
+				$prompt = sprintf("%s [%d - %s", $prompt, $cnt, $release->{'rel'}) ;
+			} else {
+				$prompt = sprintf("%s, %d - %s", $prompt, $cnt, $release->{'rel'}) ;
+			}
+			push(@rels, $release->{'rel'});
+			$cnt++;
+		} else {
+			$activeRel  = $release->{'rel'};
+		}
+	}
+
+	if($cnt == 1) {
+		logToFile ("Release $activeRel active. No more software release available to activate", LOGERROR | LOGCONS);
+		return;
+	}
+
+# more than two releases are installed. Give a prompt to uniinstall all the release version
+	$prompt = sprintf("%s ]", $prompt, $cnt) ;
+
+	# prompt option only if there are more than two choices
+	my $choice;
+	if($cnt == 2) {
+		$choice = $cnt - 1 ;
+	} else {
+		$choice = &getPromptInput("$prompt");
+	}
+
+	$choice = int($choice);
+	if($choice < 1 || $choice > $cnt) {
+		logToFile ("Invalid choice", LOGFATAL | LOGCONS);
+	}
+
+	my $relDir = getReleaseDir($rels[$choice -1]);
+#relink the active release;
+	&createActiveRelLink($relDir);
+
+	my $timestamp = `date`;
+	chomp $timestamp;
+	my $doneentry = sprintf("activate: %s", $timestamp);
+	my $logfd;
+	my $doneFile = "$relDir/$gCompletedFile";
+	open($logfd, ">>",$doneFile);
+	print $logfd "$doneentry\n";
+	close($logfd);
+
+	logToFile ("Activated release $rels[$choice -1]", LOGINFO | LOGCONS);
+
+	# start PM CLI and BRM as soon as activate is successful
+	my $entry;
+	if($gRhelVer >= 6) {
+		$entry = "${gProductLc}brm";
+	} else {
+		$entry = "brm:2345:respawn";
+	}
+	&removeInitTabEntry($entry);
+	&setupBRM();
+
+	#System("$initCmd q", 1, "Could not re-examine inittab");
+
+# start the UMLS applications.
+# startMLCApplication();
+}
+
+sub getLegacyInstallPath($) {
+	my $installedRels = shift;
+	my $oldHomeDir = Cwd::abs_path(sprintf("%s/%s", $gHomeDir, lc($gProductLegacy)));
+	my $newHomeDir = Cwd::abs_path(sprintf("%s/%s", $gHomeDir, lc($gProduct)));
+	# if absolute path are same, mlccn is soflink of mlc
+	if($oldHomeDir eq $newHomeDir) {
+		return;
+	}
+	my $installPath = sprintf("%s/%s/active", $gHomeDir, lc($gProductLegacy));
+	if( -l $installPath )  {
+       		$installedRels->{$gProductLegacy} = $installPath;
+	} else {
+		$gProductLegacy = "";
+	}
+}
+
+sub upgradeMLC()
+{
+
+	my $promptHash = shift;
+	my $release = getRelease();
+
+	&getBaseInstallPath(false);
+	logToFile ("Upgrade Path: $gBasePath", LOGINFO | LOGCONS);
+
+	my @relDataArr;
+	my %relHash = getInstalledReleases(\@relDataArr);
+	my $oldRelDir;
+	my $oldDelRel;
+	my $nodeLicFile = "NodeLicense.lic";
+
+	if($relHash{$release} ne "") {
+		logToFile ("Release $release already installed", LOGFATAL | LOGCONS);
+	}
+
+	foreach my $relData (@relDataArr) {
+		if($relData->{'type'} eq $gActiveKey) {
+			$oldRelDir = $relData->{'dir'};
+			$nodeLicFile = sprintf("%s/%s/%s", $oldRelDir , $gBinDir, $nodeLicFile);
+		} elsif( $relData->{'type'} eq  $gInstalledKey)  {
+			$oldDelRel = $relData->{'rel'};
+		}
+	}
+
+	my $size = scalar (@relDataArr);
+	if ( $size <= 0) {
+# check if the old mlc release is installed
+# this is to upgrade from the legacy installations
+		my %oldRelDetails = ();
+		getLegacyInstallPath(\%oldRelDetails);
+		my $legRelSize = scalar keys %oldRelDetails;
+		if ( $legRelSize == 1 )  {
+# relatively straight forward got ahead with the migration
+# for this
+			foreach my $key (keys %oldRelDetails) {
+				logToFile ("Upgrading from $key", LOGINFO | LOGCONS);
+				$oldRelDir = $oldRelDetails{$key};
+				$nodeLicFile = sprintf("%s/%s/%s", $oldRelDir , $gBinDir, $nodeLicFile);
+			}
+		} elsif( $legRelSize <= 0 ) {
+			logToFile ("No software release available. Run install", LOGFATAL | LOGCONS);
+		}
+	}
+
+	if( $oldRelDir eq "") {
+# opps this  system has two installed version.
+# there is not way this scritp can decide which
+# once is to be removed and which one should be
+# used for upgrade
+# humbly ask user to active one release
+		logToFile ("No software release active", LOGFATAL | LOGCONS);
+	}
+#read previous INI file
+	my %iniConfig = ();
+
+	my %oldRelData = ();
+	getOldRelDir($oldRelDir, \%oldRelData);
+	my $oldPath =  $oldRelData{'rel'};
+
+	my $iniFile = sprintf("%s/%s", $oldPath, $gIniFile);
+	readIniFile($iniFile, \%iniConfig, true);
+
+	my $nodeCnt = &getParam(\%iniConfig, "PLATFORM_SVCS", "SstInstanceId");
+
+# check license files
+	my %configHash = ();
+	my @licssts = ();
+# first check for the node license file in the current directory
+# if user wants to update the license he can put the new node license file
+# in the current working directory and upgrade
+	my $nodeLicFileLocal = "NodeLicense.lic";
+	my $licensed;
+	my $localLic = false;
+	if( -f $nodeLicFileLocal) {
+		$licensed = &checkLicense(\%configHash, \@licssts, $nodeLicFileLocal, $nodeCnt);
+		$localLic = true;
+	} else {
+		$licensed = &checkLicense(\%configHash, \@licssts, $nodeLicFile, $nodeCnt);
+	}
+	if($licensed == 0) {
+		logToFile ("License failure", LOGFATAL | LOGCONS);
+	}
+
+# create the polaris user
+	&createPolarisUser();
+
+	my $cnt = $licensed;
+# setup platform instance as its not set in the loop  below
+	$gPltSstDetail{'Instance'} = $cnt;
+
+
+# delete sections which are regenerated
+	delParam( \%iniConfig, "OAMAgent","IgnoreModulesForProcessMonitoring");
+	delParam( \%iniConfig, "OamProxy","IgnoreForCkpt");
+	delParam( \%iniConfig, "FaultMonitor","M3uaLinkSections");
+	delParam( \%iniConfig, "FaultMonitor","M3uaSections");
+	delParam( \%iniConfig, "FaultMonitor","Mtp2ConvLinkSections");
+	delParam( \%iniConfig, "FaultMonitor","Mtp3ConvSections");
+	delParam( \%iniConfig, "FaultMonitor","SctpSections");
+	delParam( \%iniConfig, "FaultMonitor","SgwAppSections");
+	my $releaseDir = &installSsts(\@licssts, \%configHash, $cnt, \%iniConfig);
+	my $status = &configureSsts(\@licssts, $releaseDir, $oldRelDir, \%iniConfig, \%configHash);
+
+# if the licesne file used was local copy the license file to the insallation directory
+	if($localLic == true) {
+		my $file = "NodeLicense.lic";
+		my $oldPath = "$gLDirPath";
+		my $newPath = "$releaseDir/$gBinDir";
+		copyFileFromPrevRel($file, $file, $newPath, $oldPath);
+	}
+
+	&setupMlcDaemon();
+
+	my $timestamp = `date`;
+	chomp $timestamp;
+	my $doneentry = sprintf("upgrade: %s", $timestamp);
+	my $logfd;
+	my $doneFile = "$releaseDir/$gCompletedFile";
+	open($logfd, ">>",$doneFile);
+	print $logfd "$doneentry\n";
+	close($logfd);
+
+	logToFile ("$gProduct successfully configured", LOGCONS);
+	logToFile ("$gProduct successfully upgraded to release $release", LOGINFO | LOGCONS);
+	&printInstalledComponents(\@licssts, \%iniConfig, \%configHash, $release);
+	logToFile ("Use \"activate\" option to activate release $release", LOGCONS);
+	deleteRelease($oldDelRel);
+
+	if($gIsLinux == false) {
+# setup crontab entry
+		setUpCrontab();
+	}
+
+	# setup syslog
+	# &setUpSyslogInit();
+
+	if($gUsingOpensaf == false) {
+		# BUG-902: commenting all change ownership, as it takes log of time over nas. 
+		# On need selective directories can be added
+		#System("$chownCmd -R $gUser:$gGroup $gBasePath", 1, "Could not change owner of the directories");
+	}
+# do not start the MLC applications.
+# allow user to re-configure
+# startMLCApplication();
+}
+
+sub patchMlc($) {
+	my $promptHash = shift;
+	my $release = getRelease();
+
+	&getBaseInstallPath(false);
+	logToFile ("Patch Path: $gBasePath", LOGINFO | LOGCONS);
+
+	my @relDataArr;
+	my %relHash = getInstalledReleases(\@relDataArr);
+	my $oldRelDir;
+	my $oldDelRel;
+	my $nodeLicFile = "NodeLicense.lic";
+
+	if($relHash{$release} ne "") {
+		logToFile ("Release $release already installed", LOGFATAL | LOGCONS);
+	}
+
+	foreach my $relData (@relDataArr) {
+		if($relData->{'type'} eq $gActiveKey) {
+			$oldRelDir = $relData->{'dir'};
+			$nodeLicFile = sprintf("%s/%s/%s", $oldRelDir , $gBinDir, $nodeLicFile);
+		} elsif( $relData->{'type'} eq  $gInstalledKey)  {
+			$oldDelRel = $relData->{'rel'};
+		}
+	}
+
+	my $size = scalar (@relDataArr);
+	if ( $size <= 0) {
+		logToFile ("No software release active", LOGFATAL | LOGCONS);
+	}
+
+#read previous INI file
+	my %iniConfig = ();
+
+	my %oldRelData = ();
+	getOldRelDir($oldRelDir, \%oldRelData);
+	my $oldPath =  $oldRelData{'rel'};
+
+	my $iniFile = sprintf("%s/%s", $oldPath, $gIniFile);
+	readIniFile($iniFile, \%iniConfig, false);
+
+	my $nodeCnt = &getParam(\%iniConfig, "PLATFORM_SVCS", "SstInstanceId");
+
+# check license files
+	my %configHash = ();
+	my @licssts = ();
+# first check for the node license file in the current directory
+# if user wants to update the license he can put the new node license file
+# in the current working directory and upgrade
+	my $nodeLicFileLocal = "NodeLicense.lic";
+	my $licensed;
+	my $localLic = false;
+	if( -f $nodeLicFileLocal) {
+		$licensed = &checkLicense(\%configHash, \@licssts, $nodeLicFileLocal, $nodeCnt);
+		$localLic = true;
+	} else {
+		$licensed = &checkLicense(\%configHash, \@licssts, $nodeLicFile, $nodeCnt);
+	}
+	if($licensed == 0) {
+		logToFile ("License failure", LOGFATAL | LOGCONS);
+	}
+
+	my $cnt = $licensed;
+# setup platform instance as its not set in the loop  below
+	$gPltSstDetail{'Instance'} = $cnt;
+
+	my %patchConfig = ();
+	readIniFile("patch.ini", \%patchConfig, true);
+	my $status;
+	# call to apply pre-checks
+	if  ($promptHash->{"cmd"} eq "patch_global_pre") {
+		$promptHash->{"-g"} = "pre";
+		$status = &checkPatch($promptHash, \%configHash, $cnt, \%iniConfig, \%patchConfig, "pre");
+		logToFile ("$gProduct global pre patch successful for $release", LOGINFO | LOGCONS);
+
+	} elsif ($promptHash->{"cmd"} eq "patch") {
+		# call to apply patch.
+		$status = &checkPatch($promptHash, \%configHash, $cnt, \%iniConfig, \%patchConfig, "pre");
+		$status = &checkPatch($promptHash, \%configHash, $cnt, \%iniConfig, \%patchConfig, "patch");
+		$status = &checkPatch($promptHash, \%configHash, $cnt, \%iniConfig, \%patchConfig, "post");
+
+		logToFile ("$gProduct successfully patched to release $release", LOGINFO | LOGCONS);
+
+		if($gUsingOpensaf == false) {
+			# BUG-902: commenting all change ownership, as it takes log of time over nas. 
+			# On need selective directories can be added
+			#System("$chownCmd -R $gUser:$gGroup $gBasePath", 1, "Could not change owner of the directories");
+		}
+
+	} elsif  ($promptHash->{"cmd"} eq "patch_global_post") {
+		$promptHash->{"-g"} = "post";
+		$status = &checkPatch($promptHash, \%configHash, $cnt, \%iniConfig, \%patchConfig, "post");
+		logToFile ("$gProduct global post patch successful for $release", LOGINFO | LOGCONS);
+	}
+
+
+}
+
+sub startService($$$)
+{
+	my $polarisentry = shift;
+	my $startcmd = shift;
+	my $stopcmd = shift;
+	my $logTxt = shift;
+	my $exitOnFail = shift;
+	my $initfile = sprintf("/usr/lib/systemd/system/%s.service", $polarisentry);
+	open(INITCONF, ">",$initfile) or die "Could not open $initfile";
+	print INITCONF "[Unit]\n";
+	print INITCONF "Description=$gProduct $logTxt service\n";
+	print INITCONF "After=remote-fs.target syslog.target network.target\n";
+	print INITCONF "\n";
+	print INITCONF "[Service]\n";
+	print INITCONF "ExecStart=/bin/bash $gActiveBinDir/$gStartAppName $startcmd\n";
+	if($stopcmd ne "") {
+		print INITCONF "ExecStop=/bin/bash $gActiveBinDir/$gStartAppName $stopcmd\n";
+	}
+	print INITCONF "Type=simple\n";
+	print INITCONF "Restart=always\n";
+	print INITCONF "TimeoutSec=30s\n";
+	print INITCONF "\n";
+	print INITCONF "[Install]\n";
+	print INITCONF "WantedBy=multi-user.target\n";
+	close (INITCONF);
+	my $status = `$systemctlCmd daemon-reload`;
+	$status = `$systemctlCmd is-active $polarisentry`;
+	chomp($status);
+	logToFile("$gProduct $logTxt is-active status $status", LOGINFO);
+	if (($status =~ /unknown/) || ($status =~ /failed/) || ($status =~ /inactive/)) {
+
+		if($polarisentry =~ /daemon/) {
+			$status = `pkill $polarisentry`;
+		}	
+		$status = `$systemctlCmd enable $polarisentry > /dev/null 2>&1`;
+		$status = `$systemctlCmd is-enabled $polarisentry`;
+		chomp($status);
+		logToFile("$gProduct $logTxt is-enabled status $status", LOGINFO);
+		if ($status =~ /enabled/) {
+			$status = `$systemctlCmd start $polarisentry > /dev/null 2>&1`;
+			chomp($status);
+			logToFile("$gProduct $logTxt start status $status", LOGINFO);
+			$status = `$systemctlCmd is-active $polarisentry`;
+			chomp($status);
+			logToFile("$gProduct $logTxt is-active status $status", LOGINFO);
+		} else {
+			logToFile("$gProduct $logTxt failed to start", LOGINFO | LOGCONS);
+			if($exitOnFail == true) {
+				exit(0);
+			}
+		}
+	} elsif (($status =~ /active/)) {
+		if($polarisentry =~ /daemon/) {
+			my $ppid=getppid();
+   			my $pname = `ps hp $ppid -o %c`;
+   			chomp $pname;
+			if ($pname =~ /$polarisentry/) {
+			} else {
+				$status = `$systemctlCmd stop $polarisentry`;
+				chomp($status);
+				logToFile("$gProduct $logTxt stop status $status", LOGINFO);
+				$status = `$systemctlCmd start $polarisentry > /dev/null 2>&1`;
+				chomp($status);
+				logToFile("$gProduct $logTxt start status $status", LOGINFO);
+				$status = `$systemctlCmd is-active $polarisentry`;
+				chomp($status);
+				logToFile("$gProduct $logTxt is-active status $status", LOGINFO);
+			}
+		} else {
+			if($logTxt eq "Applications") {
+				logToFile("$gProduct $logTxt already running", LOGINFO | LOGCONS);
+			}
+			if($exitOnFail == true) {
+				exit(0);
+			}
+		}	
+
+	} else {
+		if($logTxt eq "Applications") {
+			logToFile("$gProduct $logTxt already running", LOGINFO | LOGCONS);
+		}
+		if($exitOnFail == true) {
+			exit(0);
+		}
+	}
+}
+sub setupAppMgr()
+{
+
+	my $polarisentry = "${gProductLc}appmgr";
+	if($gRhelVer == 7) {
+		&startService($polarisentry, "service start", "service stop", "Applications", true);
+	} elsif ($gRhelVer == 6) {
+		my $initfile = sprintf("/etc/init/%s.conf", $polarisentry);
+		open(INITCONF, ">",$initfile) or die "Could not open $initfile";
+		print INITCONF "start on stopped rc RUNLEVEL=[2345]\n";
+		print INITCONF "stop on starting runlevel [016]\n";
+		print INITCONF "respawn\n";
+		my $appMgrLinkName = sprintf("%s_%s", $gProduct, $gAppMgrName);
+		print INITCONF "exec $gActiveBinDir/$gStartAppName $appMgrLinkName\n";
+		close (INITCONF);
+		my $status = `$initctlCmd status $polarisentry`;
+		if ($status =~ /running/) {
+			# already running
+			#logToFile("$gProduct Applications already running", LOGINFO | LOGCONS);
+			exit(0);
+		} else {
+			System("$initctlCmd reload-configuration", 0, "$initctlCmd reload-configuration failed");
+			System("$initctlCmd start $polarisentry", 1, "$initctlCmd start $polarisentry failed");
+		}
+	} else {
+		if(-e "$gInitTabFile.orig")
+		{
+#do not copy if the orig file exits.
+		}
+		else
+		{
+			System("$cpCmd $gInitTabFile $gInitTabFile.orig", 1, "Could not take backup of the inittab file");
+		}
+
+		my $polarisentry;
+		$polarisentry = "am:2345:respawn";
+
+		my $appMgrLinkName = sprintf("%s_%s", $gProduct, $gAppMgrName);
+		open(INITCONF, "<",$gInitTabFile) or die "Could not open $gInitTabFile.";
+		my @entries=<INITCONF>;
+		close (INITCONF);
+
+		open(INITCONF, ">",$gInitTabFile) or die "Could not open $gInitTabFile.";
+		foreach my $line (@entries)
+		{
+			if ($line =~ /^$polarisentry/)
+			{
+			}
+			else
+			{
+				print INITCONF $line;
+			}
+		}
+
+		print INITCONF "$polarisentry:$gActiveBinDir/$gStartAppName $appMgrLinkName\n";
+
+		close (INITCONF);
+		System("$initCmd q", 1, "Could not re-examine inittab");
+	}
+}
+
+sub setupSctp()
+{
+	System("/etc/init.d/sctp start", 1, "/etc/init.d/sctp start failed");
+}
+
+sub setupMlcDaemon()
+{
+	if($gProductLegacy ne "") {
+		my $legacyentry;
+		$legacyentry = sprintf("%sdaemon", lc($gProductLegacy));
+		&removeInitTabEntry($legacyentry);
+	}
+
+	my $polarisentry = "${gProductLc}daemon";
+
+	if($gRhelVer == 7) {
+		&startService($polarisentry, $gMlcDaemon, "", $gMlcDaemon, false);
+	} elsif ($gRhelVer == 6) {
+		&removeInitTabEntry("pmcli");
+		my $initfile = sprintf("/etc/init/%s.conf", $polarisentry);
+		open(INITCONF, ">",$initfile) or die "Could not open $initfile";
+		print INITCONF "start on stopped rc RUNLEVEL=[2345]\n";
+		print INITCONF "stop on starting runlevel [016]\n";
+		print INITCONF "respawn\n";
+		print INITCONF "exec $gActiveBinDir/$gStartAppName $gMlcDaemon\n";
+		close (INITCONF);
+		my $status = `$initctlCmd status $polarisentry`;
+		if ($status =~ /running/) {
+			# stop only if its not called from mlcdaemon
+			my $ppid=getppid();
+			my $pname = `ps hp $ppid -o %c`;
+			chomp $pname;
+			if ($pname =~ /$polarisentry/) {
+			} else {
+				System("$initctlCmd stop $polarisentry", 0, "$initctlCmd stop $polarisentry failed");
+				System("$initctlCmd start $polarisentry", 0, "$initctlCmd start $polarisentry failed");
+			}
+			# already running
+		} else {
+			System("$initctlCmd reload-configuration", 0, "$initctlCmd reload-configuration failed");
+			System("$initctlCmd start $polarisentry", 0, "$initctlCmd start $polarisentry failed");
+		}
+	} else {
+		if(-e "$gInitTabFile.orig") {
+#do not copy if the orig file exits.
+		} else {
+			System("$cpCmd $gInitTabFile $gInitTabFile.orig", 1, "Could not take backup of the inittab file");
+		}
+
+		my $polarisentry = "cli:2345:respawn";
+		open(INITCONF, "<",$gInitTabFile) or die "Could not open $gInitTabFile.";
+		my @entries=<INITCONF>;
+		close (INITCONF);
+
+		open(INITCONF, ">",$gInitTabFile) or die "Could not open $gInitTabFile.";
+		my $found = false;
+		foreach my $line (@entries) {
+			if ($line =~ /^$polarisentry/) {
+				$found = true;
+			}
+			print INITCONF $line;
+		}
+
+		if($found == false) {
+			print INITCONF "$polarisentry:$gActiveBinDir/$gStartAppName $gMlcDaemon\n";
+		}
+
+		close (INITCONF);
+		System("$initCmd q", 1, "Could not re-examine inittab");
+	}
+}
+
+sub setupBRM()
+{
+	if($gProductLegacy ne "") {
+		my $legacyentry;
+		$legacyentry = sprintf("%sbrm", lc($gProductLegacy));
+		&removeInitTabEntry($legacyentry);
+	}
+	my $brmLinkName;
+	my $polarisentry;
+	$polarisentry = "${gProductLc}brm";
+	$brmLinkName = sprintf("%s_%s daemon", $gProduct, $gBRMName);
+	if($gRhelVer == 7) {
+		&startService($polarisentry, $brmLinkName, "", $gBRMName, false);
+	} elsif ($gRhelVer == 6) {
+		my $initfile = sprintf("/etc/init/%s.conf", $polarisentry);
+		open(INITCONF, ">",$initfile) or die "Could not open $initfile";
+		print INITCONF "start on stopped rc RUNLEVEL=[2345]\n";
+		print INITCONF "stop on starting runlevel [016]\n";
+		print INITCONF "respawn\n";
+		print INITCONF "exec $gActiveBinDir/$gStartAppName $brmLinkName\n";
+		close (INITCONF);
+		my $status = `$initctlCmd status $polarisentry`;
+		if ($status =~ /running/) {
+			# already running
+		} else {
+			System("$initctlCmd reload-configuration", 0, "$initctlCmd reload-configuration failed");
+			System("$initctlCmd start $polarisentry", 1, "$initctlCmd start $polarisentry failed");
+		}
+	} else {
+		if(-e "$gInitTabFile.orig") {
+#do not copy if the orig file exits.
+		} else {
+			System("$cpCmd $gInitTabFile $gInitTabFile.orig", 1, "Could not take backup of the inittab file");
+		}
+
+		my $polarisentry = "brm:2345:respawn";
+		my $brmLinkName = sprintf("%s_%s daemon", $gProduct, $gBRMName);
+		open(INITCONF, "<",$gInitTabFile) or die "Could not open $gInitTabFile.";
+		my @entries=<INITCONF>;
+		close (INITCONF);
+
+		open(INITCONF, ">",$gInitTabFile) or die "Could not open $gInitTabFile.";
+		my $found = false;
+		foreach my $line (@entries) {
+			if ($line =~ /^$polarisentry/) {
+				$found = true;
+			} else {
+				print INITCONF $line;
+			}
+		}
+
+		print INITCONF "$polarisentry:$gActiveBinDir/$gStartAppName $brmLinkName\n";
+
+		close (INITCONF);
+		System("$initCmd q", 1, "Could not re-examine inittab");
+	}
+}
+
+sub removeInitTabEntry($)
+{
+	my $polarisentry = shift;
+	if($gRhelVer == 7) {
+		my $initfile = sprintf("/usr/lib/systemd/system/%s.service", $polarisentry);
+		System("$systemctlCmd stop $polarisentry", 0, "$systemctlCmd stop $polarisentry failed");
+		System("$systemctlCmd disable $polarisentry", 0, "$systemctlCmd disable $polarisentry failed");
+		unlink($initfile);
+	} elsif($gRhelVer == 6) {
+		my $initfile = sprintf("/etc/init/%s.conf", $polarisentry);
+		System("$initctlCmd stop $polarisentry", 0, "$initctlCmd stop $polarisentry failed");
+		unlink($initfile);
+	} else  {
+		open(INITCONF, "<",$gInitTabFile) or die "Could not open $gInitTabFile.";
+		my @entries=<INITCONF>;
+		close (INITCONF);
+
+		open(INITCONF, ">",$gInitTabFile) or die "Could not open $gInitTabFile.";
+		foreach my $line (@entries)
+		{
+			if ($line =~ /^$polarisentry/)
+			{
+			}
+			else
+			{
+				print INITCONF $line;
+			}
+		}
+		close (INITCONF);
+		System("$initCmd q", 1, "Could not init to re-examine inittab");
+	}
+}
+
+#This function exits if active release is not  found
+sub checkActiveRel($)
+{
+	my @dummy;
+	my %relHash = getInstalledReleases(\@dummy);
+	my $numRelease = scalar (keys %relHash);
+
+	if( $numRelease <= 0 ) {
+		logToFile ("No software release available.", LOGFATAL | LOGCONS);
+	}
+
+	my $activefound = false;
+	foreach my $key (keys %relHash) {
+		if ($relHash{$key} eq $gActiveKey)	{
+			$activefound = true;
+		}
+	}
+
+	if ($activefound == false) {
+		logToFile ("No software release active.", LOGFATAL | LOGCONS);
+	}
+}
+
+sub startForCurrentRelease()
+{
+	my $promptHash = shift;
+
+	&getBaseInstallPath(false);
+
+	#This function exits if active release is not  found
+	&checkActiveRel();
+
+	if($promptHash->{'-p'} eq "") {
+		&setupMlcDaemon();
+	}
+
+	chdir ($gActiveBinDir);
+	# &setUpSyslog();
+	if($promptHash->{'-p'} ne "") {
+		my @procs = split(',', $promptHash->{'-p'});
+		foreach my $proc (@procs) {
+			printf("starting $proc\n");
+			my $cmd = sprintf("./startApp %s_AppMgr start %s", $gProduct, $proc);
+			System("$cmd", 1, "Unable to execute cmd $cmd");
+		}
+		return;
+	}
+
+	if ($gIsLinux == true) {
+		&setupStart();
+	}
+
+	if( -f "$gUseOpensafFile") {
+		unlink("/var/run/opensaf/amf_failed_state");
+		my $old = "/etc/init.d/opensafd_";
+		my $new = "/etc/init.d/opensafd";
+		if(-f $old) {
+			System("$mvCmd -f $old $new", 1, "Unable to move $old to $new");
+		}
+
+		if(-f "/etc/init.d/opensafd") {
+			my $status = `/etc/init.d/opensafd status`;
+			chomp $status;
+			if($status ne "The OpenSAF HA Framework is not running") {
+				logToFile("$gProduct Applications already running", LOGINFO | LOGCONS);
+				return;
+			}
+
+			for(my $cnt=0; $cnt < 3; $cnt++) {
+				my $ret = `$new start`;
+				if( $ret =~ /OK/) {
+					#nothing as of now
+				} else {
+					System("$mvCmd -f $new $old", 1, "Unable to move $new to $old");
+					`$old stop`;
+					if ($cnt == 2) {
+						logToFile ("$gProduct Applications start failed", LOGERROR | LOGCONS);
+						logToFile ("Error: $ret", LOGFATAL | LOGCONS);
+					}
+					System("$mvCmd -f $old $new", 1, "Unable to move $old to $new");
+				}
+			}
+			# check the status of the su after calling start
+			# if any one is locked, unlock it
+			my @result = `amf-state su adm`;
+			my $prevline = "";
+			my $node = `cat /etc/opensaf/node_name`;
+			chomp($node);
+			my @namearr = split("-", $node);
+			foreach my $line (@result) {
+				if ($line =~ /LOCKED-INSTANTIATION/) {
+					if ($prevline =~ /_SU$namearr[1]/) {
+						my $ret = `amf-adm unlock-in $prevline`;
+						$ret = `amf-adm unlock $prevline`;
+					}
+				}
+				$prevline = $line;
+			}
+		} else {
+			logToFile("Opensaf start script (/etc/init.d/opensafd) not present", LOGFATAL | LOGCONS);
+		}
+	} else {
+		my %iniConfig = ();
+		readIniFile($gIniFile, \%iniConfig, true);
+		my $nodeCnt = &getParam(\%iniConfig, "PLATFORM_SVCS", "SstInstanceId");
+		my $monitorFile = &getRednNodesMonitorFile($nodeCnt);
+		# remove monitor file if present
+		&setupAppMgr();
+		if(-e $monitorFile) {
+			# sleep for 5 seconds before removing the monitoring file
+			sleep(5);
+			unlink($monitorFile);
+		}
+	}
+
+	if( -f "$gStartSctpFile") {
+		&setupSctp();
+	}
+	# setup cli for start and stop of process
+	&setupBRM();
+	logToFile("$gProduct Applications successfully started", LOGINFO | LOGCONS);
+}
+
+sub stopForCurrentRelease($)
+{
+	my $promptHash = shift;
+
+	&getBaseInstallPath(false);
+
+	#This function exits if active release is not  found
+	&checkActiveRel();
+	if($promptHash->{'-p'} ne "") {
+		chdir ($gActiveBinDir);
+		my @procs = split(',', $promptHash->{'-p'});
+		foreach my $proc (@procs) {
+			printf("stopping $proc\n");
+			my $cmd = sprintf("./startApp %s_AppMgr stop %s", $gProduct, $proc);
+			System("$cmd", 1, "Unable to execute cmd $cmd");
+		}
+		return;
+	}
+
+	chdir ($gActiveBinDir);
+	if( -f "$gUseOpensafFile") {
+
+		if(-f "$gOsafStartFile") {
+       	} else {
+			logToFile("$gProduct Applications not running", LOGINFO | LOGCONS);
+			return;
+        }
+
+		my $status = `/etc/init.d/opensafd status`;
+		chomp $status;
+		if($status eq "The OpenSAF HA Framework is not running") {
+			logToFile("$gProduct Applications already stopped", LOGINFO | LOGCONS);
+			return;
+		}
+
+		# check the status of the su prior to calling stop
+		# if instantiation of any su failed lock it before stopping
+		# else opensafd stop will reboot the machine
+		my @result = `amf-state su pres`;
+		my $prevline = "";
+		my $node = `cat /etc/opensaf/node_name`;
+		chomp($node);
+		my @namearr = split("-", $node);
+		foreach my $line (@result) {
+			if ($prevline =~ /_SU$namearr[1]/) {
+				my $ret = `amf-adm lock $prevline`;
+				$ret = `amf-adm lock-in $prevline`;
+			}
+
+			$prevline = $line;
+		}
+
+		my $old = "/etc/init.d/opensafd";
+		my $new = "/etc/init.d/opensafd_";
+		System("$mvCmd -f $old $new", 1, "Unable to move $old to $new");
+
+		System("$new stop", 1, "Could not all run /etc/init.d/opensafd stop");
+		System("./VirtIPConfigure 2", 0, "Could not start script to initiate IP takeover");
+		my $entry;
+		$entry = "sctp:2345:respawn:";
+		removeInitTabEntry($entry);
+		if( -f "$gStartSctpFile") {
+			System("/etc/init.d/sctp stop", 0, "/etc/init.d/sctp stop failed");
+		}
+	} else {
+		my $brmname = sprintf("%s_%s",$gProduct,$gBRMName);
+		my @remains = `/bin/ps -eaf | /bin/grep $gProduct | /bin/grep -v grep | /bin/grep -v $0 | grep -v $brmname | awk '{print \$2}'`;
+		chomp @remains;
+		my $numrunning = scalar (@remains);
+		if($numrunning == 0) {
+			logToFile("$gProduct Applications not running", LOGINFO | LOGCONS);
+			return;
+		}
+
+		my %iniConfig = ();
+		readIniFile($gIniFile, \%iniConfig, true);
+		my $nodeCnt = &getParam(\%iniConfig, "PLATFORM_SVCS", "SstInstanceId");
+		my $monitorFile = &getRednNodesMonitorFile($nodeCnt);
+		my $rednNodeDir = &getRednNodesDir($nodeCnt);
+
+		if(-d $rednNodeDir) {
+			my $monfd;
+			open($monfd, ">", "$monitorFile") or printf("Monitor $monitorFile cannot be opened\n");
+			print $monfd "true";
+		}
+
+		my $appMgrLinkName = sprintf("%s_%s", $gProduct, $gAppMgrName);
+		my $appMgrExe = sprintf("%s/$gStartAppName $appMgrLinkName", $gActiveBinDir);
+		System("$appMgrExe stop all", 0, "Could not execute $appMgrExe stop all");
+		sleep 1;
+		my $entry;
+		if($gRhelVer == 7 || $gRhelVer == 6) {
+			$entry = "${gProductLc}appmgr";
+		} else {
+			$entry = "am:2345:respawn:";
+		}
+
+		removeInitTabEntry($entry);
+		if( -f "$gStartSctpFile") {
+			# if sctp is present remove that also
+			$entry = "sctp:2345:respawn:";
+			removeInitTabEntry($entry);
+		}
+		System("./VirtIPConfigure 2", 0, "Could not start script to initiate IP takeover");
+		sleep 1;
+		if( -f "$gStartSctpFile") {
+			System("/etc/init.d/sctp stop", 0, "/etc/init.d/sctp stop failed");
+			sleep 2;
+		}
+	}
+# rope trick, even after all this processes doesn't get stopped
+# use kill to hard kill all of them
+
+	my $brmname = sprintf("%s_%s",$gProduct,$gBRMName);
+	my @remains = `/bin/ps -eaf | /bin/grep $gProduct | /bin/grep -v grep | /bin/grep -v $0 | grep -v $brmname | awk '{print \$2}'`;
+	chomp @remains;
+	kill 9, @remains;
+	# remove any virtual IP assignment
+	logToFile("$gProduct Applications successfully stopped", LOGINFO | LOGCONS);
+}
+
+sub statusForCurrentRelease($)
+{
+	my $promptHash = shift;
+
+	&getBaseInstallPath(false);
+
+	#This function exits if active release is not  found
+	&checkActiveRel();
+
+	chdir ($gActiveBinDir);
+	if( -f "$gUseOpensafFile") {
+
+		if(-f "$gOsafStartFile") {
+		} else {
+			logToFile("$gProduct Applications not running", LOGINFO | LOGCONS);
+			exit(0);
+		}
+
+		my @result = `/etc/init.d/opensafd status`;
+		chomp @result;
+		if($result[0] eq "The OpenSAF HA Framework is not running") {
+			logToFile("$gProduct Applications not running", LOGINFO | LOGCONS);
+			exit(0);
+		}
+		printf("result:\n");
+		printf("NAME                     STATUS\n");
+		my $node = `cat /etc/opensaf/node_name`;
+		chomp($node);
+		my @namearr = split("-", $node);
+
+		my @procinfos = `amf-state comp pres`;
+		chomp @procinfos;
+		my %procToNumInst = ();
+		foreach my $line (@procinfos) {
+			if ($line =~ /safComp=/) {
+				my @infos = split(",", $line);
+				@infos = split("=", $infos[0]);
+				@infos = split(/\./, $infos[1]);
+				if($infos[2] == $namearr[1]) {
+					if($procToNumInst{$infos[1]} eq "") {
+						$procToNumInst{$infos[1]} = 1;
+					} else {
+						$procToNumInst{$infos[1]}++;
+					}
+				}
+			}
+		}
+
+		my $proc;
+		my $format = "%-20s\t%-10s\n";
+		foreach my $line (@procinfos) {
+			if ($line =~ /safComp=/) {
+				my @infos = split(",", $line);
+				@infos = split("=", $infos[0]);
+				@infos = split(/\./, $infos[1]);
+				if($infos[2] == $namearr[1]) {
+					if($procToNumInst{$infos[1]} == 1) {
+						$proc = sprintf("%s_%s", $gProduct, $infos[1]);
+					} else {
+						$proc = sprintf("%s_%s%d", $gProduct, $infos[1], $infos[3]);
+					}
+				} else {
+					$proc = "";
+				}
+			} elsif ($proc ne "") {
+				my $len = length $proc;
+				my $delim;
+				if($len > 15) {
+					$delim = "\t";
+				} else {
+					$delim = "\t\t";
+				}
+				my @infos = split("=", $line);
+
+
+				if($infos[1] eq "INSTANTIATED(3)") {
+					printf($format,${proc},"Running");
+					#printf("${proc}${delim}Running\n");
+				} else {
+					printf($format,${proc},"Stopped");
+					#printf("${proc}${delim}Stopped\n");
+				}
+				$proc = "";
+			}
+		}
+
+		my $osafFile = sprintf("%s/%s", $gActiveBinDir, $gUseOpensafFile);
+		my $osfd;
+		open($osfd, "<", "$osafFile") or printf("$osafFile cannot be opened for reading\n");
+		my @osafEntries = <$osfd>;
+		close($osfd);
+		chomp(@osafEntries);
+
+		foreach my $process (@osafEntries) {
+			my $found = `/bin/ps -ef | /bin/grep $process | /bin/grep -v grep `;
+			chomp($found);
+			if( $found =~ m/$process/i) {
+				printf($format,$process,"Running");
+			} else {
+				printf($format,$process,"Stopped");
+			}
+		}
+
+
+		my $redfound = false;
+		foreach my $line (@result) {
+			if ($line =~ /_SU$namearr[1]_2N/) {
+				$redfound = true;
+			}
+
+			if( $redfound == true) {
+				if ($line =~ /ACTIVE/) {
+					print("$gProduct status: ACTIVE\n");
+					exit(0);
+				} elsif ($line =~ /STANDBY/) {
+					print("$gProduct status: STANDBY\n");
+					exit(0);
+				}
+			}
+		}
+		print("$gProduct status: UNKNOWN\n");
+
+	} else {
+		my $appMgrLinkName = sprintf("%s_%s", $gProduct, $gAppMgrName);
+		my $appMgrExe = sprintf("%s/$gStartAppName $appMgrLinkName", $gActiveBinDir);
+		System("$appMgrExe status all", 0, "Could not execute $appMgrExe status all");
+		my $statusOpFile = "/tmp/.cmdout";
+		my $statusOp = `cat $statusOpFile`;
+		printf("$statusOp\n");
+		unlink($statusOpFile);
+	}
+}
+
+sub getInstalledReleases($)
+{
+	my $relDetail = shift;
+
+	my $relAbs = Cwd::abs_path($gActiverRelLink);
+	$relAbs = basename($relAbs);
+	opendir(RELDIR, $gReleasePath);
+	my @dirs = readdir(RELDIR);
+	closedir(RELDIR);
+
+	my %relHash = ();
+	foreach my $relDir (@dirs) {
+		if( $relDir =~ /RELEASE_R(.*?)$/ ) {
+			if( -f "$gReleasePath/$relDir/$gCompletedFile") {
+				my $relKey = $gInstalledKey;
+				if($relDir eq $relAbs) {
+					$relKey = $gActiveKey;
+				}
+
+				my %relData;
+				$relData{'dir'} = "$gReleasePath/$relDir";
+				$relData{'type'} = $relKey;
+				$relData{'rel'} = $1;
+				$relHash {$1} = $relKey;
+
+				opendir(RELDIR, "$gReleasePath/$relDir/$gPkgDir");
+				my @sstdirs = readdir(RELDIR);
+				closedir(RELDIR);
+				my @sstDataArr = ();
+				foreach my $sstdir (@sstdirs) {
+					my $sstDirNameOnly = basename($sstdir);
+					if( $sstDirNameOnly =~ /(.*?)_RELEASE_R(.*?)$/ ) {
+						my %sstData = ();
+						my @sstArr = split('_', $1);
+						$sstData{'sst'} = $sstArr[0];
+						$sstData{'rel'} = $2;
+						#$relHash {$2} = $relKey;
+
+						my $patchverfile = sprintf("%s/%s/%s/%s/%s", $gReleasePath, $relDir, $gPkgDir, $sstdir, $gPatchVerFile);
+						open(PATCHVER, "<", $patchverfile);
+						my @versions = <PATCHVER>;
+						close PATCHVER;
+						chomp @versions;
+
+						$sstData{'patches'} = \@versions;
+						push(@sstDataArr, \%sstData);
+					}
+				}
+				$relData{'sst'} = \@sstDataArr;
+				push(@{$relDetail}, \%relData);
+			}
+		}
+	}
+
+	return %relHash;
+}
+
+sub printRelease($)
+{
+	my $release = shift;
+	if($release->{'type'} eq $gActiveKey) {
+		logToFile ("Active release: $release->{'rel'}", LOGCONS);
+	} else {
+		logToFile ("Installed release: $release->{'rel'}", LOGCONS);
+	}
+
+	my $relDir = $release->{'dir'};
+	logToFile ("Release directory: $relDir", LOGCONS);
+	my $sstDataArr = $release->{'sst'};
+	foreach my $sstData (@{$sstDataArr}) {
+		logToFile ("\t$sstData->{'sst'} release: $sstData->{'rel'}", LOGCONS);
+		my $patchDataArr = $sstData->{'patches'};
+		foreach my $patch (@{$patchDataArr}) {
+			logToFile ("\t\tPATCH: $patch", LOGCONS);
+		}
+	}
+}
+
+sub showReleases()
+{
+	my $promptHash = shift;
+
+	&getBaseInstallPath(false);
+
+	my @relDataArr;
+	my %relHash = &getInstalledReleases(\@relDataArr);
+	my $numRelease = scalar (@relDataArr);
+	my $activePrinted = false;
+	my $installedPrinted = false;
+
+# two for loops to print the active release first
+	foreach my $release (@relDataArr) {
+		if($release->{'type'} eq $gActiveKey) {
+			printRelease($release);
+			$activePrinted = true;
+		}
+	}
+
+	foreach my $release (@relDataArr) {
+		if($release->{'type'} ne $gActiveKey) {
+			printRelease($release);
+			$installedPrinted = true;
+		}
+	}
+
+# check if the old olgw release is installed
+# this is to upgrade from the legacy installations
+	my %oldRelDetails = ();
+	######################################
+	#uncomment this if legacy relesase has to be queried
+	#getLegacyInstallPath(\%oldRelDetails);
+	#######################################
+	my $legRelSize = scalar keys %oldRelDetails;
+	if ( $legRelSize >= 1 )  {
+# relatively straight forward got ahead with the migration
+# for this
+		foreach my $key (keys %oldRelDetails) {
+			my $relAbsDir = Cwd::abs_path($oldRelDetails{$key});
+			my $relAbs = basename($relAbsDir);
+			if($relAbs =~ m/RELEASE_(.*?)$/) {
+				if($activePrinted == true) {
+					logToFile ("Installed release: $1", LOGCONS);
+				} else {
+					logToFile ("Active release: $1", LOGCONS);
+					$activePrinted = true;
+				}
+				logToFile ("Release directory: $relAbsDir", LOGCONS);
+				logToFile ("\t$key release: $1", LOGCONS);
+			} elsif ($relAbs =~ m/R(.*?)$/) {
+				if($activePrinted == true) {
+					logToFile ("Installed release: $1", LOGCONS);
+				} else {
+					logToFile ("Active release: $1", LOGCONS);
+					$activePrinted = true;
+				}
+				logToFile ("Release directory: $relAbsDir", LOGCONS);
+				logToFile ("\t$key release: $1", LOGCONS);
+			}
+		}
+	}
+
+	if( $legRelSize <= 0 && $numRelease <= 0) {
+		logToFile("No release installed", LOGFATAL | LOGCONS);
+	}
+
+	my $relAbs = Cwd::abs_path($gLDirPath);
+	my $release = "";
+	if($relAbs =~ m/RELEASE_(.*?)\//) {
+		$release = $1;
+	}
+	if($release eq "") {
+		if($relAbs =~ m/RELEASE_(.*?)$/) {
+			$release = $1;
+		}
+	}
+	my %configHash = ();
+	my @licssts = ();
+	my $cnt = &checkLicense(\%configHash, \@licssts, "NodeLicense.lic", 0, true);
+	$gPltSstDetail{'Instance'} = $cnt;
+	my %iniConfig = ();
+	&readIniFile($gIniFile, \%iniConfig, true);
+	&printInstalledComponents(\@licssts, \%iniConfig, \%configHash, $1);
+}
+
+sub preInstallSystem()
+{
+# this will create user id.
+	createPolarisUser();
+
+# this will setup the syslog.
+	# setUpSyslogInit();
+
+}
+
+sub setUpSyslogInit() {
+		# not required as we don't use syslog now
+		#my $cmd="sed -i 's/.*\\/messages\$/\\*.info\\;local1.none\\;local2.none\\;mail.none\\;authpriv.none\\;cron.none                \\-\\/var\\/log\\/messages/g' /etc/rsyslog.conf";
+		#`$cmd`;
+		#system($cmd);
+		#} else {
+	if($gRhelVer < 6) {
+		my $syslogConfFile = "/etc/syslog.conf";
+# open the /etc/syslog.conf file and check if the entry for syslog already exists.
+		if(-e "$syslogConfFile.orig")
+		{
+#do not copy if the orig file exits.
+		}
+		else
+		{
+			System("$cpCmd $syslogConfFile $syslogConfFile.orig", 1, "Could not take backup of the syslog.conf file");
+		}
+
+		open(SYSLOGCONF, ">",$syslogConfFile) or die "Could not open $syslogConfFile.";
+		truncate(SYSLOGCONF, 0 );
+
+		if($gIsLinux == true) {
+			print SYSLOGCONF "kern.info;local0.info;mail.none;news.none;authpriv.none;cron.none              -/var/log/messages\n";
+			print SYSLOGCONF "authpriv.*                                              /var/log/secure\n";
+			print SYSLOGCONF "mail.*                                                  -/var/log/maillog\n";
+			print SYSLOGCONF "cron.*                                                  /var/log/cron\n";
+			print SYSLOGCONF "*.emerg                                                 *\n";
+			print SYSLOGCONF "uucp,news.crit                                          /var/log/spooler\n";
+			print SYSLOGCONF "local7.*                                                /var/log/boot.log\n";
+			print SYSLOGCONF "news.=crit                                        /var/log/news/news.crit\n";
+			print SYSLOGCONF "news.=err                                         /var/log/news/news.err\n";
+			print SYSLOGCONF "news.notice                                       /var/log/news/news.notice\n";
+		} else {
+			print SYSLOGCONF "auth,authpriv,cron,daemon,kern,lpr,mail,mark,news,security,syslog,user,uucp.=err;kern.notice;auth.notice\t/dev/sysmsg\n";
+			print SYSLOGCONF "*.err;kern.debug;daemon.notice;mail.crit\t/var/adm/messages\n";
+			print SYSLOGCONF "*.alert;kern.err;daemon.err\toperator\n";
+			print SYSLOGCONF "*.alert\troot\n";
+			print SYSLOGCONF "*.emerg\t*\n";
+			print SYSLOGCONF "mail.debug\tifdef(`LOGHOST', /var/log/syslog, \@loghost)\n";
+			print SYSLOGCONF "ifdef(`LOGHOST', ,\n";
+			print SYSLOGCONF "user.err\t/dev/sysmsg\n";
+			print SYSLOGCONF "user.err\t/var/adm/messages\n";
+			print SYSLOGCONF "user.alert\t`root, operator'\n";
+			print SYSLOGCONF "user.emerg\t*\n";
+			print SYSLOGCONF ")\n";
+		}
+		close (SYSLOGCONF);
+		System("$touchCmd $gLogsDirPath/$gLogFile", 1, "Could not create empty log file");
+	}
+}
+
+sub setUpSyslog() {
+	my $polarisentry = "local1.debug";
+	# not required as we don't use syslog post RHEL 6
+	if($gRhelVer < 6) {
+		my $syslogConfFile = "/etc/syslog.conf";
+# open the /etc/syslog.conf file and check if the entry for syslog already exists.
+		if(-e "$syslogConfFile.orig") {
+#do not copy if the orig file exits.
+		} else {
+			System("$cpCmd $syslogConfFile $syslogConfFile.orig", 1, "Could not take backup of the syslog.conf file");
+		}
+		open(SYSLOGCONF, "<",$syslogConfFile) or die "Could not open $syslogConfFile.";
+		my @entries=<SYSLOGCONF>;
+		close (SYSLOGCONF);
+
+		open(SYSLOGCONF, ">",$syslogConfFile) or die "Could not open $syslogConfFile.";
+		foreach my $line (@entries)
+		{
+			if ($line =~ /^$polarisentry/)
+			{
+			}
+			else
+			{
+				print SYSLOGCONF $line;
+			}
+		}
+
+		if($gIsLinux == true) {
+			print SYSLOGCONF "$polarisentry\t-$gLogsDirPath/$gLogFile\n";
+		} else {
+			print SYSLOGCONF "$polarisentry\t$gLogsDirPath/$gLogFile\n";
+		}
+		close (SYSLOGCONF);
+
+		System("$touchCmd $gLogsDirPath/$gLogFile", 1, "Could not create empty log file");
+		if($gIsLinux == true) {
+			System("/etc/init.d/syslog restart", 0, "Could not restart syslog daemon");
+		} else {
+			System("$killCmd -HUP `/bin/cat /var/run/syslog.pid`", 0, "Could not send kill -HUP to syslog daemon");
+		}
+	}
+}
+
+sub removeSyslog() {
+	# not required as we don't use syslog post RHEL 6
+	if($gRhelVer < 6) {
+		my $syslogConfFile = "/etc/syslog.conf";
+# open the /etc/syslog.conf file and check if the entry for syslog already exists.
+		if(-e "$syslogConfFile.orig")
+		{
+#do not copy if the orig file exits.
+		}
+		else
+		{
+			System("$cpCmd $syslogConfFile $syslogConfFile.orig", 1, "Could not take backup of the syslog.conf file");
+		}
+
+		my $polarisentry = "local1.debug";
+		open(SYSLOGCONF, "<",$syslogConfFile) or die "Could not open $syslogConfFile.";
+		my @entries=<SYSLOGCONF>;
+		close (SYSLOGCONF);
+
+		open(SYSLOGCONF, ">",$syslogConfFile) or die "Could not open $syslogConfFile.";
+		foreach my $line (@entries)
+		{
+			if ($line =~ /^$polarisentry/)
+			{
+			}
+			else
+			{
+				print SYSLOGCONF $line;
+			}
+		}
+
+		close (SYSLOGCONF);
+
+		if($gIsLinux == true) {
+			System("/etc/init.d/syslog restart", 0, "Could not restart syslog daemon");
+		} else {
+			System("$killCmd -HUP `/bin/cat /var/run/syslog.pid`", 0, "Could not send kill -HUP to syslog daemon");
+		}
+	}
+}
+
+
+sub startMLCApplication()
+{
+	chdir ("$gActiverRelLink/$gBinDir");
+#file to the root
+	# BUG-902: commenting all change modes, as it takes log of time over nas. 
+	# On need selective directories can be added
+	#System("$chmodCmd 777 $crLogDir", 0, "Could not change permission of CallResults path");
+
+
+# setup core adm
+	system("$coreadmCmd -i core.\%f.\%p");
+
+	if(-x  $gInstallApp) {
+		system("\./$gInstallApp start");
+	} else {
+		logToFile ("Could not invoke $gInstallApp start", LOGERROR);
+	}
+	chdir($gLDirPath);
+}
+sub stopMLCApplication
+{
+	chdir ("$gActiveBinDir");
+	if(-x  $gInstallApp) {
+		system("\./$gInstallApp stop");
+	} else {
+		logToFile ("Could not invoke $gInstallApp stop", LOGERROR);
+	}
+	chdir($gLDirPath);
+}
+
+sub uninstallMlc($)
+{
+	my $promptHash = shift;
+
+	&getBaseInstallPath(false);
+
+	chdir("/tmp");
+
+	my @dummy;
+	my %relHash = getInstalledReleases(\@dummy);
+	my 	$hashSize = scalar(keys %relHash);
+	if( $hashSize == 0)	{
+		logToFile ("No software release available", LOGFATAL | LOGCONS);
+	}
+
+	my $prompt = "Enter release to uninstall";
+	my $cnt = 1;
+	my @rels = ();
+	foreach my $release (keys %relHash) {
+		if($cnt == 1) {
+			$prompt = sprintf("%s [%d - %s(%s)", $prompt, $cnt, $release, $relHash{$release}) ;
+		} else {
+			$prompt = sprintf("%s, %d - %s(%s)", $prompt, $cnt, $release, $relHash{$release}) ;
+		}
+		push(@rels, $release);
+		$cnt++;
+	}
+
+# more than two releases are installed. Give a prompt to uniinstall all the release version
+	if($cnt > 2) {
+		$prompt = sprintf("%s, %d - ALL]", $prompt, $cnt) ;
+	} else {
+		$prompt = sprintf("%s ]", $prompt, $cnt) ;
+	}
+
+	my $choice = &getPromptInput("$prompt");
+	$choice = int($choice);
+	if($choice < 1 || $choice > $cnt) {
+		logToFile ("Invalid choice", LOGFATAL | LOGCONS);
+	}
+
+	my @relsTolDel = ();
+	if($choice == $cnt) {
+
+		my $prompt = "This command will stop the $gProduct application(s), delete all the release(s) installed and perform cleanup. Continue? (y/n) [Default n]";
+		my $choice = &getPromptInput("$prompt");
+		if( $choice ne "Y" && $choice ne "y" ) {
+			logToFile("Operation aborted", LOGFATAL | LOGCONS);
+		}
+		@relsTolDel = @rels;
+	} else {
+		push (@relsTolDel, $rels[$choice-1]);
+	}
+
+	foreach my $release (@relsTolDel) {
+		if($relHash{$release} eq $gActiveKey) {
+			my $osafFile = sprintf("%s/%s", $gActiveBinDir, $gUseOpensafFile);
+			if( -f "$osafFile") {
+				$gUsingOpensaf = true;
+			}
+# stop any running upc applications.
+			stopMLCApplication();
+			chdir("/tmp");
+#delete the active release link.
+			createActiveRelLink("");
+			chdir ($gActiveBinDir);
+		}
+		chdir("/tmp");
+#logToFile ("Release $release uninstalled");
+#print "Release $release uninstalled\n";
+
+		deleteRelease($release);
+#System("$rmCmd -rf $ntpConfFile",0, "Unable to remove $ntpConfFile");
+# oam agent reads the previous alarms and alerts file at the time or initialization.
+# remove the files during uninstall so the old alarms are removed.
+
+
+	}
+
+
+	@dummy = ();
+	%relHash = getInstalledReleases(\@dummy);
+	$hashSize = scalar(keys %relHash);
+	if( $hashSize == 0) {
+		if($gUsingOpensaf == true) {
+			# uninstall opensaf
+			# execute the cleanup
+			chdir("/opt/opensaffire/etc");
+			System("/bin/sh shutdown_opensaffire", 0, "Could not execute shutdown_opensaffire");
+
+			System("/bin/rpm -e --noscripts `/bin/rpm -qa | /bin/grep opensaffire`", 0, "Could not execute rpm -e --noscripts `rpm -qa | grep opensaffire`");
+			System("/bin/rpm -e --noscripts `/bin/rpm -qa | /bin/grep opensaf`", 0, "Could not execute rpm -e --noscripts `rpm -qa | grep opensaf`");
+			System("/bin/rm -rf /etc/opensaf", 0, "Could not execute rm -rf /etc/opensaf");
+			System("/bin/rm -rf /etc/opensaffire_release", 0, "Could not execute rm -rf /etc/opensaffire_release");
+		}
+
+		my $entry;
+		if($gRhelVer >= 6) {
+			$entry = "${gProductLc}daemon";
+		} else {
+			$entry = "cli:2345:respawn";
+		}
+		&removeInitTabEntry("pmcli");
+		&removeInitTabEntry($entry);
+
+		if($gRhelVer >= 6) {
+			$entry = "${gProductLc}brm";
+		} else {
+			$entry = "brm:2345:respawn";
+		}
+		&removeInitTabEntry($entry);
+
+		# cleanup the system if only no releases are installed
+		System("$rmCmd -rf $gCdtPath",0, "Unable to remove $gCdtPath");
+		System("$rmCmd -rf $gPsdPath",0, "Unable to remove $gPsdPath");
+		System("$rmCmd -rf $gReleasePath",0, "Unable to remove $gReleasePath");
+		System("$rmCmd -rf $gLogsDirPath/.*.txt",0, "Unable to remove $gLogsDirPath/.*.txt");
+	}
+}
+
+sub createPolarisUser()
+{
+	if (system("getent group | egrep -i \"^${gGroup}:\" $logCmd") == 0) {
+#print "Group $gGroup exists\n";
+	} else {
+#print "creating Group $gGroup\n";
+		System("$grpAddCmd $gGroup ", 1, "Group creation failed");
+	}
+
+	if (system("$idCmd  $gUser $logCmd") == 0) {
+#print "User polaris exists\n";
+	} else {
+		System("$usrAddCmd -d $gHomeDir -m -s /bin/bash -c \"Polaris Wireless\" -g $gGroup $gUser ", 1, "User creation failed");
+		System("$passwdCmd -u -f $gUser", 1, "Locking the account failed");
+#print "User polaris successfully created\n";
+	}
+	System("$usrModCmd  -g $gGroup $gUser ", 1, "Setting group for user failed");
+}
+
+sub setUpCrontab()
+{
+# check the crontab entry for logfile rollup.
+	my $crontabFile = ".tmpCrontab";
+	my $crontabEntry = "/usr/sbin/logadm";
+
+# do not use the sub System here as redirection to a log file doesn't work.
+	system("$crontabCmd -l > $crontabFile") == 0 or die "Could not read existing crontab entries\n";
+	open(CRONTAB, "<", $crontabFile) or die "Could not open $crontabFile";
+	my @entries=<CRONTAB>;
+	close (CRONTAB);
+
+	open(CRONTAB, ">", $crontabFile) or die "Could not open $crontabFile.";
+	foreach my $line (@entries)
+	{
+		if ($line =~ /$crontabEntry/)
+		{
+		}
+		elsif($line =~ /LogsManager/)
+		{
+		}
+		else
+		{
+			print CRONTAB $line;
+		}
+	}
+	print CRONTAB "0 0 * * * $crontabEntry\n";
+	close (CRONTAB);
+	System("$crontabCmd $crontabFile", 1, "Could not set the new crontab entries");
+	unlink($crontabFile);
+
+#print "Crontab successfully set up\n";
+}
+
+sub getReleaseDir($) {
+	my $release = shift;
+	my $relDir;
+	opendir(RELDIR, $gReleasePath);
+	my @dirs = readdir(RELDIR);
+	closedir(RELDIR);
+	my @entries = ();
+	my %relHash = ();
+	foreach my $dir (@dirs)
+	{
+		if( $dir =~ /RELEASE_R(.*?)$/ )
+		{
+			if( (-f "$gReleasePath/$dir/$gCompletedFile") && ($1 eq $release)) {
+				$relDir = "$gReleasePath/$dir";
+				last;
+			}
+		}
+	}
+	return $relDir;
+}
+
+sub deleteRelease($)
+{
+	my $release = shift;
+	my $pathToDel = getReleaseDir($release);
+
+	if( -d $pathToDel)
+	{
+		System("$rmCmd -rf $pathToDel",0, "Unable to remove $pathToDel");
+	}
+# get the release name from the release directory
+# The release directory name will be of the format
+# MLC_RELEASE_R1.1.1.1
+# The release name comes between RELEASE_ and _
+	if($pathToDel =~ m/RELEASE_R(.*?)$/)
+	{
+		my $release = $1;
+		logToFile("Release $release uninstalled", LOGINFO | LOGCONS);
+	}
+}
+
+sub updateProduct($$$)
+{
+	my $file = shift;
+	my $entry = shift;
+	my $value = shift;
+	open(FILE, "<","$file") or die "Could not open $file.";
+	my @entries=<FILE>;
+	close (FILE);
+
+	open(FILE, ">",$file) or die "Could not open $file";
+	foreach my $line (@entries)
+	{
+		if ($line =~ /^$entry/)
+		{
+			print FILE sprintf("%s=%s\n",$entry,$value) ;
+		}
+		else
+		{
+			print FILE $line;
+		}
+	}
+	close (FILE);
+}
+
+sub setupRelease()
+{
+	my $tarfile = getcwd;
+	chomp $tarfile;
+	$tarfile = basename($tarfile);
+
+	my $releaseDir = "$gReleasePath/$tarfile";
+	if( -d $releaseDir) {
+		System("$rmCmd -rf $releaseDir", 1, "Could not remove $releaseDir");
+	}
+
+	System("$mkdirCmd -p $releaseDir", 1, "Could not create directory $releaseDir");
+	chdir("$releaseDir");
+	-d $gBinDir or mkdir $gBinDir, 0755;
+	-d $gPkgDir or mkdir $gPkgDir, 0755;
+	-d $gLibDir or mkdir $gLibDir, 0755;
+	chdir("$gLDirPath");
+
+	return $releaseDir;
+}
+
+sub getReleaseNumber($) {
+	my $reldir = shift;
+	$reldir = basename($reldir);
+	my @values = split("_RELEASE_R", $reldir);
+	my $release = $values[-1];
+	return $release;
+}
+
+sub getLicensedAppsForSst($$$) {
+	my $licname = shift;
+	my $licconfig = shift;
+	my $sstinstance = shift;
+
+	my @retval = ();
+	my $secname = sprintf("PLATFORM_%d", $sstinstance);
+	my $secentries = &getSectionPararms($licconfig, $secname);
+
+	foreach my $parminfo (@{$secentries}) {
+		my @values = split(":", $parminfo->{'name'});
+		if($values[0] eq $licname) {
+				push(@retval, $values[1]);
+		}
+	}
+
+	@retval = sort(@retval);
+	return @retval;
+}
+
+sub getLicensedApps($$$$) {
+	my $licsstname = shift;
+	my $licappname = shift;
+	my $licconfig = shift;
+	my $sstinstance = shift;
+
+	my $secname = sprintf("PLATFORM_%d", $sstinstance);
+	my $secentries = &getSectionPararms($licconfig, $secname);
+	my @retval = ();
+	my %appmap = ();
+
+	foreach my $parminfo (@{$secentries}) {
+		my @values = split(":", $parminfo->{'name'});
+		if($values[0] eq $licsstname) {
+			if($values[1] =~ /$licappname/) {
+				my $inst = int($values[3]);
+				$appmap{$inst} = $values[1];
+			}
+		}
+	}
+
+	foreach my $entry ( keys %appmap ) {
+		push(@retval, $appmap{$entry});
+	}
+
+	@retval = sort(@retval);
+
+	return @retval;
+}
+
+sub getLicensedAppsComplete($$$$) {
+	my $licsstname = shift;
+	my $licappname = shift;
+	my $licconfig = shift;
+	my $sstinstance = shift;
+
+	my $secname = sprintf("PLATFORM_%d", $sstinstance);
+	my $secentries = &getSectionPararms($licconfig, $secname);
+	my @retval = ();
+	my %appmap = ();
+
+	foreach my $parminfo (@{$secentries}) {
+		my $appname = $parminfo->{'name'};
+		my @values = split(":", $appname);
+		if($values[0] eq $licsstname) {
+			if($values[1] =~ /$licappname/) {
+				push(@retval, $appname);
+			}
+		}
+	}
+
+	@retval = sort(@retval);
+
+	return @retval;
+}
+
+sub setupSst($$$$$) {
+
+	my $sstrec = shift;
+	my $releaseDir = shift;
+	my $licconfig = shift;
+	my $sstinstance = shift;
+	my $configHash = shift;
+
+	chdir("$releaseDir/$gPkgDir");
+
+	my $pkgname = sprintf("%s", $sstrec->{'PkgName'});
+	my $absPkgDir = sprintf("%s/%s", $gLDirPath, $pkgname);
+	System("$cpCmd $absPkgDir .", 1, "Could not copy directory $absPkgDir to package dir $releaseDir/$gPkgDir");
+	System("$gunzipCmd -c $pkgname | $tarCmd -xvf -", 1, "Could not untar $pkgname");
+	System("$rmCmd $pkgname", 1, "Could not remove $pkgname");
+	my @tarfile = split(".tar.gz", $pkgname);
+	my @licapps = getLicensedAppsForSst($sstrec->{'LicName'}, $licconfig, $sstinstance);
+
+# for platform there will be no applications in the license file as all are licensed.
+	my $logentry = "";
+	my $logseverity = &getParam($configHash, "LOGGER", "SyslogSeverityLevel");
+	if($logseverity eq "" || $logseverity eq "err") {
+		$logseverity = "error";
+	}
+
+	my $onscreen = &getParam($configHash, "LOGGER", "OnScreenPrinting");
+	if($onscreen eq "") {
+		$onscreen = "false";
+	}
+
+	&writeConfigVal($configHash, "LOGGER", "LogRollOverDuration", 1, false);
+
+	$logentry = sprintf("%s,%s", $logseverity, $onscreen);
+
+	if($sstrec->{'LicName'} eq $gPltSstDetail{'LicName'}) {
+		my $appid = 1;
+		foreach my $binary ( @{$sstrec->{'Apps'}} ) {
+
+			my $licapp = $binary;
+			chdir("$releaseDir/$gPkgDir/$tarfile[0]");
+			opendir (DIR, ".") or die "Cann't open current directory";
+			my @files = ();
+			while (my $file = readdir(DIR)) {
+				if ($file =~ /$binary/) {
+					push(@files,$file);
+				}
+			}
+			closedir(DIR);
+
+			my @version = split("_R", $files[0]);
+			$gCompToVersion{$binary} = $version[1];
+
+			my $linkSrc = sprintf("../%s/%s/%s",$gPkgDir, $tarfile[0], $files[0]);
+			my $linkDest = sprintf("%s_%s",$gProduct, $licapp);
+			chdir("$releaseDir/$gBinDir");
+			System("$lnCmd -s $linkSrc $linkDest", 1, "Could not create soft link: $linkSrc $linkDest");
+			&writeConfigVal($configHash, "APPDATA", "$licapp", sprintf("%d,$gStartAppName %s", $appid, $linkDest), true);
+			my $modentry = &getParam($configHash, "Modules", "$licapp");
+			if ($modentry =~/$gProduct/) {
+				&writeConfigVal($configHash, "Modules", "$licapp", $logentry, true);
+			} else {
+				&writeConfigVal($configHash, "Modules", "$licapp", $logentry, false);
+			}
+			$appid++;
+		}
+	} else {
+# rest all applications will be licensed.
+		foreach my $licapp (@licapps) {
+			my $appid = 1;
+			foreach my $binary ( @{$sstrec->{'Apps'}} )
+			{
+				if($licapp =~ /^$binary/) {
+					chdir("$releaseDir/$gPkgDir/$tarfile[0]");
+					opendir (DIR, ".") or die "Cann't open current directory";
+					my @files = ();
+					my $sstbinary = sprintf("%s_%s", $sstrec->{'LicName'}, $binary);
+					while (my $file = readdir(DIR)) {
+						if ($file =~ /$sstbinary/) {
+							push(@files,$file);
+						}
+					}
+					closedir(DIR);
+
+					my @version = split("_R", $files[0]);
+					$gCompToVersion{$binary} = $version[1];
+
+					my $linkSrc = sprintf("../%s/%s/%s",$gPkgDir, $tarfile[0], $files[0]);
+					my $linkDest = sprintf("%s_%s",$gProduct, $licapp);
+					chdir("$releaseDir/$gBinDir");
+					System("$lnCmd -s $linkSrc $linkDest", 1, "Could not create soft link: $linkSrc $linkDest");
+					&writeConfigVal($configHash, "APPDATA", "$licapp", sprintf("%d,$gStartAppName %s", $appid, $linkDest), true);
+					my $modentry = &getParam($configHash, "Modules", "$licapp");
+					if ($modentry =~/$gProduct/) {
+						&writeConfigVal($configHash, "Modules", "$licapp", $logentry, true);
+					} else {
+						&writeConfigVal($configHash, "Modules", "$licapp", $logentry, false);
+					}
+				}
+				$appid++;
+			}
+		}
+	}
+
+	foreach my $config ( @{$sstrec->{'Configs'}} )
+	{
+		chdir("$releaseDir/$gPkgDir/$tarfile[0]");
+		my $linkSrc = sprintf("../%s/%s/%s",$gPkgDir, $tarfile[0], $config);
+		my $linkDest = $config;
+		chdir("$releaseDir/$gBinDir");
+		if(-f $linkSrc || -d $linkSrc) {
+            if(-l $linkDest) {
+                next;
+            }
+			System("$lnCmd -s $linkSrc $linkDest", 1, "Could not create soft link: $linkSrc $linkDest");
+		} else {
+			die "$linkSrc is not present\n";
+		}
+	}
+
+	chdir("$releaseDir/$gPkgDir/$tarfile[0]");
+	if( -d "LIBs") {
+		chdir("LIBs");
+		opendir (DIR, ".") or die "Cann't open LIBs directory";
+		my @files = ();
+		while (my $file = readdir(DIR)) {
+			if ($file =~ /lib*/) {
+				push(@files,$file);
+			}
+		}
+		closedir(DIR);
+		chdir("$releaseDir/$gLibDir");
+		foreach my $file ( @files )
+		{
+			my $linkSrc = sprintf("../%s/%s/LIBs/%s",$gPkgDir, $tarfile[0], $file);
+			my $linkDest = $file;
+			System("$lnCmd -s $linkSrc $linkDest", 1, "Could not create soft link: $linkSrc $linkDest");
+		}
+	}
+	chdir("$releaseDir/$gPkgDir/$tarfile[0]");
+
+# call the sst's install function
+	$sstrec->{'InstallFunc'}->($sstrec, $releaseDir, $licconfig, $configHash);
+
+	if($gUsingOpensaf == true) {
+		chdir("$releaseDir/$gPkgDir");
+		System("$chownCmd -R root:root .", 1, "Could not change owner of the directories");
+	}
+
+	chdir("$gLDirPath");
+}
+
+sub installSsts($$$$) {
+	my $licssts = shift;
+	my $licconfig = shift;
+	my $sstinstance = shift;
+	my $iniconfig = shift;
+
+# push platoform also as one of the licensed sst
+	if( (@{$licssts} == 1) && (@{$licssts}[0]->{'LicName'} eq $gOamSstDetail{'LicName'} )) {
+# Do not add platform applications for oam manager license
+	} else {
+		unshift(@{$licssts}, \%gPltSstDetail);
+	}
+# start installing ssts one by one.
+# start with platform
+	my $releaseDir = setupRelease();
+
+	genPort();
+	logToFile("Set up in progress ...", LOGCONS);
+	foreach my $sst (@{$licssts}) {
+		my $sstprefix = $sst->{'LicName'};
+		logToFile("$sstprefix: in progress", LOGCONS);
+		setupSst($sst, $releaseDir, $licconfig, $sstinstance, $iniconfig);
+		logToFile("$sstprefix: done", LOGCONS);
+	}
+	postInstall($releaseDir, $licconfig);
+	logToFile("", LOGCONS);
+
+# install the install script
+	chdir("$gLDirPath");
+	System("$cpCmd $0 $releaseDir/$gPkgDir", 1, "Could not copy script $0 to package dir $releaseDir/$gPkgDir");
+	my $linkSrc = sprintf("../%s/%s",$gPkgDir, basename($0));
+	my $linkDest = $gInstallApp;
+	chdir("$releaseDir/$gBinDir");
+	System("$lnCmd -s $linkSrc $linkDest", 1, "Could not create soft link: $linkSrc $linkDest");
+
+	System("$cpCmd mlcclean $gMlcCleanFile", 1, "Could not copy script mlcclean to $gMlcCleanFile");
+	System("chkconfig --add mlcclean", 1, "could not execute chkconfig for mlcclean");
+	System("chkconfig mlcclean on", 1, "could not execute chkconfig for mlcclean");
+	System("/bin/touch /var/lock/subsys/mlcclean", 1, "could not touch file for mlcclean");
+
+	chdir("$gLDirPath");
+
+	return $releaseDir;
+}
+
+sub configureSsts($$$$$) {
+	my $licssts = shift;
+	my $releaseDir = shift;
+	my $upgradeFromDir = shift;
+	my $configHash = shift;
+	my $licconfig = shift;
+
+	if($upgradeFromDir ne "") {
+	}
+
+
+# now get the configuration for the subsystems
+	foreach my $sst (@{$licssts}) {
+# call the sst's configure function
+		$sst->{'ConfigFunc'}->($configHash, $releaseDir, $upgradeFromDir, $licconfig);
+	}
+
+# flush the configuration into the ini file
+	if ($gOnlyConfig eq "") {
+		writeIniFile("$releaseDir/$gBinDir/$gIniFile", $configHash);
+	} else {
+		writeIniFile("$gIniFile", $configHash);
+	}
+}
+
+sub executePrePost($$$)
+{
+	my $patchConfig = shift;
+	my $pcnt = shift;
+	my $paramkey = shift;
+
+	#check if this was called for global pre-action.
+	my $actionsec = &getParam($patchConfig, "PATCH_$pcnt", $paramkey);
+	my @actions = split(",", $actionsec);
+	my $result = true;
+
+	my $numactions = scalar(@actions);
+	if($numactions == 0) {
+		logToFile("PATCH_$pcnt No $paramkey configured", LOGINFO|LOGCONS);
+	} else {
+		my $globalPrePatch;
+		foreach my $actionparam (@actions) {
+			$globalPrePatch = &getParam($patchConfig, "ACTIONS", $actionparam);
+			if($globalPrePatch eq "") {
+				logToFile("PATCH_$pcnt has empty entry for $paramkey = $actionparam", LOGERROR|LOGCONS);
+				$result = false;
+			} else {
+				$result = &executePrePostAction($globalPrePatch);
+			}
+
+			if($result == false) {
+				#patch is not required. proceed to next.
+				last;
+			}
+		}
+
+		if($result == false) {
+			#patch is not required. proceed to next.
+			logToFile("PATCH_$pcnt $paramkey $globalPrePatch failed", LOGFATAL | LOGCONS);
+		} else {
+			logToFile("PATCH_$pcnt $paramkey $globalPrePatch success", LOGCONS);
+		}
+	}
+
+	return $result;
+}
+
+sub executePatch($$$)
+{
+	my $iniconfig = shift;
+	my $patchConfig = shift;
+	my $pcnt = shift;
+
+	my $result = false;
+
+	my $currentRel = sprintf("%s.%s.%s.%s",
+				&getParam($iniconfig, "PRODUCT", "MajorVersion"),
+				&getParam($iniconfig, "PRODUCT", "MinorVersion"),
+				&getParam($iniconfig, "PRODUCT", "Revision"),
+				&getParam($iniconfig, "PRODUCT", "Build")
+				);
+
+	opendir (DIR, ".") or die "Cann't open current directory";
+	while (my $tarfile = readdir(DIR)) {
+		if ($tarfile =~ /\.tar\.gz/) {
+			System("$gunzipCmd -c $tarfile | $tarCmd -xvf -", 1, "Could not gunzip $tarfile");
+		}
+	}
+	closedir(DIR);
+
+	# apply patch
+	my $paramkey = "action";
+	my $actionsec = &getParam($patchConfig, "PATCH_$pcnt", $paramkey);
+	my @actions = split(",", $actionsec);
+
+	my $numactions = scalar(@actions);
+	if($numactions == 0) {
+		logToFile("PATCH_$pcnt No patch actions configured", LOGERROR|LOGCONS);
+		$result = false;
+	} else {
+		my $result = true;
+		my $patch;
+		foreach my $actionparam (@actions) {
+			$patch = &getParam($patchConfig, "PATCHES", $actionparam);
+			if($patch eq "") {
+				logToFile("PATCH_$pcnt has empty entry for PATCH = $actionparam", LOGERROR|LOGCONS);
+				$result = false;
+			} else {
+				$result = &applyPatch($patch, $currentRel, $iniconfig);
+			}
+			if($result == false) {
+				#patch failed. Move to next.
+				last;
+			}
+		}
+
+		if($result == false) {
+			#patch is not required. proceed to next.
+			logToFile("PATCH_$pcnt action $patch failed", LOGFATAL | LOGCONS);
+		} else {
+			logToFile("PATCH_$pcnt action $patch success", LOGCONS);
+		}
+	}
+}
+
+sub checkPatch($$$$$)
+{
+	my $promptHash = shift;
+	my $licconfig = shift;
+	my $sstinstance = shift;
+	my $iniconfig = shift;
+	my $patchConfig = shift;
+	my $type = shift;
+
+	for (my $pcnt = 1; $pcnt <= 100; $pcnt++) {
+		my $secEntries = &getSectionPararms($patchConfig, "PATCH_$pcnt");
+		my $numEntries = scalar(@{$secEntries});
+		if ($numEntries == 0) {
+			#logToFile("PATCH_$pcnt has 0 entries", LOGCONS);
+			next;
+		}
+		my $checksec = &getParam($patchConfig, "PATCH_$pcnt", "check");
+		my @checks = split(",", $checksec);
+		my $result = true;
+
+		my $numchecks = scalar(@checks);
+		if($numchecks == 0) {
+			logToFile("No checks configured in patch configuration file", LOGERROR|LOGCONS);
+			$result = false;
+		} else {
+			foreach my $check (@checks) {
+				my $checkentry = &getParam($patchConfig, "CHECKS", $check);
+				if($checkentry eq "") {
+					logToFile("PATCH_$pcnt has empty entry for check = $check", LOGERROR|LOGCONS);
+					$result = false;
+				} else {
+					$result = &patchRequired($licconfig, $iniconfig, $checkentry);
+				}
+				if($result == false) {
+					#patch is not required. proceed to next.
+					last;
+				}
+			}
+		}
+
+		if(($type eq "patch") || ($promptHash->{"-g"} ne "")) {
+			if($result == false) {
+				#patch is not required. proceed to next.
+				logToFile("PATCH_$pcnt not required", LOGCONS);
+				next;
+			} else {
+				logToFile("PATCH_$pcnt required", LOGCONS);
+			}
+		}
+
+		my $paramkey;
+		if ($promptHash->{"-g"} ne "") {
+			$paramkey = sprintf("%s-global", $promptHash->{"-g"});
+		} else {
+			$paramkey = sprintf("%s-machine", $type);
+		}
+
+		if ($type eq "patch") {
+			$result = executePatch($iniconfig, $patchConfig, $pcnt);
+		} else {
+			#check if this was called for global pre-action.
+			# no need to check and exit as this function will make program exit if
+			# it fails.
+			$result = executePrePost($patchConfig, $pcnt, $paramkey);
+		}
+	}
+}
+
+sub patchRequired ($$$)
+{
+	my $licconfig = shift;
+	my $iniconfig = shift;
+	my $check = shift;
+
+	my @checks = split(",", $check);
+	my $type = $checks[0];
+	if ($type eq "lic") {
+		$iniconfig = $licconfig;
+	}
+
+	if ($type eq "file") {
+		#check if file exists
+		my $filename = $checks[1];
+		my $chr;
+		my $trueret = true;
+		if ($filename =~ /^\!/) {
+			$filename = reverse($filename);
+			$chr = chop($filename);
+			$filename = reverse($filename);
+
+			if ($chr ne "\!") {
+				logToFile("File $filename has invalid negation", LOGERROR | LOGCONS);
+				return false;
+			}
+			$trueret = false;
+		}
+
+		my $op = `ls $checks[1] 2> /dev/null`;
+		if ($op eq "") {
+			#logToFile("file $checks[1] not found", LOGCONS);
+			return !$trueret;
+		} else {
+			#logToFile("file $checks[1] OP: $op", LOGCONS);
+			return $trueret;
+		}
+
+	} elsif (($type eq "ini") || ($type eq "lic")) {
+		my ($section, $param, $value) = split('\+', $checks[1]);
+		if ($section =~ /^\*/) {
+		#either first or last character can be *. remove it.
+			my $chr = chop($section);
+			if ($chr ne "\*") {
+				$section = sprintf("%s%c", $section, $chr);
+				$section = reverse($section);
+				$chr = chop($section);
+				$section = reverse($section);
+			}
+
+			if ($chr ne "\*") {
+				logToFile("Section $section has invalid wildcard", LOGERROR | LOGCONS);
+				return false;
+			}
+		}
+
+		if ($param =~ /^\*/) {
+		#either first or last character can be *. remove it.
+			my $chr = chop($param);
+			if ($chr ne "\*") {
+				$param = sprintf("%s%c", $param, $chr);
+				$param = reverse($param);
+				$chr = chop($param);
+				$param = reverse($param);
+			}
+
+			if ($chr ne "\*") {
+				logToFile("Param $param has invalid wildcard", LOGERROR | LOGCONS);
+				return false;
+			}
+		}
+
+		my $configHash = shift;
+		foreach my $seckey (keys %{$iniconfig}) {
+			if ($seckey =~ /$section/) {
+				foreach my $parminfo (@{$iniconfig->{$seckey}}) {
+					if( $parminfo->{'name'} =~ /$param/) {
+						if ($value eq $parminfo->{'value'} || $value eq "") {
+							#logToFile("Param $param matching value", LOGCONS);
+							return true;
+						}
+						#dont return false yet. check all other sections
+					}
+				}
+			}
+		}
+		#logToFile("Param $param not matching value", LOGCONS);
+		return false;
+	} else {
+		logToFile("Invalid check type $type", LOGERROR | LOGCONS);
+		return false;
+	}
+}
+
+sub executePrePostAction ($)
+{
+	my $action = shift;
+
+	my @actions = split(",", $action);
+	my $type = $actions[0];
+	my $cmd = $actions[1];
+	my $result = $actions[2];
+
+	if ($type eq "cmd") {
+		#check if file exists
+		my $op = `$cmd 2> /dev/null`;
+		if ($op =~ /$result/) {
+			#logToFile("$cmd success", LOGCONS);
+			return true;
+		} else {
+			#logToFile("$cmd failed", LOGCONS);
+			return false;
+		}
+	} elsif (($type eq "start") || ($type eq "stop")) {
+		chdir ($gActiveBinDir);
+		my $item = $actions[1];
+		my @apps =`ls $item*`;
+		chomp(@apps);
+		my $ret = false;
+		foreach my $app (@apps) {
+			my $cmd = sprintf("./startApp %s_AppMgr %s %s", $gProduct, $type, $app);
+			my $op = `$cmd`;
+			if ($op =~ /$result/) {
+				logToFile("$cmd success", LOGCONS);
+				$ret = true;
+			} else {
+				logToFile("$cmd failed", LOGCONS);
+				return false;
+			}
+		}
+		chdir ($gLDirPath);
+		return $ret;
+	}
+}
+
+sub applyFilePatch($$)
+{
+	my $actionsRef = shift;
+	my $currentRel = shift;
+
+	my @actions = @{$actionsRef};
+	my $destdir = $actions[1];
+	my $destfile = $actions[2];
+	my $srcfile = $actions[3];
+
+	if ($destdir eq "" || $destdir eq "active") {
+		$destdir = $gActiveBinDir;
+	} elsif ($destdir eq "lib") {
+		$destdir = "$gActiverRelLink/$gLibDir";
+	}
+
+	if ($srcfile eq "") {
+		$srcfile = $destfile;
+	}
+
+	my @files = `find $gLDirPath -name $srcfile`;
+	chomp(@files);
+	my $patchFile = $files[-1];
+	if ($patchFile eq "") {
+		logToFile("Source file $srcfile not found", LOGERROR | LOGCONS);
+		return false;
+	}
+	my $patchdirname  = dirname($patchFile);
+	my $patchfilenameonly = basename($patchFile);
+	my $patchrel;
+
+	if($patchfilenameonly =~ m/_R(.*?)$/) {
+		$patchrel = $1;
+	}
+
+	# recursively find the releases number from directories
+	while(($patchrel eq "") && ($patchdirname ne "\/")) {
+		my $basedir = basename($patchdirname);
+		if($basedir =~ m/_RELEASE_R(.*?)$/) {
+			$patchrel = $1;
+		} elsif($basedir =~ m/_R(.*?)$/) {
+			$patchrel = $1;
+		}
+		$patchdirname = dirname($patchdirname);
+	}
+
+	if($patchrel eq "") {
+		logToFile("Patch version not found for $patchFile", LOGERROR | LOGCONS);
+		return false;
+	}
+	chomp($patchrel);
+
+	chdir ($destdir);
+	@files = `find . -name \"$destfile*\"`;
+	chomp(@files);
+
+	my $numfiles = scalar(@files);
+	if($numfiles == 0) {
+		logToFile("Destination file $destfile not found", LOGERROR | LOGCONS);
+		return false;
+	}
+
+	# multiple instance can occur only for softlink files.
+	# get absolute file name etc. for those in the begining.
+	my $destlink = $files[0];
+	if(!(-f $destlink) && !(-l $destlink)) {
+		logToFile("Destination file $destfile not present", LOGERROR | LOGCONS);
+		return false;
+	}
+
+	my $dest = Cwd::abs_path($destlink);
+	my $filenameonly = basename($dest);
+	my $dirname  = dirname($dest);
+	my $patchdirName = $dirname;
+
+	my $foundsst = false;
+
+	while (!$foundsst && ($patchdirName ne "\/")) {
+		my @tokens = split("\/", $patchdirName);
+
+		my $sstdir = basename($patchdirName);
+
+		foreach my $sstrec (@ssts) {
+			my $sstprefix = $sstrec->{'PkgPrefix'};
+			if($sstdir =~ m/^$sstprefix/) {
+				$foundsst = true;
+				last;
+			}
+		}
+
+		if(!$foundsst) {
+			$patchdirName = dirname($patchdirName);
+		}
+	}
+
+	#if sst is not found user platform sst dir to record the patch version.
+	if(!$foundsst) {
+		$patchdirName = "";
+		my $cmd = sprintf("find . -name %s_%s", $gProduct, $gAppMgrName);
+		my @appmgrfiles = `$cmd`;
+		chomp(@appmgrfiles);
+		foreach my $appMgrlink (@appmgrfiles) {
+			if((-f $appMgrlink) || (-l $appMgrlink)) {
+				my $destAppMgr = Cwd::abs_path($appMgrlink);
+				$patchdirName  = dirname($destAppMgr);
+				last;
+			}
+		}
+	}
+
+	if($patchdirName eq "") {
+		logToFile("No directory found for storing patch version file for patch $patchfilenameonly", LOGERROR | LOGCONS);
+		return false;
+	}
+	my $patchverfile = sprintf("%s/%s", $patchdirName, $gPatchVerFile);
+
+	my $release = "";
+
+	# get the release name from the release directory
+	# The release directory name will be of the format
+	# MLC_RELEASE_R1.1.1.1
+	# The release name comes between RELEASE_ and end
+	if($filenameonly =~ m/_R(.*?)$/) {
+		#if the file already has version no need to take a backup
+		#else take a backup with previous release version.
+		$release = $1;
+
+		if($release eq $patchrel) {
+			logToFile("Patch file $patchfilenameonly already applied", LOGERROR | LOGCONS);
+			next;
+		}
+	} else {
+		#check for patches releases number in directory.
+		open(PATCHVER, "<", $patchverfile);
+		my @versions = <PATCHVER>;
+		close PATCHVER;
+
+		foreach my $relversion (@versions) {
+			if ($relversion =~ /$filenameonly/) {
+				my ($dummy, $tmprel) = split('-> ', $relversion);
+				chomp($tmprel);
+				$release = $tmprel;
+			}
+		}
+
+		if($release eq "") {
+			$release = $currentRel;
+		}
+
+		if($release eq $patchrel) {
+			logToFile("Patch file $patchfilenameonly already applied", LOGERROR | LOGCONS);
+			return true;
+		}
+
+		chomp($release);
+
+		# take backup of old file.
+		my $fromFile = $dest;
+		my $toFile = sprintf("%s/PATCH_BKP_%s_%s\n", $dirname, $filenameonly, $release);
+		System("$mvCmd $fromFile $toFile", 1, "Cound not mv $fromFile to $toFile");
+	}
+
+	#all the files should point to the same source link.
+	# replace the source link with new file.
+	my $filecnt = 0;
+	foreach my $destlink (@files) {
+		$filecnt++;
+
+		my $symlink;
+		if (-l $destlink) {
+			$symlink = readlink($destlink);
+		}
+
+		# destlink is softlink
+		# dest is the actual file.
+		# first copy patch to dest
+		# RECORD
+		if($symlink ne "") {
+			my $dirsymlink  = dirname($symlink);
+			# create a soft link with new file.
+			my $toFile = sprintf("%s/%s", $dirname, $patchfilenameonly);
+			if(-f $toFile) {
+				if( $filecnt == 1) {
+					#patch is already present.
+					logToFile("Patch file $patchfilenameonly already present", LOGERROR | LOGCONS);
+					return true;
+				}
+			} else {
+				System("$cpCmd $patchFile $toFile", 1, "Cound not cp $patchFile to $toFile");
+			}
+
+			System("$rmCmd $destlink", 1, "Could not delete link $destlink");
+			# create a soft link with new file.
+			my $fromFile = sprintf("%s/%s", $dirsymlink, $patchfilenameonly);
+			System("$lnCmd -s $fromFile $destlink", 1, "Could not create soft link for $destlink");
+		} else {
+			System("$cpCmd $patchFile $dirname", 1, "Cound not cp $patchFile to $dirname");
+		}
+	}
+
+	# update patch version and patch file details.
+	open(PATCHVER, ">>", $patchverfile);
+	print PATCHVER "$patchfilenameonly -> $patchrel\n";
+	close PATCHVER;
+
+	return true;
+}
+
+sub applyConfigurationPatch($$)
+{
+	my $actionsRef = shift;
+	my $currentRel = shift;
+	my $iniconfig = shift;
+
+	my @actions = @{$actionsRef};
+	my $type = $actions[1];
+	my $config = $actions[2];
+
+	my $ret = false;
+
+	my $patchdirname  = $gLDirPath;
+	my $patchrel;
+
+	# recursively find the releases number from directories
+	while(($patchrel eq "") && ($patchdirname ne "\/")) {
+		my $basedir = basename($patchdirname);
+		if($basedir =~ m/_RELEASE_R(.*?)$/) {
+			$patchrel = $1;
+		} elsif($basedir =~ m/_R(.*?)$/) {
+			$patchrel = $1;
+		}
+		$patchdirname = dirname($patchdirname);
+	}
+
+	if($patchrel eq "") {
+		logToFile("Patch version not found for configuratoin patch", LOGERROR | LOGCONS);
+		return false;
+	}
+	chomp($patchrel);
+
+	$patchdirname = "";
+	my $cmd = sprintf("find . -name %s_%s", $gProduct, $gAppMgrName);
+	my @appmgrfiles = `$cmd`;
+	chomp(@appmgrfiles);
+	foreach my $appMgrlink (@appmgrfiles) {
+		if((-f $appMgrlink) || (-l $appMgrlink)) {
+			my $destAppMgr = Cwd::abs_path($appMgrlink);
+			$patchdirname  = dirname($destAppMgr);
+			last;
+		}
+	}
+
+	if($patchdirname eq "") {
+		logToFile("No directory found for storing patch version file for configuration patch", LOGERROR | LOGCONS);
+		return false;
+	}
+	my $patchverfile = sprintf("%s/%s", $patchdirname, $gPatchVerFile);
+	open(PATCHVER, "<", $patchverfile);
+	my @versions = <PATCHVER>;
+	close PATCHVER;
+
+	my $release = "";
+	foreach my $relversion (@versions) {
+		if ($relversion =~ /configuration/) {
+			my ($dummy, $tmprel) = split('-> ', $relversion);
+			chomp($tmprel);
+			$release = $tmprel;
+		}
+	}
+
+	if($release eq "") {
+		$release = $currentRel;
+	}
+
+	#if($release eq $patchrel) {
+		#logToFile("Patch for configuration already applied", LOGERROR | LOGCONS);
+		#return true;
+	#}
+
+	my ($section, $param, $value) = split('\+', $config);
+	if($type eq "add") {
+		&writeConfigVal($iniconfig, $section, $param, $value, true);
+		$ret = true;
+	} else {
+		# if not add support wild cards for section and paramter name.
+		if ($section =~ /^\*/) {
+		#either first or last character can be *. remove it.
+			my $chr = chop($section);
+			if ($chr ne "\*") {
+				$section = sprintf("%s%c", $section, $chr);
+				$section = reverse($section);
+				$chr = chop($section);
+				$section = reverse($section);
+			}
+
+			if ($chr ne "\*") {
+				logToFile("Section $section has invalid wildcard", LOGERROR | LOGCONS);
+				return false;
+			}
+		}
+
+		if ($param =~ /^\*/) {
+		#either first or last character can be *. remove it.
+			my $chr = chop($param);
+			if ($chr ne "\*") {
+				$param = sprintf("%s%c", $param, $chr);
+				$param = reverse($param);
+				$chr = chop($param);
+				$param = reverse($param);
+			}
+
+			if ($chr ne "\*") {
+				logToFile("Param $param has invalid wildcard", LOGERROR | LOGCONS);
+				return false;
+			}
+		}
+
+		foreach my $seckey (keys %{$iniconfig}) {
+			if ($seckey =~ /$section/) {
+				foreach my $parminfo (@{$iniconfig->{$seckey}}) {
+					if( $parminfo->{'name'} =~ /$param/) {
+						if($type eq "del") {
+							$parminfo->{'name'} = "";
+							$parminfo->{'value'} = "";
+							$ret = true;
+						} elsif ($type eq "mod") {
+							$parminfo->{'value'} = $value;
+							$ret = true;
+						}
+					}
+				} # loop for parameter within section iteration
+			}
+		} # loop for section iteration
+	}
+
+	if($ret == true) {
+		if($release ne $patchrel) {
+			my $toFile = sprintf("%s_%s\n", $gIniFile, $release);
+			System("$mvCmd $gIniFile $toFile", 1, "Cound not mv $gIniFile to $toFile");
+			# update patch version and patch file details.
+			open(PATCHVER, ">>", $patchverfile);
+			print PATCHVER "configuration -> $patchrel\n";
+			close PATCHVER;
+		}
+
+		writeIniFile($gIniFile, $iniconfig);
+	}
+	return $ret;
+}
+
+sub applyPatch ($$)
+{
+	my $action = shift;
+	my $currentRel = shift;
+	my $iniconfig = shift;
+
+	my @actions = split(",", $action);
+	my $type = $actions[0];
+
+	#untar all the tar files of the patch.
+	my $ret = false;
+
+	if ($type eq "file") {
+		$ret = &applyFilePatch(\@actions, $currentRel);
+		chdir ($gLDirPath);
+	} elsif ($type eq "ini") {
+		chdir ($gActiveBinDir);
+		$ret = &applyConfigurationPatch(\@actions, $currentRel, $iniconfig);
+		chdir ($gLDirPath);
+	}
+
+	return $ret;
+}
+
+sub createActiveRelLink($)
+{
+	my $installDir = shift;
+
+	if(-l $gActiverRelLink)
+	{
+		System("$rmCmd $gActiverRelLink", 1, "Could not delete link for active release");
+	}
+
+# create soft link for the active release.
+	if (-d $installDir )
+	{
+		System("$lnCmd -s $installDir $gActiverRelLink", 1, "Could not create soft link for Release");
+	}
+
+	chdir($installDir);
+	return true;
+}
+
+sub configureMlc($) {
+
+	my $promptHash = shift;
+
+	my %configHash = ();
+	my @licssts = ();
+
+	my $licensed = &checkLicense(\%configHash, \@licssts, "NodeLicense.lic", 0);
+	if($licensed == 0) {
+		logToFile ("License failure", LOGFATAL | LOGCONS);
+	}
+	unshift(@licssts, \%gPltSstDetail);
+	&genPort();
+
+	my $cnt = $licensed;
+# setup platform instance as its not set in the loop  below
+	$gPltSstDetail{'Instance'} = $cnt;
+
+	my %iniConfig = ();
+	my $iniFile = "PDEApp.ini.old";
+	&readIniFile($iniFile, \%iniConfig, true);
+	$gReleasePath= "."  ;
+	my $releaseDir = setupRelease();
+	my $status = &configureSsts(\@licssts, $releaseDir, "", \%iniConfig, \%configHash);
+
+	logToFile ("$gIniFile written", LOGCONS);
+}
+
+
+sub installMlc($) {
+
+	my $promptHash = shift;
+
+# clean up the shared memory
+	my $shmkey = sprintf("0x%08x", $gBasePortAppMgr);
+	system("for i in `/usr/bin/ipcs -m  | grep $shmkey | awk '{print \$2}'`; do /usr/bin/ipcrm -m \$i > /dev/null 2> /dev/null ; done ");
+
+
+# check license files
+	my %configHash = ();
+	my @licssts = ();
+
+	my $licensed = &checkLicense(\%configHash, \@licssts, "NodeLicense.lic", 0);
+	if($licensed == 0) {
+		logToFile ("License failure", LOGFATAL | LOGCONS);
+	}
+
+	-d $gReleasePath or system ("$mkdirCmd -p $gReleasePath $logCmd") ;
+
+	my $release = getRelease();
+
+	my @relDataArr;
+	my %relHash = getInstalledReleases(\@relDataArr);
+	if($relHash{$release} ne "") {
+		logToFile ("Release $release already installed", LOGFATAL | LOGCONS);
+	}
+
+	my $size = scalar (@relDataArr);
+
+	my %oldRelDetails = ();
+	&getLegacyInstallPath(\%oldRelDetails);
+	my $legRelSize = scalar keys %oldRelDetails;
+	if ( ($size + $legRelSize) >= 2) {
+		logToFile ("Maximum number of releases already installed", LOGFATAL | LOGCONS);
+	}
+
+# create the polaris user
+	&createPolarisUser();
+
+
+	my $cnt = $licensed;
+# setup platform instance as its not set in the loop  below
+	$gPltSstDetail{'Instance'} = $cnt;
+
+	my %iniConfig = ();
+	my $releaseDir = &installSsts(\@licssts, \%configHash, $cnt, \%iniConfig);
+	my $status = &configureSsts(\@licssts, $releaseDir, "", \%iniConfig, \%configHash);
+
+# setup the status file which indicates that the installation is complete
+	my $timestamp = `date`;
+	chomp $timestamp;
+	my $doneentry = sprintf("install: %s", $timestamp);
+	my $logfd;
+	my $doneFile = "$releaseDir/$gCompletedFile";
+	open($logfd, ">>",$doneFile);
+	print $logfd "$doneentry\n";
+	close($logfd);
+
+
+	my $version = &getReleaseNumber($releaseDir);
+# create the active release link
+# when install activate can happen instantly
+	# start PM CLI and BRM as soon as install is successful
+	&setupMlcDaemon();
+	logToFile ("Release $version successfully installed", LOGINFO | LOGCONS);
+	&printInstalledComponents(\@licssts, \%iniConfig, \%configHash, $version);
+	if ($size + $legRelSize <= 0) {
+# let user decide if they have to activate later
+		my $status = &createActiveRelLink($releaseDir);
+		if( $status == true ) {
+			logToFile ("Release $version successfully activated", LOGINFO | LOGCONS);
+			&setupBRM();
+		}
+	}
+
+	if($gUsingOpensaf == false) {
+		# do not change permission of files as opensaf requires root as onwer for those files.
+		# BUG-902: commenting all change ownership, as it takes log of time over nas. 
+		# On need selective directories can be added
+		#System("$chownCmd -R $gUser:$gGroup $gBasePath", 1, "could not change permission of the $gBasePath");
+	}
+	if($gIsLinux == false) {
+# setup crontab entry
+		setUpCrontab();
+	}
+
+	# setup syslog
+	&setUpSyslogInit();
+
+
+#TBD
+# start the mlc applications.
+#startmlcapplication();
+}
+
+sub untarPltPkg()
+{
+	my $plttarprefix = $gPltSstDetail{'PkgPrefix'};
+	my @files = ();
+
+	opendir (DIR, ".") or die "Cann't open current directory";
+	while (my $file = readdir(DIR)) {
+		if ($file =~ /$plttarprefix/) {
+			push(@files,$file);
+		}
+	}
+	closedir(DIR);
+	logToFile ("platform dirs: @files\n", LOGINFO);
+
+	if(@files == 0) {
+# only one file it present. It may be a gz or a tar file or
+# or untarred directory
+		logToFile ("Platform tar file not found", LOGFATAL | LOGCONS);
+	}
+
+# if tar file is not presnet go for gzip file.
+	my $tarfile;
+	foreach my $file (@files)
+	{
+		if ($file =~ /\.tar\.gz/) {
+			$tarfile = $file;
+			last;
+		}
+	}
+	my @tarTemp = split(".tar.gz", $tarfile);
+	System("$gunzipCmd -c $tarfile | $tarCmd -xvf -", 1, "Could not gunzip $tarfile");
+	my $tardir = $tarTemp[0];
+	return $tardir;
+}
+
+sub getInstalledPltPkg()
+{
+	my $plttarprefix = $gPltSstDetail{'PkgPrefix'};
+	my $dir = "../$gPkgDir";
+	my @files = ();
+
+	opendir (DIR, $dir) or die "Cann't open current directory";
+	while (my $file = readdir(DIR)) {
+		if ($file =~ /$plttarprefix/) {
+			push(@files,$file);
+		}
+	}
+	closedir(DIR);
+	logToFile ("platform dirs: @files\n", LOGINFO);
+
+	if(@files == 0) {
+# only one file it present. It may be a gz or a tar file or
+# or untarred directory
+		logToFile ("Platform tar file not found", LOGFATAL | LOGCONS);
+	}
+
+# if tar file is not presnet go for gzip file.
+	my $tarfile;
+	foreach my $file (@files)
+	{
+		if ($file =~ /\.tar\.gz/) {
+			$tarfile = $file;
+			last;
+		}
+	}
+
+	if($tarfile eq "") {
+		return "../$gPkgDir/$files[0]";	
+	} else {
+		my @tarTemp = split(".tar.gz", $tarfile);
+		System("$gunzipCmd -c $tarfile | $tarCmd -xvf -", 1, "Could not gunzip $tarfile");
+		my $tardir = $tarTemp[0];
+		return $tardir;
+	}
+}
+
+sub getFileNameFromPltDir($$)
+{
+	my $tardir = shift;
+	my $filepattern = shift;
+
+	my $filename = "";
+	opendir (DIR, "$tardir") or die "Cann't open directory: $tardir";
+	while (my $file = readdir(DIR)) {
+		if ($file =~ /$filepattern/) {
+			$filename = $file;
+			last;
+		}
+	}
+	closedir(DIR);
+
+	$filename = "$tardir/$filename";
+	return $filename;
+}
+
+sub checkLicense($$$$$) {
+	my $configHash = shift;
+	my $licssts = shift;
+	my $nodelicfile = shift;
+	my $nodecnt = shift;
+	my $stats = shift;
+
+	my $tardir = "";
+	if($stats == true ) {
+		$tardir = &getInstalledPltPkg()
+	} else {
+		$tardir = &untarPltPkg();
+	}
+	$gPltSstDetail{'PkgName'} = "$tardir.tar.gz";
+	my $licFile = &getFileNameFromPltDir($tardir, $gLicFilePrefix);
+	if($licFile eq "") {
+		logToFile ("License decoder not present", LOGFATAL | LOGCONS);
+	}
+
+	my $decodedLic = ".Decoded.txt";
+	if(!(-f $nodelicfile)) {
+		logToFile ("Node license file $nodelicfile not present", LOGFATAL | LOGCONS);
+	}
+
+	System("$licFile $nodelicfile $decodedLic", 1, "Could not decode: $licFile $nodelicfile");
+	if(!(-f $decodedLic)) {
+		logToFile ("Node license decode failure", LOGFATAL | LOGCONS);
+	}
+
+# read the decoded file and get the list  of the susbystems licensed.
+	&readIniFile($decodedLic, $configHash, true);
+	my $cnt = 1;
+	my $licensed = 0;
+	while (true) {
+		my $entry = &getParam($configHash, "NODEDETAIL", "nodedata$cnt");
+		if($entry ne "") {
+			$licensed = checkMacAndHost($entry);
+			if($licensed == 1) {
+				last;
+			}
+		} else {
+			last;
+		}
+		$cnt++;
+	}
+
+	my $secentries = &getSectionPararms($configHash, "NODEDETAIL");
+	$gNumNodes = scalar(@{$secentries});
+	$gNumNodes--;
+
+	if($licensed == 0 ) {
+		$cnt = 0;
+		return $cnt;
+	}
+
+	if($nodecnt > 0) {
+		$cnt = $nodecnt;
+	}
+
+# system is licensed. Get the licensed subsystems licensed system can be
+# read from the decoded text
+	my @licensedsst = ();
+
+	$secentries = &getSectionPararms($configHash, "PLATFORM_$cnt");
+	foreach my $parminfo (@{$secentries}) {
+		if($parminfo->{'name'} eq "AppHA") {
+			next;
+		}
+		my @values = split(":", $parminfo->{'name'});
+		my $found = false;
+		foreach my $licsst (@licensedsst) {
+			if($licsst eq $values[0]) {
+				$found = true;
+				last;
+			}
+		}
+
+		if($found == true) {
+			next;
+		}
+
+		push(@licensedsst, $values[0]);
+# check for present of the licensed package in the tar file
+		foreach my $sstrec (@ssts) {
+			my $sstlicname = $sstrec->{'LicName'};
+			if($sstlicname eq $values[0]) {
+				my $sstprefix = $sstrec->{'PkgPrefix'};
+				my $dir = ".";
+				if($stats == true ) {
+					$dir = "../$gPkgDir";
+				}
+				my @files = ();
+				opendir (DIR, $dir) or die "Cann't open current directory";
+				while (my $file = readdir(DIR)) {
+					if($stats == true ) {
+						if (($file =~ /$sstprefix/)) {
+							push(@files,$file);
+						}
+					} else {
+						if (($file =~ /$sstprefix/) & ($file =~ /.tar.gz/)) {
+							push(@files,$file);
+						}
+					}
+				}
+				closedir(DIR);
+				if(@files >= 1) {
+					$sstrec->{'PkgName'} = $files[0];
+					$sstrec->{'Instance'} = $values[2];
+# do not add mode as this information is
+# not available
+#$sstrec->{'Mode'} = $values[3];
+					push(@{$licssts}, $sstrec);
+					last;
+				} else {
+					logToFile ("Package not found for $sstlicname", LOGFATAL | LOGCONS);
+				}
+			}
+		}
+	}
+
+	my $sstsize = scalar(@{$licssts});
+	if($sstsize == 0) {
+		$gBasePath	= "/${gProductLc}redn";
+	} else {
+		logToFile ("Licensed subsystems are: @licensedsst", LOGINFO | LOGCONS);
+	}
+	&getBaseInstallPath(false);
+	logToFile ("Installation Path: $gBasePath", LOGINFO | LOGCONS);
+
+	return $cnt;
+}
+
+sub getRednNodesDir($) {
+	my $nodecnt = shift;
+	my $nodedir = sprintf("/%sredn/%s/%s%d", $gProductLc, $gRednNodesDir, $gProductLc, $nodecnt);
+	return $nodedir;
+}
+
+sub getRednNodesLegacyDir($) {
+	my $nodecnt = shift;
+	my $nodedir;
+	if($gProductLegacy ne "") {
+		$nodedir = sprintf("/%sredn/%s/%s%d", $gProductLc, $gRednNodesDir, lc($gProductLegacy), $nodecnt);
+	}
+	return $nodedir;
+}
+
+sub getRednNodesIniFile($) {
+	my $nodecnt = shift;
+	my $rednIni = sprintf("%s/config.ini", &getRednNodesDir($nodecnt));
+	return $rednIni;
+}
+
+sub getRednNodesMonitorFile($) {
+	my $nodecnt = shift;
+	my $rednIni = sprintf("%s/stopmonitoring", &getRednNodesDir($nodecnt));
+	return $rednIni;
+}
+
+sub checkMacAndHost($) {
+	my $inivalue = shift;
+	my $retvalue = 0;
+	my @values = split(",", $inivalue);
+	my $hostid = `/usr/bin/hostid`;
+	chomp($hostid);
+	$hostid = hex($hostid);
+	$hostid = sprintf("%d", $hostid);
+
+	my @macvalues = split("-", $values[0]);
+
+	foreach my $licmac (@macvalues) {
+		my $inimac = convertMacToLowerWithoutZeroPadding($licmac);
+		if($inimac eq "") {
+			next;
+		}
+# don't check hostid if the machine is linux.
+# hostid is configurable in linux
+		if($gIsLinux == true) {
+			$hostid = $values[1];
+		}
+		if($hostid == $values[1]) {
+# check mac address
+			my @macs = ();
+			if($gIsLinux == true) {
+				@macs = `/usr/sbin/ip addr | /bin/grep ether | awk '{ print \$2 }'`;
+			} else {
+				@macs = `/usr/sbin/arp -a | /bin/grep $gHostName | /usr/bin/awk '{print \$5}'`;
+			}
+
+			foreach my $mac (@macs) {
+				$mac = convertMacToLowerWithoutZeroPadding($mac);
+				if($mac =~ /^$inimac/i) {
+# license check success
+# update if this node is controller
+					if ($values[3]  eq "controller") {
+						$gIsController = true;
+					}
+					$localmac = $mac;
+					$gNodeCnt = $values[2];
+					$retvalue = 1;
+					last;
+				}
+			}
+		}
+
+		if($retvalue == 1) {
+			last;
+		}
+	}
+	return $retvalue;
+}
+
+sub convertMacToLowerWithoutZeroPadding($) {
+	my $mac = shift;
+	$mac =~ tr/A-Z/a-z/;
+	my @macelements = split(":", $mac);
+	my $size = scalar(@macelements);
+	if($size != 6) {
+		$mac = "";
+		return $mac;
+	}
+
+	$mac = "";
+	foreach my $macelem (@macelements) {
+		if($macelem ne "0") {
+			$macelem =~ s/^0//;
+		}
+		if( $mac eq "") {
+			$mac = sprintf("%s", $macelem);
+		} else {
+			$mac = sprintf("%s:%s", $mac, $macelem);
+		}
+	}
+	return $mac;
+}
+
+sub pltInstall($$$$)
+{
+	my $sstrec = shift;
+	my $releaseDir = shift;
+	my $licconfig = shift;
+	my $configHash = shift;
+
+	if($gIsLinux == true) {
+		my $pltBinary = sprintf("%s/%s/%s", $releaseDir, $gBinDir, $gStartAppName);
+		my $sysstatinstalled = `rpm -qa | grep sysstat`;
+		if($sysstatinstalled eq "") {
+			my $filter = LOGFATAL | LOGCONS;
+			if($gContinueOnPrecheckFail ne "true") {
+				$filter = LOGERROR | LOGCONS
+			}
+			logToFile("SYSSTAT package required for system monitoring is not installed", $filter);
+		}
+
+		my $osaffilestart = "OpenSAFfire_";
+		my $osaffileend = "_Build_RPMs.tar.gz";
+		my $pkgname = $sstrec->{'PkgName'};
+		my @tarfile = split(".tar.gz", $pkgname);
+		chdir("$releaseDir/$gPkgDir/$tarfile[0]");
+		# install python preconditions for mlc query scripts for GT HA
+		System("./pexpect_install", 1, "Cound not install pexpect");
+
+		opendir (DIR, ".") or die "Cann't open $releaseDir/$gPkgDir/$tarfile[0] directory";
+		# check for opensaf tar file
+		my @files = ();
+		while (my $file = readdir(DIR)) {
+			if ($file =~ /$osaffilestart/) {
+				if ($file =~ /$osaffileend/) {
+					push(@files,$file);
+				}
+			}
+		}
+		closedir(DIR);
+
+		my $useVMware = &getParam($licconfig, "FEATURES", "AppHA");
+		if($useVMware ne "none") {
+			## if mixed pick individual VM config
+			if($useVMware eq "mixed") {
+				my $pltSecName = sprintf("PLATFORM_%s", $gPltSstDetail{'Instance'});
+				$useVMware = &getParam($licconfig, $pltSecName, "AppHA");
+			}
+			if($useVMware ne "none" ) {
+				$gUsingVMware = true;
+				$gVMwareVMname =  &getParam($configHash, "PLATFORM_SVCS", "VMName");
+				if($gVMwareVMname eq "") {
+					
+					$gVMwareVMname = &getInputString("Enter the VM Name for System Name [ $gHostName ]");
+					
+					if($useVMware eq "vmware") {
+						my $exsiUser = &getInputString("Enter the VMware Vcenter user name");
+						my $exsiPasswd = &getInputString("Enter the VMware Vcenter user passwd");
+						my $exsiIp = getIp("Enter VMware Vcenter IP address", false, false);
+						my $exsiPort = getPort("Enter VMware Vcenter Host Port", "443");
+						my $exsiProtocol = &getInputString("Enter the protocol being used to communicate with VMware Vcenter(for Example: https)");
+						my $vminitfile = $gVMwareIniFile;
+						open(INITCONF, ">",$vminitfile) or die "Could not open $vminitfile";
+						print INITCONF "VI_SERVER = $exsiIp\n";
+						print INITCONF "VI_USERNAME = $exsiUser\n";
+						print INITCONF "VI_PASSWORD = $exsiPasswd\n";
+						print INITCONF "VI_PROTOCOL = $exsiProtocol\n";
+						print INITCONF "VI_PORTNUMBER = $exsiPort\n";
+						close (INITCONF);
+					}
+					elsif ($useVMware eq "generic") {
+						#enable softdog
+						`modprobe softdog`;
+						# enable softdog on every boot
+						`echo "softdog" > /etc/modules-load.d/softdog.conf `;
+						
+					}
+				}
+			}
+		}
+		my $useOpenSaf = &getParam($licconfig, "FEATURES", "UseOpenSaf");
+		if($useOpenSaf eq "true") {
+			my $pltPkgDir = sprintf("../%s/%s", $gPkgDir, $tarfile[0]);
+			chdir("$releaseDir/$gBinDir");
+			# update softlink of startapp to the softlink of startapp for goahead
+			my $fromFile = sprintf( "%s/%s.goahead", $pltPkgDir, $gStartAppName);
+			my $toFile = "startApp";
+			unlink($toFile);
+			System("$lnCmd -s  $fromFile $toFile", 1, "Cound not link $fromFile to $toFile");
+			System("$chownCmd root:root $toFile", 1, "Cound not own $toFile");
+			chdir("$releaseDir/$gLibDir");
+			# remove all opensaf libraires
+			my $toFile = "libSaCkpt.so.1";
+			unlink($toFile);
+			$toFile = "libSaAmf.so.0";
+			unlink($toFile);
+			$toFile = "libopensaf_core.so.0";
+			unlink($toFile);
+			chdir("$releaseDir/$gPkgDir/$tarfile[0]");
+			$gUsingOpensaf = true;
+			System("$gunzipCmd  -c $files[0] | $tarCmd -xvf -", 1, "Cound not gunzip opensaf package $files[0]");
+			my @opensafdir = split("_RPMs.tar.gz", $files[0]);
+			chdir("$releaseDir/$gPkgDir/$tarfile[0]/$opensafdir[0]");
+			my $basefile = "install.conf.in";
+			my $inputfile = "install.conf";
+			System("$cpCmd $basefile $inputfile", 1, "copying of $basefile to $inputfile failed");
+			my $inifd;
+			my $tipcintf = getParam($configHash, "PLATFORM_SVCS", "IntfForTipc");
+			my @intfs = ();
+			if($tipcintf  eq "") {
+				@intfs = getEthIntfForTipc();
+			} else {
+				@intfs = split(",", $tipcintf);
+			}
+			open($inifd, ">>", "$inputfile") or printf("input file $inputfile cannot be opened for writing\n");
+			print $inifd "CLUSTER_COUNT=$gNumNodes\n";
+			print $inifd "MDS_TRANSPORT=TIPC\n";
+			my $nodeCnt = $gNodeCnt - 1;
+			print $inifd "NODE_COUNT=$nodeCnt\n";
+			close($inifd);
+
+			$inputfile = "input";
+			open($inifd, ">", "$inputfile") or printf("input file $inputfile cannot be opened for writing\n");
+			#for prompt: Do you want to continue with the same old options: [y/n [default no]]
+			print $inifd "y\n";
+			#for prompt: Enter the first ethernet interface to be used for the Opensaf NODE's to communicate
+			print $inifd "$intfs[0]\n";
+			#for prompt: Enter the second ethernet interface to be used for the Opensaf NODE's to communicate
+			print $inifd "$intfs[1]\n";
+			#for prompt: Files /etc/redhat-lsb/lsb_start_daemon and /etc/init.d/functions need to be modified to suit the OpenSAFFIRE
+			#            Do you want to modify the files: [y]
+			print $inifd "y\n";
+			close($inifd);
+
+			my $clusterid = &getParam($licconfig, "NODEDETAIL", "ClusterId");
+			`/bin/sed -i 's/TIPC_ID=.*/'TIPC_ID=$clusterid'/g' install.sh`;
+			my $installcmd = "/bin/sh install.sh < $inputfile";
+			System("$installcmd", 1, "Running $installcmd failed");
+
+			if($kernel >= 4) {
+				System("modprobe tipc", 1, "TPIC installation failed");
+			} else {
+				my $name =`/bin/uname -r`;
+				chomp $name;
+				my $arch =`/bin/arch`;
+				chomp $arch;
+				my $tipcfile = sprintf("tipc.ko.%s-%s", $name, $arch);
+				chdir("$releaseDir/$gPkgDir/$tarfile[0]");
+				if( -f $tipcfile) {
+					my $inputdir = sprintf("/lib/modules/%s/kernel/net/tipc", $name);
+					-d $inputdir or system("$mkdirCmd -p $inputdir 2> /dev/null > /dev/null");
+					my $inputfile = sprintf("%s/tipc.ko", $inputdir);
+					System("$cpCmd $tipcfile $inputfile", 1, "copying of $tipcfile to $inputfile failed");
+					System("depmod -a", 1, "depmod $inputfile failed");
+				} else {
+					die "TIPC file $tipcfile required for kernel version of system is not packaged";
+				}
+			}
+
+# setup 30 days for opensaf logs
+#`/bin/sed -i 's/DTSV_MAX_ARCHIVES=.*/DTSV_MAX_ARCHIVES=30/g' /etc/opensaf/dtsv.conf`;
+#`/bin/sed -i 's/#enable_coredump/enable_coredump/g' /etc/init.d/opensafd`;
+#`/bin/sed -i 's/${DAEMON_COREFILE_LIMIT:-0}/unlimited/g' /etc/rc.d/init.d/functions`;
+
+# block reboot in opensaf script and issue reboot incase of vmware
+			my $cmd="/bin/sed -i 's/\$icmd \\/sbin\\/reboot -f/\if [ -f \\/root\\/.visdkrc ] ; then\\n\$icmd \\/sbin\\/reboot -f\\nelse\\npkill -9 osaf\\npkill -9 nid\\nfi/g' /usr/lib64/opensaf/opensaf_reboot";
+			`$cmd`;
+
+			chdir("$releaseDir/$gPkgDir/$tarfile[0]");
+			my $optDir = "/opt";
+			my $preopensaffile = "OpenSAFfire_4555_config.tar.gz";
+			System("$cpCmd $preopensaffile $optDir", 1, "copying of $preopensaffile to $optDir failed");
+			chdir("$optDir");
+			System("$gunzipCmd  -c $preopensaffile | $tarCmd -xvf -", 1, "could not untar $preopensaffile");
+			unlink($preopensaffile);
+			chdir("$optDir/opensaffire");
+			my $opensafSetup = "OpenSAFfire_4555.sh";
+			System("/bin/sh $opensafSetup", 1, "could not execute $opensafSetup");
+			System("chkconfig opensafd on", 1, "could not execute chkconfig for opensaf");
+		} else {
+		}
+		`/bin/sed -i 's/PRODUCT=.*/PRODUCT=$gProduct/g' $pltBinary`;
+	}
+}
+
+sub getSuList($$) {
+	my $configHash = shift;
+	my $suHash = shift;
+
+
+	for(my $cnt = 1; $cnt <= $gNumNodes; $cnt++) {
+		my $twoNSuName = "";
+
+		my $nodeparm = &getParam($configHash, "NODEDETAIL","nodedata$cnt");
+		my @nodevalues = split(",", $nodeparm);
+
+		my $node = "";
+		if ($nodevalues[3]  eq "controller") {
+			$node = sprintf("SC-%d", $cnt);
+		} else {
+			$node = sprintf("PL-%d", $cnt);
+		}
+
+		my $secEntries = &getSectionPararms($configHash, "PLATFORM_$cnt");
+		foreach my $parminfo (@{$secEntries}) {
+			if($parminfo->{'name'} eq "AppHA") {
+				next;
+			}
+			my @values = split(",", $parminfo->{'value'});
+			my $app = $parminfo->{'name'};
+			my @appfields = split(":", $app);
+			my @appname = split("$appfields[3]", $appfields[1]);
+			$app = sprintf("%s.%s.%s.%s", $appfields[0], $appname[0], $appfields[2], $appfields[3]);
+			my $obj;
+#For all 2N app assume same SU name for blade level red, else take from decoded
+			my $suName;
+			if($gProductLc eq tsmlccn && $values[0] eq "2N") {
+				$suName = "TSMLC_1_1";
+			} else {
+				# all SGWs in a blade form single SU
+				# This is done so that virtual IPs used by SGWs are swapped to peer blade
+				# we will not support virtual ip address per instance
+				if($values[0] eq "2N") {
+					if($twoNSuName eq "") {
+						$suName = $values[1];
+						$twoNSuName = $suName;
+					} else {
+						$suName = $twoNSuName;
+					}
+				} else {
+					$suName = $values[1];
+				}
+			}
+
+			if(exists $suHash->{$suName}) {
+				$obj = $suHash->{$suName};
+			} else {
+				$obj = surecord->new();
+			}
+			my $exe = sprintf("%s_%s", $gProduct, $appfields[1]);
+			$obj->{'version'} = $gCompToVersion{$appname[0]};
+			$obj->{'mode'} = $values[0];
+			$obj->{'sg'} = $values[2];
+			push(@{$obj->{'apps'}},$app);
+			push(@{$obj->{'nodes'}},$node);
+			push(@{$obj->{'exes'}},$exe);
+			$suHash->{$suName}  = $obj;
+		}
+
+		my $obj = surecord->new();
+		$obj->{'mode'} = "NORED";
+		$obj->{'sg'} = sprintf("PLT_%d", $cnt);
+		push(@{$obj->{'nodes'}},$node);
+		my $pltapps = $gPltSstDetail{'Apps'};
+		foreach my $app (@{$pltapps}) {
+			if($app eq $gBRMName) {
+				next;
+			}
+			if(($app eq "OamClient" || $app eq "AppMgr" ) && $twoNSuName ne "") {
+				my $obj1;
+				if(exists $suHash->{$twoNSuName}) {
+					$obj1 = $suHash->{$twoNSuName};
+				} else {
+					$obj1 = surecord->new();
+				}
+				push(@{$obj1->{'nodes'}},$node);
+				push(@{$obj1->{'apps'}},sprintf("PLT.%s.%d.1",$app, $cnt));
+				my $exe = sprintf("%s_%s", $gProduct, $app);
+				push(@{$obj1->{'exes'}},"$exe");
+				$suHash->{$twoNSuName}  = $obj1;
+			}else{
+				$obj->{'version'} = $gCompToVersion{$app};
+				push(@{$obj->{'apps'}},sprintf("PLT.%s.%d.1",$app, $cnt));
+				push(@{$obj->{'nodes'}},$node);
+				my $exe = sprintf("%s_%s", $gProduct, $app);
+				push(@{$obj->{'exes'}},"$exe");
+			}
+		}
+		$suHash->{$obj->{'sg'}}  = $obj;
+	}
+}
+
+sub getEthIntfForTipc() {
+	my @ethIntfArr = ();
+	my $prompt  = "Enter number of ethernet interface to be used for internal communication [1/2] [Default: 2]";
+	my $choice = getPromptInput($prompt);
+	if ($choice ne "1" && $choice ne "2") {
+		$choice = 2;
+	}
+	if($choice == 2) {
+		my $ethIntf = getEthIntf("Enter ethernet interface to be used for internal communication", \@ethIntfArr);
+		push (@ethIntfArr, $ethIntf);
+	}
+	my $ethIntf = getEthIntf("Enter ethernet interface to be used for internal communication", \@ethIntfArr);
+	push (@ethIntfArr, $ethIntf);
+	return @ethIntfArr;
+}
+
+sub getEthIntf($$) {
+	my $prompt = shift;
+	my $excludeArr = shift;
+
+	my @vintfsRaw = `/usr/sbin/ip addr | /bin/grep BROADCAST | awk '{ print \$2 }' | /bin/grep -v eth21 | /bin/grep -v eth22 | cut -d":" -f1`;
+	chomp(@vintfsRaw);
+
+	my @vintfs;
+	foreach my $intf (@vintfsRaw) {
+		my $found = false;
+		foreach my $intfdel (@{$excludeArr}) {
+			if($intf eq $intfdel) {
+				$found = true;
+				last;
+			}
+		}
+
+		if($found == false) {
+			push (@vintfs, $intf);
+		}
+	}
+
+	my $ethIntf = "";
+	my $numIntf = scalar (@vintfs);
+# if only one ip is configured in the system use it for all the
+# ip prompts
+	if($numIntf > 0) {
+		my $defval = "";
+		my $cnt = 0;
+		foreach my $ethentry (@vintfs) {
+			$cnt++;
+			if($cnt == 1) {
+				$defval = sprintf("[%d-%s", $cnt, $ethentry);
+			} else {
+				$defval = sprintf("%s, %d-%s", $defval, $cnt, $ethentry);
+			}
+		}
+
+		$defval = sprintf("%s]", $defval);
+		my $done = false;
+		my $choice = "";
+
+		if ($cnt == 1) {
+			$choice = 1;
+		} else  {
+			$choice = &getPromptInput("$prompt $defval");
+			while(!$done) {
+				if ($choice eq "q" || $choice eq "Q") {
+					logToFile("Operation aborted", LOGFATAL | LOGCONS);
+				}
+				$choice = int ($choice);
+				if($choice < 1 || $choice > $numIntf) {
+					printf("Invalid value. Enter valid value or q to quit.\n");
+					delete $gPromptToInput{$prompt};
+					$choice = &getPromptInput("$prompt $defval");
+					next;
+				}
+				$done = true;
+			}
+
+		}
+		$ethIntf = $vintfs[$choice - 1];
+	} else {
+		logToFile ("No interface configured", LOGFATAL | LOGCONS);
+	}
+
+	return $ethIntf;
+}
+
+sub pltConfig ($$$$) {
+	my $configHash = shift;
+	my $currentRelPath = shift;
+	my $oldRelPath = shift;
+	my $licconfig = shift;
+
+	my $instance = $gPltSstDetail{'Instance'};
+
+###### PLATFORM_SVCS  #########################
+	my $ip = &getParam($configHash, "PLATFORM_SVCS", "NodeIPAddress");
+
+	if($ip eq "" || $ip eq "127.0.0.1") {
+		$ip = &getIp("Enter node IP address", true, false);
+	}
+
+	&writeConfigVal($configHash, "PLATFORM_SVCS", "NodeIPAddress", "$ip", true);
+
+	if (true == $gUsingVMware) {
+		&writeConfigVal($configHash, "PLATFORM_SVCS", "VMName", "$gVMwareVMname", true);
+	}
+# master has the subsysetm instance id as one. Don't prompt for the master
+# app manager ips if self is master
+
+	&writeConfigVal($configHash, "NAT_IP_MAP", "", "", false);
+
+	if($gUsingOpensaf != true) {
+		my $val = &getParam($configHash, "PLATFORM_SVCS", "MasterNodeIPAddress");
+		if($instance != 1) {
+			if($val eq "") {
+				$val = getIp("Enter IP address of the node which is licensed to run main AppMgr", false, false);
+			}
+			&writeConfigVal($configHash, "PLATFORM_SVCS", "MasterNodeIPAddress", "$val", true);
+		}
+	}
+
+	if($gUsingOpensaf == true) {
+			&writeConfigVal($configHash, "PLATFORM_SVCS", "StateNotificationPort", $gPortNumbers{7}, true);
+			&writeConfigVal($configHash, "PLATFORM_SVCS", "HAUsersInitWait", 600, false);
+			&writeConfigVal($configHash, "PLATFORM_SVCS", "HAUsers", "1,2", false);
+			&writeConfigVal($configHash, "PLATFORM_SVCS", "HAUserLamAllowFailOver", "true", false);
+			&writeConfigVal($configHash, "PLATFORM_SVCS", "HAUserOamAllowFailOver", "true", false);
+			&writeConfigVal($configHash, "ServerDetails", "", "", false);
+	}
+
+	my $nodeLicIni = &getParam($configHash, "PLATFORM_SVCS", "NodeLicenseFile");
+	&writeConfigVal($configHash, "PLATFORM_SVCS", "NodeLicenseFile", "NodeLicense.lic", true);
+# applications 2 till 8 are platform applications to be started
+	my @pltApps = @{$gPltSstDetail{'Apps'}};
+	my $pltsize = scalar(@pltApps);
+	my $pltBinaries = $pltApps[1];
+	for(my $bincnt = 2; $bincnt < $pltsize - 1; $bincnt++) {
+		$pltBinaries = sprintf("%s,%s", $pltBinaries, $pltApps[$bincnt]);
+	}
+
+	&writeConfigVal($configHash, "PortDetail", "BasePort", $gBasePortAppMgr, true);
+	&writeConfigVal($configHash, "PLATFORM_SVCS", "Applications", "$pltBinaries", true);
+	&writeConfigVal($configHash, "PLATFORM_SVCS", "SstInstanceId", "$instance", true);
+	&writeConfigVal($configHash, "PLATFORM_SVCS", "MasterSstInstanceId", "1", true);
+	&writeConfigVal($configHash, "PLATFORM_SVCS", "DumpBinary", "false", false);
+	&writeConfigVal($configHash, "PLATFORM_SVCS", "ExcludePartiotionsForAlarm", "", false);
+	&writeConfigVal($configHash, "PLATFORM_SVCS", "UsagePollInterval", "10", false);
+	&delParam($configHash, "PLATFORM_SVCS", "HighCPUThreshold");
+	&delParam($configHash, "PLATFORM_SVCS", "MediumCPUThreshold");
+	&delParam($configHash, "PLATFORM_SVCS", "LowCPUThreshold");
+	&delParam($configHash, "PLATFORM_SVCS", "HighDiskUsageThreshold");
+	&delParam($configHash, "PLATFORM_SVCS", "MediumDiskUsageThreshold");
+	&delParam($configHash, "PLATFORM_SVCS", "LowDiskUsageThreshold");
+	&delParam($configHash, "PLATFORM_SVCS", "HighRealMemoryThreshold");
+	&delParam($configHash, "PLATFORM_SVCS", "MediumRealMemoryThreshold");
+	&delParam($configHash, "PLATFORM_SVCS", "LowRealMemoryThreshold");
+	&delParam($configHash, "PLATFORM_SVCS", "HighSwapMemoryThreshold");
+	&delParam($configHash, "PLATFORM_SVCS", "MediumSwapMemoryThreshold");
+	&delParam($configHash, "PLATFORM_SVCS", "LowSwapMemoryThreshold");
+	&delParam($configHash, "PLATFORM_SVCS", "CpuPollInterval");
+	&delParam($configHash, "PLATFORM_SVCS", "DiskPollInterval");
+	&delParam($configHash, "PLATFORM_SVCS", "MemPollInterval");
+	&delParam($configHash, "PLATFORM_SVCS", "NwPollInterval");
+	# GT HA mode changes
+	&writeConfigVal($configHash, "PLATFORM_SVCS", "VirtualIpMode", "1", false);
+	#&writeConfigVal($configHash, "PLATFORM_SVCS", "HAPeerIPs", "127.0.0.1", false);
+	&delParam($configHash, "PLATFORM_SVCS", "HAPeerIPs");
+	#&writeConfigVal($configHash, "PLATFORM_SVCS", "PeerUserName", "polaris", false);
+	&delParam($configHash, "PLATFORM_SVCS", "PeerUserName");
+	#&writeConfigVal($configHash, "PLATFORM_SVCS", "PeerPassword", "dummy", false);
+	&delParam($configHash, "PLATFORM_SVCS", "PeerPassword");
+	#&writeConfigVal($configHash, "PLATFORM_SVCS", "HAAuditInterval", "20", false);
+	&delParam($configHash, "PLATFORM_SVCS", "HAAuditInterval");
+	#&writeConfigVal($configHash, "PLATFORM_SVCS", "HAAuditRetryCnt", "3", false);
+	&delParam($configHash, "PLATFORM_SVCS", "HAAuditRetryCnt");
+	&writeConfigVal($configHash, "PLATFORM_SVCS", "HwType", "Server", false);
+	&writeConfigVal($configHash, "PLATFORM_SVCS", "ChassisNo", "1", false);
+	&writeConfigVal($configHash, "PLATFORM_SVCS", "SlotNo", "1", false);
+	# Bug 1892
+	&writeConfigVal($configHash, "PLATFORM_SVCS", "WatchDogPatInterval", "3", false);
+	&writeConfigVal($configHash, "PLATFORM_SVCS", "WatchDogPatRetryCnt", "3", false);
+
+	&delParam($configHash, "PLATFORM_SVCS", "HAMode");
+
+	&writeConfigVal($configHash, "PLATFORM_SVCS", "RestartCnt", "3", false);
+	if($gUsingOpensaf == true) {
+		&writeConfigVal($configHash, "PLATFORM_SVCS", "RestartCntThreshold", "10", false);
+	} else{
+		if($gUsingVMware == true){
+			&writeConfigVal($configHash, "PLATFORM_SVCS", "RestartCntThreshold", "30", false);
+		} else {
+			&writeConfigVal($configHash, "PLATFORM_SVCS", "RestartCntThreshold", "5", false);
+		}
+	}
+
+	&writeConfigVal($configHash, "BackUpAndRestore", "BRMPath", "/Disk/home/polaris/backup", false);
+	&writeConfigVal($configHash, "BackUpAndRestore", "MaxSize", "0", false);
+	&writeConfigVal($configHash, "BackUpAndRestore", "PollTime", "300", false);
+
+
+	#&writeConfigVal($configHash, "BackupPath", "release", "$gReleasePath", false);
+	#&writeConfigVal($configHash, "BackupPath", "active", "$gActiverRelLink", false);
+# remove legacy paramters for upgrade case.
+	delParam ($configHash,"PLATFORM_SVCS", "Sst_1_StartFile");
+	delParam ($configHash,"PLATFORM_SVCS", "Sst_2_StartFile");
+	delParam ($configHash,"PLATFORM_SVCS", "PlatfomStartIPAddress");
+	delParam ($configHash,"PLATFORM_SVCS", "NoOfApplications");
+	delParam ($configHash,"PLATFORM_SVCS", "MaxNodes");
+
+	&updateNodeSpecicParam($configHash, "APPDATA", "*");
+	&updateNodeSpecicParam($configHash, "SYSTEM", "*");
+	&updateNodeSpecicParam($configHash, "Modules", "*");
+	&updateNodeSpecicParam($configHash, "LogsManager", "*");
+	&updateNodeSpecicParam($configHash, "PLATFORM_SVCS", "NodeIPAddress");
+	&updateNodeSpecicParam($configHash, "PLATFORM_SVCS", "SstInstanceId");
+	&updateNodeSpecicParam($configHash, "PLATFORM_SVCS", "HAPeerIPs");
+	&updateNodeSpecicParam($configHash, "PLATFORM_SVCS", "PeerPassword");
+	&updateNodeSpecicParam($configHash, "BackUpAndRestore", "BRMPath");
+
+#copy the NodeLicense.lic from pervious release to current release during upgrade
+#during install the file has to be copied from current working  directory
+	my $newPath = "$currentRelPath/$gBinDir";
+	if($oldRelPath ne "" ) {
+		my $file;
+		my $oldPath = "";
+		$file = "NodeLicense.lic";
+		my %oldRelData = ();
+		&getOldRelDir($oldRelPath, \%oldRelData);
+		$oldPath = "";
+		#4054
+		if($oldRelData{'from'} eq mlccn || $oldRelData{'from'} eq mer || $oldRelData{'from'} eq tsmlccn || $oldRelData{'from'} eq lc($gProductLegacy)) {
+			$oldPath =  $oldRelData{'rel'};
+		} else {
+			$oldPath = "$gLDirPath";
+		}
+		&copyFileFromPrevRel($file, $file, $newPath, $oldPath);
+		$file = ".ExpiryLicense.lic";
+		&copyFileFromPrevRel($file, $file, $newPath, $oldPath);
+	} else {
+		my $file = "NodeLicense.lic";
+		my $oldPath = "$gLDirPath";
+		&copyFileFromPrevRel($file, $file, $newPath, $oldPath);
+		$file = ".ExpiryLicense.lic";
+		&copyFileFromPrevRel($file, $file, $newPath, $oldPath);
+	}
+# add port for oam proxy
+	&writeConfigVal($configHash, "OamProxy", "CliPort", getNextPort(), true);
+	# keep one port free for internal CLI
+	&getNextPort();
+	
+	&writeConfigVal($configHash, "OamProxy", "PDEUpdateTimer", "4000", false);
+	&writeConfigVal($configHash, "OamProxy", "NumCliIntSess", "40", false);
+	&updateNodeSpecicParam($configHash, "OamProxy", "IgnoreForCkpt");
+###### OamClient  #########################
+
+	my $ip = getParam($configHash, "OamClient", "OamServerIPAddress");
+	if($ip eq "") {
+		$ip = getIp("Enter Oam Server IP address", false, true);
+	}
+	&writeConfigVal($configHash, "OamClient", "OamServerIPAddress", "$ip", true);
+
+	my $port = getParam($configHash, "OamClient", "OamServerPortNumber");
+
+	if($gProductLc eq tsmlccn) {
+		if($port eq "") {
+			$port = getPort("Enter Oam Server request port", "46008");
+		}
+		&writeConfigVal($configHash, "OamClient", "OamServerPortNumber", "46008", true);
+	}else{
+		if($port eq "") {
+			$port = getPort("Enter Oam Server request port", $gPortNumbers{8});
+		}
+		&writeConfigVal($configHash, "OamClient", "OamServerPortNumber", "$port", true);
+		&writeConfigVal($configHash, "OamClient", "OAMConfigRespConcatParamId", "218,210", true);
+	}
+	if($gUsingVMware == true) {
+		&writeConfigVal($configHash, "OamClient", "OAMConnDownForFailover", "-1", true);
+		&writeConfigVal($configHash, "OamClient", "OAMConnDownFailureCnt", "-1", true);
+		&writeConfigVal($configHash, "OamClient", "OAMConnDownFailureDuration", "-1", true);	
+	} else {
+		&writeConfigVal($configHash, "OamClient", "OAMConnDownForFailover", "600", false);
+		&writeConfigVal($configHash, "OamClient", "OAMConnDownFailureCnt", "2", false);
+		&writeConfigVal($configHash, "OamClient", "OAMConnDownFailureDuration", "10", false);
+	}
+	if($gProductLc eq tsmlccn) {
+		&writeConfigVal($configHash, "KPI", "KPIDuration", "30", false);
+	}else{
+		&delSection($configHash, "ALARMDEF");
+
+		my %almConfig = ();
+
+		&writeConfigVal($configHash, "KPI", "KPIDuration", "60", false);
+		&writeConfigVal(\%almConfig, "ALARMDEF", "200", "ProcessNotOper,Process <3> on VM <89> is down", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "202", "InternalSstConnLost,Process <3> on VM <89> lost connection with process <99> on VM <98>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "213", "MLReportSessionUnreachable,MASS URL <5>:<6> unreachable for session <3>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "214", "TLRReportSessionUnreachableAlarm,TARGETTED URL <5>:<6> unreachable for session <3>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "217", "STPUnreachable,STP having PC <24> over association <38> or LinkSet <84> is down via MLC PC <23>", false); 
+ 		&writeConfigVal(\%almConfig, "ALARMDEF", "218", "MSCUnreachable,MSC having PC <25> over association <38> or LinkSet <84> is down via MLC PC <23>", false); 
+ 		&writeConfigVal(\%almConfig, "ALARMDEF", "219", "BSCUnreachable,BSC having PC <26> over association <38> or LinkSet <84> is down via MLC PC <23>", false); 
+ 		&writeConfigVal(\%almConfig, "ALARMDEF", "220", "RNCUnreachable,RNC having PC <27> over association <38> is down via MLC PC <23>", false); 
+ 		&writeConfigVal(\%almConfig, "ALARMDEF", "221", "HLRUnreachable,HLR having PC <28> over association <38> or LinkSet <84> is down via MLC PC <23>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "222", "LCSClientUnreachable,Client <29> with endpoint <5>:<6> unreachable", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "223", "IPNetworkUnreachable,IP Network Unreachable for <65> <5> <6>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "224", "UnknownServingSwitchReceived,Unknown switch <65> <83>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "227", "AssociationDown,Association <38> down for Node <37> Tye <36>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "229", "SS7LinkDown,SS7 link <40> linkset <84> towards <36> <37> down", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "230", "SS7LinksetDown,SS7 linkset <84> towards <36> <37> down", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "231", "TrunkDown,SS7 Trunk <39> down", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "232", "UnhealthySatellitesExceededThreshold,Unhealthy satellite", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "233", "NavigationFileStale,Navigation file stale", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "234", "AlmanacFileStale,Almanac file stale", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "235", "NavigationFileCorr,Navigation file corrupted", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "236", "AlmanacFileCorr,Almanac file corrupted", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "238", "DataStorageLimitReached,Data sorage limit reached", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "239", "HardwareFaullt,Resource <66> Type <67> Severity <1> crossed threshold on vm <89> mac <50>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "240", "LeIntfTpsBreached,<75> tps breached", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "242", "WSDReadFail,WSD read failure by process <3> on VM <89>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "243", "WLDReadFail,WLD read failure by process <3> on VM <89>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "247", "CDTReadFail,<72> CDT read failure by process <3> on VM <89>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "248", "UnableToProvideLoc,<59>:<60>:<61>:<62> is unable to provide locaton <82> for rat <72>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "249", "UnableToComputeLocation,<59>:<60>:<61>:<62> is unable to provide locaton for rat <72>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "250", "LeOutstandingExceeded,Client <29> <75> outstanding exceeded", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "261", "InterfaceNotOperational,Resource <66> Type <67> down on vm <89> mac <50>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "271", "CgwNoEvents,No event from <83> on <59>:<60>:<61>:<62>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "272", "CgwEventRateHigh,Event rate high on <59>:<60>:<61>:<62>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "278", "ProbBandwidthExceedsThreshold,Probe <87> MAC <50> Severity <1> bandwidth is above <41>", false);
+		&writeConfigVal(\%almConfig, "ALARMDEF", "279", "TargettedLimitsExceeding,Limits exceeding for <75> client <29>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "280", "SGSNUnreachable,MLC <23> is unable to reach SGSN Id <76>. SctpAssocId <38> Configured LinkSet <84>", false);
+		&writeConfigVal(\%almConfig, "ALARMDEF", "281", "MassServiveLoadControlOn", "Load Control on of <72> <78> <79>",false);
+		&writeConfigVal(\%almConfig, "ALARMDEF", "283", "CoreNetworkInterworkingError", "CN error for <92> from <78> <79>",false);
+		&writeConfigVal(\%almConfig, "ALARMDEF", "283", "SiteLicenseExpiring", "Site License <86> for <72> <82>",false);
+		&writeConfigVal(\%almConfig, "ALARMDEF", "294", "FBIFailedToStoreFile", "Failed to store for FBI",false);
+		&writeConfigVal(\%almConfig, "ALARMDEF", "295", "FBIFailedToUploadFile", "Failed to update FBI file for <29> url <91>",false);
+		&writeConfigVal(\%almConfig, "ALARMDEF", "296", "FBIDiskUsageBreach", "FBI disk usage breached for <41>",false);
+		&writeConfigVal(\%almConfig, "ALARMDEF", "297", "UnableToProvideLocPartial,<59>:<60>:<61>:<62> is unable to provide locaton <82> for rat <72>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "299", "ESRDMappingUnavailable,ESRD Mapping unavaialble", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "300", "MassSubsriberProvidersFullyUnavailable,Mass subsriber providers <94> fully unavailable", false);
+		&writeConfigVal(\%almConfig, "ALARMDEF", "301", "MassSubsriberProvidersPartiallyUnavailableAlarm,Mass subsriber providers <94> partially unavailable", false);
+		&writeConfigVal(\%almConfig, "ALARMDEF", "302", "LicenseSitesBreached,Licensed site for rat <72> lm <82> exceeded", false);
+		#&writeConfigVal(\%almConfig, "ALARMDEF", "303", "VMContinuousFailure,VM <89> failed", false);
+		&delParam (\%almConfig, "ALARMDEF", "303");
+		&writeConfigVal(\%almConfig, "ALARMDEF", "304", "ProbeUnreachable,Probe <87> is unreachable from PRGW <95> for port <6>", false);
+		&writeConfigVal(\%almConfig, "ALARMDEF", "305", "UWSUnreachable,UWS is unreachable", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "306", "WSCountLow,Low WS Count", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "307", "ULINotReported,ULI Not Reported for service <75>", false); 		
+		&writeConfigVal(\%almConfig, "ALARMDEF", "308", "LeIntfExpLicense,<97> service license <86> for client <29> expired", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "309", "LdsExpLicense,LM license has expired for <72> <82>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "310", "LdsLicenseExpiring,LM license expiring for <72> <82>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "311", "LESPsdMemory,<72> LES Memory Usage for loading PSD is above threshold", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "313", "MsgServerUnreachable,Msg server <101> unrechable from <95>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "315", "EventNotReported,Events not reported from <72> <87>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "316", "WlsNotReported,WLS not reported from <3> on VM <89> serving Rat <72>", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "317", "ProbePpsCapacityExeeded,<72> Probe Name <87> <67> exceeded", false); 
+		&writeConfigVal(\%almConfig, "ALARMDEF", "1209", "IMSProbeActivity,No <1019> packet is received from IMS Probe", false);
+		&writeConfigVal(\%almConfig, "ALARMDEF", "1206", "NoRequestRcvdFromLcsClient, No Request Received From LcsClient <1004>", false);
+		writeIniFile("$currentRelPath/$gBinDir/$gAlarmIniFile", \%almConfig);
+	}
+	&writeConfigVal($configHash, "KPI", "KPIMaxLossDuration", "5", false);
+	&writeConfigVal($configHash, "KPI", "LRThreshold", "10000", false);
+
+	&writeConfigVal($configHash, "LOGGER", "OnScreenPrinting", "false", false);
+# delete LogFolder so as to use values from current release and doesn't
+# get carried forwared from previous
+	&writeConfigVal($configHash, "LOGGER", "LogFolder", $gLogsDirPath, true);
+# delete LogFolder so as to use values from current release and doesn't
+# get carried forwared from previous
+	&writeConfigVal($configHash, "LOGGER", "SyslogFileName", $gLogFile, true);
+	&writeConfigVal($configHash, "LOGGER", "SyslogSeverityLevel", "err", false);
+	&writeConfigVal($configHash, "LOGGER", "FieldSeperator", "", false);
+	&writeConfigVal($configHash, "LOGGER", "LogServerListenPort", $gPortNumbers{9}, true);
+	&updateNodeSpecicParam($configHash, "LOGGER", "SyslogFileName");
+
+	&writeConfigVal($configHash, "SYSTEM", "SystemName", "$gHostName", false);
+
+# log adm file = true
+# log directory name
+# retention period = 30 days
+# gzip required = true
+	&updLogRetentionPeriod($configHash, "ConfigAudit", "0", $gLogsDirPath, $gLogRetentionPeriod, "0");
+	&setupLogsMgrForKpiAndCr($configHash);
+
+	if($gProductLc eq tsmlccn) {
+		my $logFile = "KPI";
+		my $logFileOpt = sprintf("0,%s/KPI,%d,0", $gLogsDirPath, 365);
+		&writeConfigVal($configHash, "LogsManager", $logFile, $logFileOpt, false);
+		$logFileOpt = sprintf("0,%s/LocationResult,%d,1", $gLogsDirPath, $gLogRetentionPeriod);
+		$logFile = "LocationResult";
+		&writeConfigVal($configHash, "LogsManager", $logFile, $logFileOpt, false);
+	}
+
+###### LoggingHosts #######
+	&delSection($configHash, "LoggingHosts");
+
+	my $release = getReleaseNumber($currentRelPath);
+	my @version = split('\.', $release);
+	if( @version != 4 && @version != 3) {
+		if($currentRelPath ne "") {
+			logToFile ("Version number is not  equal to 3 or 4 in tar file $currentRelPath", LOGFATAL);
+		}
+	}
+
+	&writeConfigVal($configHash, "PRODUCT", "ProductName", $gProduct, true);
+	&writeConfigVal($configHash, "PRODUCT", "ProductId", "1", true);
+	&writeConfigVal($configHash, "PRODUCT", "MajorVersion", $version[0], true);
+	&writeConfigVal($configHash, "PRODUCT", "MinorVersion", $version[1], true);
+	&writeConfigVal($configHash, "PRODUCT", "Revision", $version[2], true);
+	&writeConfigVal($configHash, "PRODUCT", "Build", $version[3], true);
+	use POSIX qw/strftime/;
+	my $dateStr = strftime('%d%m%Y', localtime(time));
+	&writeConfigVal($configHash, "PRODUCT", "DateOfCommissioning", "$dateStr", true);
+	&updateNodeSpecicParam($configHash, "PRODUCT", "DateOfCommissioning");
+}
+
+sub postInstall($$) {
+	my $currentRelPath = shift;
+	my $licconfig = shift;
+
+	if(true == $gUsingVMware) {
+		my $lclcommandname = "/usr/bin/echo $gVMwareVMname > $currentRelPath/$gBinDir/$gVMwareFile";
+		`$lclcommandname`;
+	}
+	if($gUsingOpensaf == true) {
+
+		System("$touchCmd $currentRelPath/$gBinDir/$gUseOpensafFile", 1, "Could not create $currentRelPath/$gBinDir/$gUseOpensafFile");
+
+		if($gIsController) {
+# imm.xml for the conigured components have to be generated
+# for NORED mode, generate imm.xml for all the nodes seperately.
+# for 2N, generate imm.xml for both the nodes togather.
+			my $pkgname = $gPltSstDetail{'PkgName'};
+			my @tarfile = split(".tar.gz", $pkgname);
+			chdir("$currentRelPath/$gPkgDir/$tarfile[0]");
+			my $immbase = "immbase.xml";
+			my $imm = "/etc/opensaf/imm.xml";
+
+			System("$cpCmd $imm $immbase", 1, "Unable to copy $imm to $immbase");
+			open(IMMBASE, "<", $immbase) or die "Could not open $immbase";
+			my @entries=<IMMBASE>;
+			close (IMMBASE);
+			open(IMMBASE, ">", $immbase) or die "Could not open $immbase";
+			my $start = false;
+			my $skip = false;
+			foreach my $line (@entries) {
+				if ($line =~ /<dn>safAmfCluster=myAmfCluster<\/dn>/) {
+					$start = true;
+					printf IMMBASE $line;
+				} elsif ($line =~ /<name>saAmfClusterStartupTimeout<\/name>/) {
+					printf IMMBASE $line;
+					if($start == true) {
+						printf IMMBASE "\t\t\t\t\t<value>5000000000</value>\n";
+						$start = false;
+						$skip = true;
+					}
+				} elsif ($skip == true) {
+						$start = false;
+						$skip = false;
+				} else {
+					printf IMMBASE $line;
+				}
+			}
+			close IMMBASE;
+			my %suHash = ();
+			getSuList($licconfig, \%suHash);
+			foreach my $key (keys %suHash) {
+				my $obj = $suHash{$key};
+				my $apps = $obj->{'apps'};
+				my $exes = $obj->{'exes'};
+				my $nodes = $obj->{'nodes'};
+				if($key eq "") {
+					next;
+				}
+				if($obj->{'mode'} eq "2N") {
+
+					my $confFile = "./2n_config.sh";
+					my $value = $key;
+					`/bin/sed -i 's/APP_NAME=.*/'APP_NAME=$value'/g' $confFile`;
+
+					#`/bin/sed -i 's/SOFTWARE_PATH=.*/'SOFTWARE_PATH=$gActiveBinDir'/g' $confFile`;
+
+					my $node1 = ${$nodes}[0];
+					`/bin/sed -i 's/NODE_1=.*/'NODE_1=$node1'/g' $confFile`;
+
+					my $node2 = "";
+					foreach my $node (@{$nodes}) {
+						if ($node ne $node1) {
+							$node2 = $node;
+							last;
+						}
+					}
+					`/bin/sed -i 's/NODE_2=.*/'NODE_2=$node2'/g' $confFile`;
+
+					$value = $obj->{'version'};
+					`/bin/sed -i 's/SAF_VERSION=.*/'SAF_VERSION=$value'/g' $confFile`;
+
+# scritp already sets it to active rel link
+					$value = sprintf("%s\/%s", $gActiverRelLink, $gBinDir);
+					`/bin/sed -i 's/PRODUCT=.*/'PRODUCT=$gProductLc'/g' $confFile`;
+
+					#comp kill should be result in comp restart before escalating to SU
+					`/bin/sed -i 's/SUFAIL_ON_RESTART=.*/'SUFAIL_ON_RESTART=0'/g' $confFile`;
+
+					$value = sprintf("\"s/COMPNAME_NODE_1=\.\*/COMPNAME_NODE_1=\\(");
+					my $size = scalar(@{$apps}) / 2;
+					for(my $cnt = 0; $cnt < $size; $cnt++) {
+						$value = sprintf("%s '%s'", $value, ${$apps}[$cnt]);
+					}
+					$value = sprintf("%s \\)/g\"", $value);
+					`/bin/sed -i $value $confFile` ;
+
+					$value = sprintf("\"s/COMPNAME_NODE_2=\.\*/COMPNAME_NODE_2=\\(");
+					my $size = scalar(@{$apps});
+					for(my $cnt = $size / 2; $cnt < $size; $cnt++) {
+						$value = sprintf("%s '%s'", $value, ${$apps}[$cnt]);
+					}
+					$value = sprintf("%s \\)/g\"", $value);
+					`/bin/sed -i $value $confFile` ;
+
+					$value = $gStartAppName;
+					`/bin/sed -i 's/INSTANTIATE_SCRIPT=.*/'INSTANTIATE_SCRIPT=$value'/g' $confFile` ;
+
+					$value = sprintf("\"s/INSTANTIATE_ARGS_NODE_1=\.\*/INSTANTIATE_ARGS_NODE_1=\\(");
+					my $size = scalar(@{$exes}) / 2;
+					for(my $cnt = 0; $cnt < $size; $cnt++) {
+						$value = sprintf("%s 'startup %s'", $value, ${$exes}[$cnt]);
+					}
+					$value = sprintf("%s \\)/g\"", $value);
+					`/bin/sed -i $value $confFile` ;
+
+					$value = sprintf("\"s/INSTANTIATE_ARGS_NODE_2=\.\*/INSTANTIATE_ARGS_NODE_2=\\(");
+					my $size = scalar(@{$apps});
+					for(my $cnt = $size / 2; $cnt < $size; $cnt++) {
+						$value = sprintf("%s 'startup %s'", $value, ${$exes}[$cnt]);
+					}
+					$value = sprintf("%s \\)/g\"", $value);
+					`/bin/sed -i $value $confFile` ;
+
+					$value = $gStartAppName;
+					`/bin/sed -i 's/CLEANUP_SCRIPT=.*/'CLEANUP_SCRIPT=$value'/g' $confFile` ;
+
+					$value = sprintf("\"s/CLEANUP_ARGS_NODE_1=\.\*/CLEANUP_ARGS_NODE_1=\\(");
+					my $size = scalar(@{$exes}) / 2;
+					for(my $cnt = 0; $cnt < $size; $cnt++) {
+						$value = sprintf("%s 'cleanup %s'", $value, ${$exes}[$cnt]);
+					}
+					$value = sprintf("%s \\)/g\"", $value);
+					`/bin/sed -i $value $confFile` ;
+
+					$value = sprintf("\"s/CLEANUP_ARGS_NODE_2=\.\*/CLEANUP_ARGS_NODE_2=\\(");
+					my $size = scalar(@{$apps});
+					for(my $cnt = $size / 2; $cnt < $size; $cnt++) {
+						$value = sprintf("%s 'cleanup %s'", $value, ${$exes}[$cnt]);
+					}
+					$value = sprintf("%s \\)/g\"", $value);
+					`/bin/sed -i $value $confFile` ;
+
+#file modified, execute the install
+					System("$confFile", 1, "Unable to execute $confFile");
+					System("$cpCmd $confFile $key", 1, "Unable to copy $confFile to $key");
+#printf("\n$cpCmd $confFile $key");
+#my $pwd1=`pwd`;
+#print("\npwd=$pwd1");
+#merge the files,
+					my $immtemp = "immtmp.xml";
+					#print ("\n/usr/share/opensaf/immxml/immxml-merge -o $immtemp $immbase $key/*.xml");
+					#print("\n$mvCmd $immtemp $immbase");
+					System("/usr/share/opensaf/immxml/immxml-merge -o $immtemp $immbase $key/*.xml", 1, "Unable to execute $confFile");
+					System("$mvCmd $immtemp $immbase", 1, "Unable to mv $immtemp to $immbase");
+
+				} elsif ($obj->{'mode'} eq "NORED") {
+					my @values = split('\.', ${$apps}[0]);
+					if($values[2] == $gNodeCnt) {
+						my $osafFile = "$currentRelPath/$gBinDir/$gUseOpensafFile";
+						`echo @{$exes} >> $osafFile`;
+					}
+					#printf("Unsupported redundancy model $obj->{'mode'} for @{$apps} value $values[2] app ${$apps}[0]\n");
+				} else {
+					printf("Invalid redundancy model $obj->{'mode'} for @{$apps}\n");
+				}
+			}
+
+			System("$cpCmd $immbase $imm", 1, "Unable to copy $immbase to $imm");
+			#`/bin/sed -i 's/[^-]reboot/'\\>reboot_bak'/g' $imm`;
+		}
+		my $name1 =`/bin/uname -r`;
+		chomp $name1;
+		my $arch =`/bin/arch`;
+		chomp $arch;
+		my $tipcConffile = sprintf("tipc-config.%s-%s", $name1, $arch);
+		System("$cpCmd $tipcConffile /sbin/tipc-config", 1, "Unable to copy tipc-config to /sbin");
+		System("> /etc/opensaf/virtualIP.conf", 0, "Unable to cleanup /etc/opensaf/virtualIP.conf");
+
+		#Disable blade reboot in case of errors
+		`/bin/sed -i 's/REBOOT_ON_FAIL_TIMEOUT=.*/'REBOOT_ON_FAIL_TIMEOUT=0'/g' /etc/opensaf/nid.conf` ;
+		`/bin/sed -i 's/=opensaf/'=root'/g' /etc/opensaf/nid.conf`;
+		# block hard reboot in opensaf script
+		`/bin/sed -i 's/export OPENSAF_REBOOT_TIMEOUT=.*/export OPENSAF_REBOOT_TIMEOUT=0/g' /etc/opensaf/nid.conf` ;
+
+		#Replace the original opensafd with new copy that kills immlist and immfind process suring stop
+		System("$cpCmd -f /etc/init.d/opensafd /etc/init.d/opensafd.org", 0, "Unable to backup /etc/init.d/opensafd");
+		System("$cpCmd -f opensafd /etc/init.d/", 0, "Unable to replace build opensafd in /etc/init.d/opensafd");
+		System("$chmodCmd -R 755 /etc/init.d/opensafd", 0, "Unable to replace build opensafd in /etc/init.d/opensafd");
+
+		# create a soft link of the var/opensaf/crash directory to logs/core directory
+		my $fromFile = "/var/crash/opensaf";
+		my $toFile = $gCoreDir;
+		System("$rmCmd $toFile", 0, "Cound not remove $toFile");
+		System("$lnCmd -s $fromFile $toFile", 0, "Cound not link $fromFile to $toFile");
+	} else {
+		-d $gCoreDir or system("$mkdirCmd -p $gCoreDir 2> /dev/null > /dev/null") ;
+	}
+}
+
+sub sgwInstall($$$) {
+	my $sstrec = shift;
+	my $releaseDir = shift;
+	my $licconfig = shift;
+
+	my $pkgname = $gSgwSstDetail{'PkgName'};
+	my @tarfile = split(".tar.gz", $pkgname);
+	my $linkSrcDir = sprintf("../../../%s/%s", $gPkgDir, $tarfile[0]);
+
+
+	my $standard = &getParam($licconfig, "FEATURES", "StackStandard");
+	my $m3uaType = &getParam($licconfig, "FEATURES", "M3uaType");
+	if($m3uaType eq "ADAX") {
+		$gLksctp = false;
+	}
+
+	my $pltinstance = $gPltSstDetail{'Instance'};
+	my $sstinstance = $gSgwSstDetail{'Instance'};
+	my @licapps = &getLicensedAppsForSst($gSgwSstDetail{'LicName'}, $licconfig, $pltinstance);
+	my $sgwapps = $gSgwSstDetail{'Apps'};
+
+	my $sctpInstalled = `rpm -qa | grep lksctp`;
+	if($sctpInstalled eq "") {
+		my $filter = LOGFATAL | LOGCONS;
+		if($gContinueOnPrecheckFail ne "true") {
+			$filter = LOGERROR | LOGCONS
+		}
+		logToFile("LKSCTP package is not installed", $filter);
+	}
+
+# sigtran of ss7 will be controled by the type of applications which needs to be
+# licensed
+# sigtran stack
+	my $sgwapp = @{$sgwapps}[4];
+	my $onedone = false;
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$sgwapp/) {
+# create sigtran dirs for all the instances
+# copy base configuration files to the new dir
+# update ports to the new dir configuration
+
+# check if ADAX sctp is installed.
+			if($onedone == false) {
+				my $sctpInstalled = "";
+				if($gIsLinux == true) {
+					if($gLksctp == false) {
+# check for sctp to be installed
+						System("/etc/init.d/sctp start", 0, "/etc/init.d/sctp stop failed");
+
+						$sctpInstalled = `/sbin/lsmod | grep streams_sctp`;
+						if($sctpInstalled eq "") {
+							my $filter = LOGFATAL | LOGCONS;
+							if($gContinueOnPrecheckFail ne "true") {
+								$filter = LOGERROR | LOGCONS
+							}
+							logToFile("SCTP package required for SIGTRAN is not installed", $filter);
+						}
+
+						$sctpInstalled = `/sbin/lsmod | grep streams`;
+						if($sctpInstalled eq "") {
+							my $filter = LOGFATAL | LOGCONS;
+							if($gContinueOnPrecheckFail ne "true") {
+								$filter = LOGERROR | LOGCONS
+							}
+							logToFile("STREAMS package required for SIGTRAN is not installed", $filter);
+
+						}
+						System("/etc/init.d/sctp stop", 0, "/etc/init.d/sctp stop failed");
+					}
+				} else {
+					$sctpInstalled = `/bin/pkginfo | /bin/grep ADAXsctp | /bin/grep -v grep`;
+					if($sctpInstalled eq "") {
+						my $filter = LOGFATAL | LOGCONS;
+						if($gContinueOnPrecheckFail ne "true") {
+							$filter = LOGERROR | LOGCONS
+						}
+						logToFile("ADAXsctp package required for SIGTRAN is not installed", $filter);
+					}
+				}
+				$onedone = true;
+			}
+
+			my $sgwPkgDir = sprintf("../%s/%s", $gPkgDir, $tarfile[0]);
+			my $appinstance = getAppInstanceId($gSgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			chdir("$releaseDir/$gBinDir");
+			if($gLksctp == false) {
+				# update softlink of M3UA to the softlink of Adax M3UA
+				my $m3uabin;
+				opendir (DIR, "$sgwPkgDir") or die "Cann't open $sgwPkgDir";
+				while (my $file = readdir(DIR)) {
+					if ($file =~ /^SGW_ADAXM3UA_/) {
+						$m3uabin = $file;
+						last;
+					}
+				}
+				closedir(DIR);
+				my $fromFile = "$sgwPkgDir/$m3uabin";
+				my $toFile = sprintf("%s_M3UA", $gProduct);
+				if( -l $toFile) {
+				} else {
+					$toFile = sprintf("%s_M3UA%d", $gProduct,$appinstance);
+				}
+				unlink($toFile);
+				System("$lnCmd -s  $fromFile $toFile", 1, "Cound not link $fromFile to $toFile");
+			}
+
+			my $stackWrapper = sprintf("%s_%s", $gProduct, $licapp);
+# update the product
+			updateProduct($stackWrapper, "PRODUCT", $gProduct);
+
+# stack binaries have to be renamed to reflect the product
+# for sigtran it will be sigtran stack
+			my $sigtrandir = sprintf("SIGTRANDir_%d_%d", $sstinstance, $appinstance);
+			mkpath("$releaseDir/$gBinDir/$sigtrandir/$gBinDir");
+			chdir("$releaseDir/$gBinDir/$sigtrandir/$gBinDir");
+
+#link sccp
+			my $fromFile = "$linkSrcDir/SGW_SCCPApp";
+			my $toFile = sprintf("%s_SIGTRANSCCPApp_%d_%d", $gProduct, $sstinstance, $appinstance);
+			System("$lnCmd -s $fromFile $toFile", 1, "Cound not link $fromFile to $toFile");
+
+#link sme
+			$fromFile = "$linkSrcDir/SGW_SmeApp";
+			$toFile = sprintf("%s_SIGTRANSmeApp_%d_%d", $gProduct,$sstinstance, $appinstance);
+			System("$lnCmd -s  $fromFile $toFile", 1, "Cound not link $fromFile to $toFile");
+
+#copy the standard cfg to the respective directory
+			mkpath("$releaseDir/$gBinDir/$sigtrandir/$gCfgDir");
+			chdir("$releaseDir/$gBinDir/$sigtrandir/$gCfgDir");
+			$fromFile = "../../StackCfg/*";
+			$toFile = "\.";
+			System("$cpCmd -r $fromFile $toFile", 1, "Cound not mv $fromFile to $toFile");
+		}
+	}
+	chdir("$gLDirPath");
+
+	$sgwapp = @{$sgwapps}[1];
+	$onedone = false;
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$sgwapp/) {
+			if($onedone == false) {
+# check if ADAX hdc is installed.
+				my $hdcInstalled = "";
+				if($gIsLinux == true) {
+
+						$hdcInstalled = `/sbin/lsmod | grep streams_hdcx`;
+						if($hdcInstalled eq "") {
+							my $filter = LOGFATAL | LOGCONS;
+							if($gContinueOnPrecheckFail ne "true") {
+								$filter = LOGERROR | LOGCONS
+							}
+							logToFile("STREAMS HDCX package required for SS7 is not installed", $filter);
+						}
+
+						$hdcInstalled = `/sbin/lsmod | grep streams`;
+						if($hdcInstalled eq "") {
+							my $filter = LOGFATAL | LOGCONS;
+							if($gContinueOnPrecheckFail ne "true") {
+								$filter = LOGERROR | LOGCONS
+							}
+							logToFile("STREAMS package required for SS7 is not installed", $filter);
+						}
+				} else {
+					$hdcInstalled = `/bin/pkginfo | /bin/grep ADAXhdc`;
+					if($hdcInstalled eq "") {
+						my $filter = LOGFATAL | LOGCONS;
+						if($gContinueOnPrecheckFail ne "true") {
+							$filter = LOGERROR | LOGCONS
+						}
+						logToFile("ADAXhdc package required for SS7 is not  installed", $filter);
+					}
+				}
+
+				my $qcxInstalled = "";
+				if($gIsLinux == true) {
+					unless(-f $qcxConfCmd) {
+						my $filter = LOGFATAL | LOGCONS;
+						if($gContinueOnPrecheckFail ne "true") {
+							$filter = LOGERROR | LOGCONS
+						}
+						logToFile("ADAXqcx package required for SS7 is not  installed", $filter);
+					}
+
+					unless(-f "/usr/net/Adax/hdc/hdcd") {
+						my $filter = LOGFATAL | LOGCONS;
+						if($gContinueOnPrecheckFail ne "true") {
+							$filter = LOGERROR | LOGCONS
+						}
+						logToFile("ADAXhdc package required for SS7 is not  installed", $filter);
+					}
+				} else {
+					$qcxInstalled = `/bin/pkginfo | /bin/grep ADAXqcx`;
+					if($qcxInstalled eq "") {
+						my $filter = LOGFATAL | LOGCONS;
+						if($gContinueOnPrecheckFail ne "true") {
+							$filter = LOGERROR | LOGCONS
+						}
+						logToFile("ADAXqcx package required for SS7 is not  installed", $filter);
+					}
+				}
+				$onedone = true;
+			}
+		}
+	}
+
+# create sigtran dirs for all the instances
+# install ss7 stack if configured
+	$sgwapp = @{$sgwapps}[5];
+	$onedone = false;
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$sgwapp/) {
+# create sigtran dirs for all the instances
+# copy base configuration files to the new dir
+# update ports to the new dir configuration
+
+			chdir("$releaseDir/$gBinDir");
+			my $stackWrapper = sprintf("%s_%s", $gProduct, $licapp);
+# update the product
+			updateProduct($stackWrapper, "PRODUCT", $gProduct);
+
+# stack binaries have to be renamed to reflect the product
+# for sigtran it will be sigtran stack
+			my $appinstance = getAppInstanceId($gSgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			my $ss7dir = sprintf("SS7Dir_%d_%d", $sstinstance, $appinstance);
+			mkpath("$releaseDir/$gBinDir/$ss7dir/$gBinDir");
+			chdir("$releaseDir/$gBinDir/$ss7dir/$gBinDir");
+
+#link sccp
+			my $fromFile = "$linkSrcDir/SGW_SCCPApp";
+			my $toFile = sprintf("%s_SS7SCCPApp_%d_%d", $gProduct, $sstinstance, $appinstance);
+			System("$lnCmd -s $fromFile $toFile", 1, "Cound not link $fromFile to $toFile");
+
+#link sme
+			$fromFile = "$linkSrcDir/SGW_SmeApp";
+			$toFile = sprintf("%s_SS7SmeApp_%d_%d", $gProduct,$sstinstance, $appinstance);
+			System("$lnCmd -s  $fromFile $toFile", 1, "Cound not link $fromFile to $toFile");
+
+#link mtp3
+			$fromFile = "$linkSrcDir/SGW_MTP3App";
+			$toFile = sprintf("%s_SS7MTP3App_%d_%d", $gProduct,$sstinstance, $appinstance);
+			System("$lnCmd -s  $fromFile $toFile", 1, "Cound not link $fromFile to $toFile");
+
+#copy the standard cfg to the respective directory
+			mkpath("$releaseDir/$gBinDir/$ss7dir/$gCfgDir");
+			chdir("$releaseDir/$gBinDir/$ss7dir/$gCfgDir");
+			$fromFile = "../../StackCfg/*";
+			$toFile = "\.";
+			System("$cpCmd -r $fromFile $toFile", 1, "Cound not mv $fromFile to $toFile");
+
+		}
+	}
+	chdir("$gLDirPath");
+
+}
+
+sub sgwConfig ($$$$) {
+	my $configHash = shift;
+	my $currentRelPath = shift;
+	my $oldRelPath = shift;
+	my $licconfig = shift;
+	my $standard = &getParam($licconfig, "FEATURES", "StackStandard");
+	my $pltinstance = $gPltSstDetail{'Instance'};
+	my $sstinstance = $gSgwSstDetail{'Instance'};
+	my @licapps = &getLicensedAppsForSst($gSgwSstDetail{'LicName'}, $licconfig, $pltinstance);
+	@licapps = sort(@licapps);
+	my $sgwapps = $gSgwSstDetail{'Apps'};
+	my $sgwinstance = 1;
+	my $smecmdinst = 1;
+	my $sgwlicensed = 0;
+	my %sgwLteInstance = ();
+
+# delete the  sections from the APPDATA as they are started through the
+# the wrapper script.
+
+	my $stackPortGen = sprintf("%s/%s/stackPortGen.pl", $currentRelPath, $gBinDir);
+	my $stackStartPort = $gPortNumbers{$gMaxPortAppIndex};
+
+# find out the number of SGWs licensed.
+# configure all the sgw pdes first. Later they are excluded
+	my $sgwapp;
+	if ($gProductLc eq tsmlccn) {
+		$sgwapp = @{$sgwapps}[6];		
+	} else {
+		$sgwapp = @{$sgwapps}[0];
+	}
+	my $pdeid = 0;
+	my @licapps = &getLicensedApps($gSgwSstDetail{'LicName'}, $sgwapp, $licconfig, $pltinstance);
+	my @diaPorts = ();
+	foreach my $licapp (@licapps) {
+#Prompt PDE specific information if SGW is interfacing with any PDE
+		$sgwinstance = &getAppInstanceId($gSgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+		my $sgwuser = "";
+		if ($gProductLc eq tsmlccn) {
+			$sgwuser = &getTSgwUser($licconfig, $sstinstance, $sgwinstance);
+		} else {
+			$sgwuser = &getSgwUser($licconfig, $sstinstance, $sgwinstance);
+		}	
+		if ($sgwuser =~ /SGWL/ || $sgwuser eq "TSGW-ESMLC") {
+			# add sections for SGW for LTE
+			my $sgwsecname = sprintf("SCTP_SELF_%d_%d", $sstinstance, $sgwinstance);
+			&writeConfigVal($configHash, $sgwsecname, "syntax", "ips,port,inboundstream,outboundstream,idletimeout", true);
+			$sgwsecname = sprintf("SCTP_PEER_%d_%d", $sstinstance, $sgwinstance);
+			&writeConfigVal($configHash, $sgwsecname, "syntax", "ips,port,selfid,destid,hbinterval,mode,protid,comment", true);
+			&updateFaultMonConfig($configHash, "SctpSections", $sgwsecname);
+			$sgwLteInstance{$sgwinstance} = 1;
+
+			my $standard = "";
+			my @stackPorts = ();
+			my $sgwssn = "";
+			my $ss7dir = "";
+			my $mtp2cfg = "";
+			my $m3uasecname = "";
+			$sgwsecname = sprintf("SGW_%d_%d", $sstinstance, $sgwinstance);
+			&updateSgwAppConfig($configHash, $licconfig, "SCTP", $standard, \@stackPorts, $sgwsecname, $sgwssn, $ss7dir, $mtp2cfg, $m3uasecname, $sgwuser, $currentRelPath);
+			&updateFaultMonConfig($configHash, "SgwAppSections", $sgwsecname);
+		} elsif ($sgwuser =~ /SGWN/) {
+			# add sections for SGW for NR(5G)
+			$sgwLteInstance{$sgwinstance} = 1;
+
+			my $standard = "";
+			my @stackPorts = ();
+			my $sgwssn = "";
+			my $ss7dir = "";
+			my $mtp2cfg = "";
+			my $m3uasecname = "";
+			my $sgwsecname = sprintf("NR_PEER_CFG_%d_%d", $sstinstance, $sgwinstance);
+			&writeConfigVal($configHash, $sgwsecname, "syntax", "type,amfInstId,apiRoot,routetype,routename,comment", true);
+
+			$sgwsecname = sprintf("SGW_%d_%d", $sstinstance, $sgwinstance);
+			&updateSgwAppConfig($configHash, $licconfig, "HTTP", $standard, \@stackPorts, $sgwsecname, $sgwssn, $ss7dir, $mtp2cfg, $m3uasecname, $sgwuser, $currentRelPath);
+			&updateFaultMonConfig($configHash, "SgwAppSections", $sgwsecname);
+		} elsif ($sgwuser =~ /PRAL/ ) {
+			# add sections for SGW for LTE
+			$sgwLteInstance{$sgwinstance} = 1;
+
+			my $standard = "";
+			my @stackPorts = ();
+			my $sgwssn = "";
+			my $ss7dir = "";
+			my $mtp2cfg = "";
+			my $m3uasecname = "";
+			my $sgwsecname = sprintf("SGW_%d_%d", $sstinstance, $sgwinstance);
+			&updateSgwAppConfig($configHash, $licconfig, "TCP", $standard, \@stackPorts, $sgwsecname, $sgwssn, $ss7dir, $mtp2cfg, $m3uasecname, $sgwuser, $currentRelPath);
+			$sgwlicensed++;
+			next;
+		} elsif ($sgwuser =~ /PRA/ ) {
+			# skip instance which doesn't neeed WLS
+			$sgwLteInstance{$sgwinstance} = 1;
+		} elsif ($sgwuser =~ /OLGW-LTE/ ) {
+# add sections for SGW for LTE
+			$sgwLteInstance{$sgwinstance} = 1;
+			my $standard = "";
+			my @stackPorts = ();
+			my $sgwssn = "";
+			my $ss7dir = "";
+			my $mtp2cfg = "";
+			my $m3uasecname = "";
+
+			my $dfnCliPort = &getNextPort();
+			my $oamCliPort = &getNextPort();
+			push(@stackPorts, $dfnCliPort);
+			push(@stackPorts, $oamCliPort);
+			push(@diaPorts, $dfnCliPort);
+			push(@diaPorts, $oamCliPort);
+
+			my $sgwsecname = sprintf("SGW_%d_%d", $sstinstance, $sgwinstance);
+			&updateSgwAppConfig($configHash, $licconfig, "SCTP-DIA", $standard, \@stackPorts, $sgwsecname, $sgwssn, $ss7dir, $mtp2cfg, $m3uasecname, $sgwuser, $currentRelPath);
+			&updateFaultMonConfig($configHash, "SgwAppSections", $sgwsecname);
+
+			my $sgwpeersecname = sprintf("SGWAppPeer_%d_%d", $sstinstance, $sgwinstance);
+			&writeConfigVal($configHash, $sgwpeersecname, "syntax", "hostId,realm, PeerType,RouteType,RouteName,PeerPort,PeerIps,Usercomment", true);
+			my $dfnfile = sprintf("dfn1.cfg");
+		} elsif (($sgwuser =~ /SGWO-DIA-SH/ ) || ($sgwuser =~ /SGWO-DIA/ )) {
+# add sections for SGW for LTE for SH interface
+			my $standard = "";
+			my @stackPorts = ();
+			my $sgwssn = "";
+			my $ss7dir = "";
+			my $mtp2cfg = "";
+			my $m3uasecname = "";
+			$sgwLteInstance{$sgwinstance} = 1;
+
+			my $sgwsecname = sprintf("SGW_%d_%d", $sstinstance, $sgwinstance);
+
+			my $sgwpeersecname = sprintf("SGWAppPeer_%d_%d", $sstinstance, $sgwinstance);
+			&writeConfigVal($configHash, $sgwpeersecname, "syntax", "hostId,realm, PeerType,RouteType,RouteName,PeerPort,PeerIps,Usercomment", true);
+
+			$sgwpeersecname = sprintf("SCTP_SELF_%d_%d", $sstinstance, $sgwinstance);
+			&writeConfigVal($configHash, $sgwpeersecname, "syntax", "ips,port,inboundstream,outboundstream,idletimeout", true);
+			$sgwpeersecname = sprintf("SCTP_PEER_%d_%d", $sstinstance, $sgwinstance);
+			&writeConfigVal($configHash, $sgwpeersecname, "syntax", "ips,port,selfid,destid,hbinterval,mode,protid,comment", true);
+			# following are possible.
+			# Aricent SLg-Slh + PW Sh (SGW users OLGW-LTE and SGWO-DIA-SH)
+			# PW SLg-Slh + PW Sh (SGW users SGW0-DIA and SGWO-DIA-SH)
+			# PW SLg-SLh-Sh (SGW users SGW0-DIA only, not supported as of now)
+			# For the third depoyment, move/merge configuraton of SGWO-DIA-SH into SGWO-DIA during upgrade
+			# set below variable to 10 when third configuration is supported. Also this needs to be performed
+			# after iterating through all SGWusers and only if SGWO-DIA-SH is not found
+			my $shSgwInstMax = 1;
+			for( my $shSgwInst = 1; $shSgwInst < $shSgwInstMax; $shSgwInst++) {
+				my $shSgwSecName = sprintf("SGW_%d_%d", $sstinstance, $shSgwInst);
+				my $shSgwUser = getParam($configHash, $shSgwSecName, "SGWUser");
+				if($shSgwUser eq "SGWO-DIA-SH") {
+					&delSection($configHash, $shSgwSecName);
+					$sgwpeersecname = sprintf("SGWAppPeer_%d_%d", $sstinstance, $shSgwInst);
+					my $idnames = &getSectionPararms($configHash, $sgwpeersecname);
+					foreach my $seckey ( @{$idnames} ) {
+						if($seckey->{'name'} eq "syntax") {
+							next;
+						}
+						my @idvalues = split(",", $seckey->{'value'});
+						if($idvalues[2] eq "HSS") {
+							$idvalues[2] = "HSS-SH";
+						} elsif($idvalues[2] eq "DIN") {
+							$idvalues[2] = "DIN-SH";
+						}
+						my $newval = join(",", @idvalues);
+						my $newSecName = sprintf("SGWAppPeer_%d_%d", $sstinstance, $sgwinstance);
+						&writeConfigVal($configHash, $newSecName, $seckey->{'name'}, $newval, false);
+					}
+					&delSection($configHash, $sgwpeersecname);
+
+					$sgwpeersecname = sprintf("SCTP_SELF_%d_%d", $sstinstance, $shSgwInst);
+					my $idnames = &getSectionPararms($configHash, $sgwpeersecname);
+					foreach my $seckey ( @{$idnames} ) {
+						my $newSecName = sprintf("SCTP_SELF_%d_%d", $sstinstance, $sgwinstance);
+						&writeConfigVal($configHash, $newSecName, $seckey->{'name'}, $seckey->{'value'}, false);
+					}
+					&delSection($configHash, $sgwpeersecname);
+
+					$sgwpeersecname = sprintf("SCTP_PEER_%d_%d", $sstinstance, $shSgwInst);
+					my $idnames = &getSectionPararms($configHash, $sgwpeersecname);
+					foreach my $seckey ( @{$idnames} ) {
+						my $newSecName = sprintf("SCTP_PEER_%d_%d", $sstinstance, $sgwinstance);
+						&writeConfigVal($configHash, $newSecName, $seckey->{'name'}, $seckey->{'value'}, false);
+					}
+					&delSection($configHash, $sgwpeersecname);
+
+					$sgwpeersecname = sprintf("SGW_%d_%d", $sstinstance, $shSgwInst);
+					my $idnames = &getSectionPararms($configHash, $sgwpeersecname);
+					foreach my $seckey ( @{$idnames} ) {
+						my $newSecName = sprintf("SGW_%d_%d", $sstinstance, $sgwinstance);
+						&writeConfigVal($configHash, $newSecName, $seckey->{'name'}, $seckey->{'value'}, false);
+					}
+					&delSection($configHash, $sgwpeersecname);
+				}
+			}
+			$sgwpeersecname = sprintf("SGWAppPeer_%d_%d", $sstinstance, $sgwinstance);
+			my $idnames = &getSectionPararms($configHash, $sgwpeersecname);
+			foreach my $seckey ( @{$idnames} ) {
+				if($seckey->{'name'} eq "syntax") {
+					next;
+				}
+				my @idvalues = split(",", $seckey->{'value'});
+				if ($sgwuser =~ /SGWO-DIA-SH/ ) {
+					if($idvalues[2] eq "HSS") {
+						$idvalues[2] = "HSS-SH";
+					} elsif($idvalues[2] eq "DIN") {
+						$idvalues[2] = "DIN-SH";
+					}
+				} else {
+					my $peerport = $idvalues[5];
+					my $peerip = $idvalues[6];
+					# if ip and port is empty its in new format
+					if($peerip eq "") {
+						next;
+					}
+					$idvalues[5] = "";
+					$idvalues[6] = "";
+					# split SGWAppPeer to SCTP_PEER
+					my $selfip = &getParam($configHash, $sgwsecname, "SCTP_IP");
+					if($selfip eq "") {
+						next;
+					}
+					$selfip =~ s/,/&/ig;
+					my $selfport = &getParam($configHash, $sgwsecname, "SCTP_PORT");
+					my $mode = &getParam($configHash, $sgwsecname, "SCTP_MODE");
+					if($mode = "Server") {
+						$mode = "CLIENT";
+					} else {
+						$mode = "SERVER";
+					}
+					my $selfid = 0;
+					$sgwpeersecname = sprintf("SCTP_SELF_%d_%d", $sstinstance, $sgwinstance);
+					my $selfarr = &getSectionPararms($configHash, $sgwpeersecname);
+					foreach my $self ( @{$selfarr} ) {
+						my @selfvalues = split("_", $seckey->{'self'});
+						my $selfnum = int($selfvalues[1]);
+						if($selfnum > $selfid) {
+							$selfid = $selfnum;
+						}
+					}
+					$selfid += 1;
+					my $selfkey = sprintf("SelfId_%d", $selfid);
+					&writeConfigVal($configHash, $sgwpeersecname, "$selfkey", "$selfip,$selfport,,,", false);
+					$sgwpeersecname = sprintf("SCTP_PEER_%d_%d", $sstinstance, $sgwinstance);
+					&writeConfigVal($configHash, $sgwpeersecname, "$idvalues[4]", "$peerip,$peerport,$selfkey,$seckey->{'name'},,$mode,46,", false);
+					$sgwpeersecname = sprintf("SGWAppPeer_%d_%d", $sstinstance, $sgwinstance);
+					my $newval = join(",", @idvalues);
+					&writeConfigVal($configHash, $sgwpeersecname, $seckey->{'name'}, $newval, true);
+				}
+			}
+			&updateSgwAppConfig($configHash, $licconfig, "SCTP-DIA-PW", $standard, \@stackPorts, $sgwsecname, $sgwssn, $ss7dir, $mtp2cfg, $m3uasecname, $sgwuser, $currentRelPath);
+			&updateFaultMonConfig($configHash, "SgwAppSections", $sgwsecname);
+		} elsif ($sgwuser =~ /SGWO-5G/) {
+			$sgwLteInstance{$sgwinstance} = 1;
+			my $secname = sprintf("SGW_%d_%d", $sstinstance, $sgwinstance);
+			&writeConfigVal($configHash, $secname, "SGWUser", $sgwuser, false);
+			&writeConfigVal($configHash, $secname, "SP_TRANSPORT", "HTTP", false);
+			&writeConfigVal($configHash, $secname, "AMF_INTF_TlsCertFile", "cacert.pem", false);
+			&writeConfigVal($configHash, $secname, "AMF_INTF_TlsKeyFile", "cakey.key", false);
+			&writeConfigVal($configHash, $secname, "AMF_INTF_ReconnectWaitDuration", "240", false);
+			&writeConfigVal($configHash, $secname, "UDM_INTF_TlsCertFile", "cacert.pem", false);
+			&writeConfigVal($configHash, $secname, "UDM_INTF_TlsKeyFile", "cakey.key", false);
+			&writeConfigVal($configHash, $secname, "UDM_INTF_ReconnectWaitDuration", "240", false);
+			&writeConfigVal($configHash, $secname, "UDM_CBK_Scheme", "http", false);
+			&writeConfigVal($configHash, $secname, "UDM_CBK_IP", "127.0.0.1", false);
+			&writeConfigVal($configHash, $secname, "UDM_CBK_ListenPort", "23456", false);
+			&writeConfigVal($configHash, $secname, "UDM_CBK_TlsCertFile", "cacert.pem", false);
+			&writeConfigVal($configHash, $secname, "UDM_CBK_TlsKeyFile", "cakey.key", false);
+			&writeConfigVal($configHash, $secname, "UDM_CBK_ReconnectWaitDuration", "240", false);
+			&writeConfigVal($configHash, $secname, "NAMF_LOC_EVENT_NOTIFY_Scheme", "http", false);
+			&writeConfigVal($configHash, $secname, "NAMF_LOC_EVENT_NOTIFY_IP", "127.0.0.1", false);
+			&writeConfigVal($configHash, $secname, "NAMF_LOC_EVENT_NOTIFY_ListenPort", "34567", false);
+			&writeConfigVal($configHash, $secname, "NAMF_LOC_EVENT_NOTIFY_TlsCertFile", "cacert.pem", false);
+			&writeConfigVal($configHash, $secname, "NAMF_LOC_EVENT_NOTIFY_TlsKeyFile", "cakey.key", false);
+			&writeConfigVal($configHash, $secname, "TCPKeepAliveEnabled", "false", false);
+			&writeConfigVal($configHash, $secname, "TCPIdleDuration", "3600", false);
+			&writeConfigVal($configHash, $secname, "MLC_SELF_NF_INSTANCE_ID", "3fa85f64-5717-4562-b3fc-2c963f66afa1", true);
+			&delParam ($configHash, $secname, "UDM_INTF_Scheme");
+			&delParam ($configHash, $secname, "UDM_INTF_ListenPort");
+			&delParam ($configHash, $secname, "UDM_INTF_ServerIP");
+			&delParam($configHash, $secname, "RESEND_NF_REGISTER_INTERVAL_IN_SEC");
+			&delParam($configHash, $secname, "NF_REGISTER_RSP_WAIT_INTERVAL_IN_SEC");
+			&delParam($configHash, $secname, "NF_UPDATE_RSP_WAIT_INTERVAL_IN_SEC");
+			&delParam($configHash, "SGWO_5G_PEER_AMF_CFG", "syntax");
+			&delSection($configHash, "SGWO_5G_PEER_AMF_CFG");
+			my $sgwsecname = sprintf("NR_PEER_CFG_%d_%d", $sstinstance, $sgwinstance);
+			&writeConfigVal($configHash, $sgwsecname, "syntax", "type,amfInstId,apiRoot,routetype,routename,comment", true);
+        	} elsif ($sgwuser =~ /SGWO-ODB/ ) {
+			$sgwLteInstance{$sgwinstance} = 1;
+			my $secname = sprintf("SGW_%d_%d", $sstinstance, $sgwinstance);
+			&writeConfigVal($configHash, $secname, "SGWUser", $sgwuser, false);
+			&writeConfigVal($configHash, $secname, "OperatorId", "TELEFONICA", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "ProvGwIp", "127.0.0.1", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "ProvGwPort", "12345", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "ProvGwUserId", "user", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "ProvGwPassword", "password", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "ProvGwEirIp_1", "127.0.0.1", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "ProvGwEirPort_1", "7777", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "ProvGwEirIp_2", "", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "ProvGwEirPort_2", "", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "ProvGwEirUserId", "user", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "ProvGwEirPassword", "password", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "TELEFONICA_EIR_INTF", "HW-TYPE1", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "ProvGwEirIp", "127.0.0.1", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "ProvGwEirPort", "7778", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "RestServerUserId", "polaris", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "RestServerPassword", "polaris", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "SftpServerUserId", "polaris", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "SftpServerPassword", "polaris", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "SftpServerIp", "127.0.0.1", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "SftpServerPort", "22", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "SftpFileServerPath", "/opt/tieto/eir/imei_files/eirtest1.txt", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "MaxNoOfWaitingIMEI", "2", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "TokenGuardTimeInSecond", "1", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "BlockUnblockGuardTimeInSecond", "1", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "TokenAPISuccessStatusCodeSet", "200", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "BlockUnblockAPISuccessStatusCodeSet", "204", false);
+			&writeConfigVal($configHash, "CIP_TELEFONICA", "BlockUnblockAPITempFailureStatusCodeSet", "500", false);
+
+			&writeConfigVal($configHash, "CIP_ICE", "ProvGwIp_1", "127.0.0.1", false);
+			&writeConfigVal($configHash, "CIP_ICE", "ProvGwPort_1", "12345", false);
+			&writeConfigVal($configHash, "CIP_ICE", "ProvGwIp_2", "127.0.0.1", false);
+			&writeConfigVal($configHash, "CIP_ICE", "ProvGwPort_2", "12345", false);
+			&writeConfigVal($configHash, "CIP_ICE", "ProvGwUserId", "user", false);
+			&writeConfigVal($configHash, "CIP_ICE", "ProvGwPassword", "password", false);
+			&writeConfigVal($configHash, "CIP_ICE", "HttpListenPort", "8000", false);
+			&writeConfigVal($configHash, "CIP_ICE", "TARGET_ICE_RESP", "/service/RespuestaBloqueoDesbloqueoCarcelarioSoap", false);
+			&writeConfigVal($configHash, "CIP_ICE", "TARGET_ICE_NTFY", "/service/NotificarBloqueoDesbloqueoCarcelarioSoap", false);
+			&writeConfigVal($configHash, "CIP_ICE", "TARGET_ICE_REQ", "/service/SolicitarBloqueoDesbloqueo", false);
+			&writeConfigVal($configHash, "CIP_ICE", "ICE_REQ_ContentType", "soap+xml", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "ProvGwIp_1", "127.0.0.1", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "ProvGwPort_1", "12345", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "ProvGwIp_2", "127.0.0.1", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "ProvGwPort_2", "12345", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "ProvGwUserId", "user", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "ProvGwPassword", "password", false);
+			&replaceParamInIni($configHash, "CIP_CLARO", "CIP_CLARO", "ProvGwEirIp", "ProvGwEirIp_1");
+			&replaceParamInIni($configHash, "CIP_CLARO", "CIP_CLARO", "ProvGwEirPort", "ProvGwEirPort_1");
+			&writeConfigVal($configHash, "CIP_CLARO", "ProvGwEirIp_1", "127.0.0.1", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "ProvGwEirPort_1", "12346", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "ProvGwEirIp_2", "", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "ProvGwEirPort_2", "", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "IMEIDigitsInUnblock", "14", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "IMEIDigitsInHuaweiEirReq", "14", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "EIR_REQ_PLMN_VALUE", "712", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "CLARO_EIR_INTF", "ERICSSON", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "IMEIDigitsInHuaweiEirReq", "14", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "HUAWEI_EIR_HLRSN", "5", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "ProvGwHuaweiEirUserId", "user", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "ProvGwHuaweiEirPassword", "password", false);
+
+			&writeConfigVal($configHash, "CIP_CLARO", "ClaroLoginGuardTime", "14", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "ClaroHlrGuardTime", "20", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "ClaroHssGuardTime", "20", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "REQ_TO_HLR_ONLY_RANGE", "ABCDE0000000000-ABCDE0000000100,ABCDE0000000101-ABCDE0000000200", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "REQ_TO_HSS_ONLY_RANGE", "ABCDE0000000201-ABCDE0000000300,ABCDE0000000301-ABCDE 0000000400", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "REQ_TO_HLR_HSS_RANGE", "ABCDE0000000401-ABCDE0000000500,ABCDE0000000501-ABCDE0000000600", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "CLARO_IMSI_INTF", "ERICSSON_TYPE1", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "UserName", "USER", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "Password", "PASS", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "MOType", "motype", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "Priority", "priority", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "BlockUsecase", "POLARIS_ADD", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "UnblockUsecase", "POLARIS_DEL", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "SoapActionSuccess", "CAI3G#SetResponse", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "SoapActionFailure", "Fault", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "MobileNetworkNode_1", "http://172.24.80.142:8080/adaptoramxclaro/adaptoramxclaro", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "MobileNetworkNode_2", "http://172.20.11.105:8080/CAI3G1.2/services/CAI3G1.2/async", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "HttpServerIp", "0.0.0.0", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "HttpServerPort", "7015", false);
+			&writeConfigVal($configHash, "CIP_CLARO", "MessageIDStart", "POLARIS", false);
+
+			delParam ($configHash, "CIP_CLARO", "ProvGwEirIp");
+			delParam ($configHash, "CIP_CLARO", "ProvGwEirPort");
+		}
+		$sgwlicensed++;
+	}
+# configure all the tsgw pdes
+	&configureTSGWInfo($configHash, $licconfig);
+	my $sgwapp = @{$sgwapps}[6];
+# loop through 100 platform instance and do for all the SGW instances
+	my @licapps = &getLicensedApps($gSgwSstDetail{'LicName'}, $sgwapp, $licconfig, $pltinstance);
+	foreach my $licapp (@licapps) {
+		$sgwlicensed++;
+	}
+
+	#reset sgw instance.
+	$sgwinstance = 1;
+
+# log adm file = true
+# log directory name
+# retention period = 30 days
+# gzip requited = true
+
+	$sgwapp = @{$sgwapps}[1];
+	my $mtp2present = false;
+	my $mtp3present = false;
+	@licapps = &getLicensedApps($gSgwSstDetail{'LicName'}, $sgwapp, $licconfig, $pltinstance);
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$sgwapp/) {
+			$mtp2present = true;
+			last;
+		}
+	}
+
+	# SS7
+	my $mtp2ip = "127.0.0.1";
+	$sgwapp = @{$sgwapps}[5];
+	my $onedone = false;
+	@licapps = &getLicensedApps($gSgwSstDetail{'LicName'}, $sgwapp, $licconfig, $pltinstance);
+	foreach my $licapp (@licapps) {
+		$mtp3present = true;
+		my @stackPorts = ();
+		my $appinstance = &getAppInstanceId($gSgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+		my $ss7dir = sprintf("SS7Dir_%d_%d", $sstinstance, $appinstance);
+
+		my %oldRelData = ();
+		&getOldRelDir($oldRelPath, \%oldRelData);
+		my $oldPath =  $oldRelData{'rel'};
+
+		if ($mtp2present == false) {
+# special case, check for legacy paramter also along with current parameter
+			if($onedone == false) {
+				my $mtp2cfgfile = "$oldPath/$ss7dir/$gCfgDir/Single/ss_ph_conf";
+				my $mtp2ipold = "";
+				if( -f $mtp2cfgfile) {
+					$mtp2ipold = `cat $mtp2cfgfile  | /bin/grep MTP2_ENTITY_INFO_1 | awk \'{print \$2}\'`;
+				}
+
+				if($mtp2ipold eq "") {
+					$mtp2ip = getIp("Enter MTP2 IP address", false, true);
+				} else {
+					$mtp2ip = $mtp2ipold;
+				}
+			}
+		}
+
+		my $port;
+		my $standardnum;
+		if( $standard =~ "ITU" ) {
+			$standardnum = 1;
+		} else {
+			$standardnum = 3;
+		}
+		if($onedone == false) {
+			$port = $stackStartPort;
+		} else {
+			$port = $gPortNumbers{$gMaxPortAppIndex};
+		}
+		my $numDMtp3 = 1;
+		my $selfDMtp3ip = "127.0.0.1";
+		my $peerDMtp3ip = "127.0.0.1";
+		my $mtp3cfgFile = "$currentRelPath/$gBinDir/$ss7dir/$gCfgDir/Single/ss7_ph_conf";
+		if ($gUsingOpensaf) {
+			$numDMtp3 = 2;
+			$selfDMtp3ip = &getParam($configHash, "PLATFORM_SVCS", "NodeIPAddress");
+			$peerDMtp3ip = `/bin/grep DMTP3_INSTANCE_ $mtp3cfgFile | /usr/bin/awk '{print \$2}' > /dev/null 2> /dev/null`;
+			chomp($peerDMtp3ip);
+			if($peerDMtp3ip eq "") {
+				$peerDMtp3ip = &getIp("SGW [$sstinstance,$appinstance] Enter peer MTP3 IP address", false, true);
+			}
+		}
+# format: cmd <stack base port> <network type> <stack type> <mtp2 ip address> <mtp2 id> <num distributed mtp3s> <self mtp3 ip> <peer mtp3 ip>
+# format: cmd <stack base port> <2 - national> <1 ITU > <mtp2 ip> <1|2> <0|2> <127.0.0.1|node ip> <127.0.0.1|peer ip>
+# format: cmd <stack base port> <2 - national> <3 ANSI> <mtp2 ip> <1|2> <0|2> <127.0.0.1|node ip> <127.0.0.1|peer ip>
+		@stackPorts = `$stackPortGen $port 2 $standardnum $mtp2ip $sstinstance $numDMtp3 $selfDMtp3ip $peerDMtp3ip`;
+
+		chomp(@stackPorts);
+		$gPortNumbers{$gMaxPortAppIndex} = $stackPorts[6] + 1;
+
+# copy the configuration files to the respective directories
+		my $fromFile = "sme.cfg";
+		my $toFile = "$currentRelPath/$gBinDir/$ss7dir/$gCfgDir/smeport/configuration_files/ss7_ph_conf";
+		System("$mvCmd  $fromFile $toFile", 1, "Cound not mv $fromFile to $toFile");
+
+		$fromFile = "mtp3.cfg";
+		$toFile = $mtp3cfgFile;
+		System("$mvCmd  $fromFile $toFile", 1, "Cound not mv $fromFile to $toFile");
+
+		$fromFile = "sccp.cfg";
+		$toFile = "$currentRelPath/$gBinDir/$ss7dir/$gCfgDir/normal/ss7_ph_conf";
+		System("$mvCmd  $fromFile $toFile", 1, "Cound not mv $fromFile to $toFile");
+		if ($gUsingOpensaf && $gProductLc eq tsmlccn && $sstinstance > 1 )
+		{
+#update SCCP_CONN_ID_OFFSET if this is not first sst instance
+			my $key = "SCCP_CONN_ID_OFFSET";
+			my $newval = 65536;
+			`/bin/sed -i 's/$key.*0/'$key\\\t$newval'/g' $toFile` ;
+		}
+		my $sgwsecname = sprintf("SGWAppPeer_%d_%d", $sstinstance, $sgwinstance);
+		&writeConfigVal($configHash, $sgwsecname, "", "", false);
+		$sgwsecname = sprintf("CCToMCCMapping_%d_%d", $sstinstance, $sgwinstance);
+		&writeConfigVal($configHash, $sgwsecname, "", "", false);
+		$sgwsecname = sprintf("NCToMNCMapping_%d_%d", $sstinstance, $sgwinstance);
+		&writeConfigVal($configHash, $sgwsecname, "", "", false);
+		my @sgwdata;
+		while($sgwinstance <= $sgwlicensed) {
+			$sgwsecname = sprintf("SGW_%d_%d", $sstinstance, $sgwinstance);
+			@sgwdata = &getSgwUserParam($licconfig, $sstinstance, $sgwinstance);
+			my $sgwssn = $sgwdata[1];
+			if($sgwssn ne "") {
+				my $mtp2cfg = sprintf("MTP2CONV_%d_%d",$sstinstance, $appinstance);
+				&updateSgwAppConfig($configHash, $licconfig, "SS7", $standard, \@stackPorts, $sgwsecname, $sgwssn, $ss7dir, $mtp2cfg, "", $sgwdata[0], $currentRelPath);
+				&updateFaultMonConfig($configHash, "SgwAppSections", $sgwsecname);
+				$sgwinstance++;
+				last;
+			} else {
+				$sgwinstance++;
+			}
+		}
+
+		$sgwsecname = sprintf("SS7Stack_%d_%d", $sstinstance, $appinstance);
+		&delSection($configHash, $sgwsecname);
+
+		my $value = &getParam($configHash,"APPDATA", $sgwapp);
+		if($value eq "") {
+			$value = &getParam($configHash, "APPDATA", $licapp);
+			&writeConfigVal($configHash, "APPDATA", "$licapp", sprintf("%s %d %d", $value, $sstinstance, $appinstance), true);
+		} else {
+			&writeConfigVal($configHash, "APPDATA", "$sgwapp", sprintf("%s %d %d", $value, $sstinstance, $appinstance), true);
+		}
+
+		my $value = "";
+		if($smecmdinst == 1) {
+			$value = "SmeCmdSender";
+			updateIgnoreForPm($configHash, $value);
+			delParam ($configHash, "APPDATA", "SmeCmdSender");
+		}
+		$value = sprintf("SmeCmdSender%d", $smecmdinst);
+		updateIgnoreForPm($configHash, $value);
+
+		$value = sprintf("SmeCmdSender%d", $smecmdinst);
+		delParam ($configHash, "APPDATA", $value);
+		$smecmdinst++;
+
+		if($onedone == false) {
+			if($gIsLinux == true) {
+				my $logFile = sprintf("\*.log", $sstinstance, $appinstance);
+				&updLogRetentionPeriod($configHash, $logFile, "1", "$gLogsDirPath/SS7StackLogs", $gLogRetentionPeriod, "1");
+			}
+		}
+
+		$onedone = true;
+	}
+
+	# MTP2
+	my $mtp3ip = "127.0.0.1";
+	$sgwapp = @{$sgwapps}[1];
+	$onedone = false;
+	@licapps = &getLicensedApps($gSgwSstDetail{'LicName'}, $sgwapp, $licconfig, $pltinstance);
+	foreach my $licapp (@licapps) {
+		my $port;
+		if($onedone == false) {
+			$port = $stackStartPort;
+		} else {
+			$port = $gPortNumbers{$gMaxPortAppIndex};
+		}
+		my $standardnum = 3;
+		my $mtp2ip = "127.0.0.1";
+		my $numDMtp3 = 0;
+		my $selfDMtp3ip = "127.0.0.1";
+		my $peerDMtp3ip = "127.0.0.1";
+		my @stackPorts = `$stackPortGen $port 2 $standardnum $mtp2ip $sstinstance $numDMtp3 $selfDMtp3ip $peerDMtp3ip`;
+		chomp(@stackPorts);
+		$gPortNumbers{$gMaxPortAppIndex} = $stackPorts[6] + 1;
+		my $fromFile = "sme.cfg";
+		System("$rmCmd  $fromFile", 1, "Cound not rm $fromFile");
+		$fromFile = "mtp3.cfg";
+		System("$rmCmd  $fromFile", 1, "Cound not rm $fromFile");
+		$fromFile = "sccp.cfg";
+		System("$rmCmd  $fromFile", 1, "Cound not rm $fromFile");
+		my $appinstance = &getAppInstanceId($gSgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+
+
+		my %oldRelData = ();
+		getOldRelDir($oldRelPath, \%oldRelData);
+		my $oldPath =  $oldRelData{'rel'};
+
+		my $selfip = getParam($configHash, "PLATFORM_SVCS", "NodeIPAddress");
+		my $mtp2cfg = sprintf("MTP2CONV_%d_%d",$sstinstance, $appinstance);
+		if($mtp3present == false) {
+			$mtp3ip = &getParam($configHash, $mtp2cfg,"MTP3IPAddress");
+			if($mtp3ip eq "") {
+				$mtp3ip = getIp("Enter MTP3 IP address", false, true);
+			}
+		} else {
+			$selfip = "127.0.0.1";
+		}
+
+		&updateMtp2Config($configHash, \@stackPorts, $mtp2cfg, $mtp3ip, $selfip);
+		&updateFaultMonConfig($configHash, "Mtp3ConvSections", $mtp2cfg);
+		&updateNodeSpecicParam($configHash, $mtp2cfg, "*");
+
+		if($onedone == false) {
+			$mtp2cfg = sprintf("MTP2Links");
+			&writeConfigVal($configHash, $mtp2cfg, "syntax", "TrunkName,SLC,Slot:TrunkName,SLC,Slot:TrunkName,SLC,Slot", true);
+			$mtp2cfg = sprintf("TRUNK_CONFIG");
+			my $syntax = &getParam($configHash, $mtp2cfg, "syntax");
+			&writeConfigVal($configHash, $mtp2cfg, "syntax", "HwType,CLOCK Source,TrunkType,ChassisNo,ChassisSlotNo,Adax Card No, Trunk No,Framing,LineCoding,DataRate,ServerName", true);
+			if($syntax =~ /ServerId/) {
+				&copyTrunkCfgFrom7_0($configHash);
+			}
+			&updateNodeSpecicParam($configHash, $mtp2cfg, "*");
+
+		}
+		$onedone = true;
+	}
+
+# sigtran stack
+	$sgwapp = @{$sgwapps}[4];
+	$onedone = false;
+	@licapps = &getLicensedApps($gSgwSstDetail{'LicName'}, $sgwapp, $licconfig, $pltinstance);
+	foreach my $licapp (@licapps) {
+		my @stackPorts = ();
+		my $appinstance = &getAppInstanceId($gSgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+		my $sigtrandir = sprintf("SIGTRANDir_%d_%d", $sstinstance, $appinstance);
+
+#copy the nw.cfg from pervious release to current release during upgradee
+		my %oldRelData = ();
+		getOldRelDir($oldRelPath, \%oldRelData);
+		my $oldPath =  $oldRelData{'rel'};
+
+		my $nwsecname = sprintf("M3uaNwCfg_%d_%d",$sstinstance, $appinstance);
+        my $nwfmt = "peerRC,selfRC,sctpPort,numIps,ip1,...,numPcs, pc1,...,peerTraficMode,selfTrafficMode,exchangeMode,sendAspUp";
+		&writeConfigVal($configHash, "$nwsecname", "syntax", $nwfmt, true);
+		&updateFaultMonConfig($configHash, "M3uaLinkSections", $nwsecname);
+
+		my @sgwdata = ();
+		my $sgwssn;
+		while($sgwinstance <= $sgwlicensed) {
+			if($sgwLteInstance{$sgwinstance} != 1) {
+				@sgwdata = &getSgwUserParam($licconfig, $sstinstance, $sgwinstance);
+				$sgwssn = $sgwdata[1];
+				if($sgwssn ne "") {
+					last;
+				} else {
+					$sgwinstance++;
+				}
+			} else {
+				$sgwinstance++;
+			}
+		}
+
+		if($sgwinstance > $sgwlicensed) {
+			print("Required number of SGW App instances is not licensed.\n");
+			last;
+		}
+
+		my $sgwsecname = sprintf("SGWAppPeer_%d_%d", $sstinstance, $sgwinstance);
+		&writeConfigVal($configHash, $sgwsecname, "", "", false);
+		my $sgwuser = &getSgwUser($licconfig, $sstinstance, $sgwinstance);
+
+
+		if($gLksctp == false) {
+			System("$touchCmd $currentRelPath/$gBinDir/$gStartSctpFile", 1, "Could not create $currentRelPath/$gBinDir/$gStartSctpFile");
+		}
+
+		my $standardnum = 3;
+		my $numDMtp3 = 0;
+		my $selfDMtp3ip = "127.0.0.1";
+		my $peerDMtp3ip = "127.0.0.1";
+		my $mtp2ip = "127.0.0.1";
+		chomp(@stackPorts);
+		if($standard =~ /ANSI/ ) {
+			$standardnum = 3;
+		} else {
+			$standardnum = 1;
+		}
+		@stackPorts = `$stackPortGen $gPortNumbers{$gMaxPortAppIndex} 2 $standardnum $mtp2ip $sstinstance $numDMtp3 $selfDMtp3ip $peerDMtp3ip`;
+		chomp(@stackPorts);
+# reassign start start port number for latter use
+		$gPortNumbers{$gMaxPortAppIndex} = $stackPorts[6] + 1;
+
+# copy the configuration files to the respective directories
+		my $fromFile = "sme.cfg";
+		my $toFile = "$currentRelPath/$gBinDir/$sigtrandir/$gCfgDir/smeport/configuration_files/ss7_ph_conf";
+		System("$mvCmd  $fromFile $toFile", 1, "Cound not mv $fromFile to $toFile");
+
+		$fromFile = "mtp3.cfg";
+		$toFile = "$currentRelPath/$gBinDir/$sigtrandir/$gCfgDir/Single/ss7_ph_conf";
+		System("$mvCmd  $fromFile $toFile", 1, "Cound not mv $fromFile to $toFile");
+
+		$fromFile = "sccp.cfg";
+		$toFile = "$currentRelPath/$gBinDir/$sigtrandir/$gCfgDir/normal/ss7_ph_conf";
+		System("$mvCmd  $fromFile $toFile", 1, "Cound not mv $fromFile to $toFile");
+		if ($gUsingOpensaf && $gProductLc eq tsmlccn && $sstinstance > 1 )
+		{
+#update SCCP_CONN_ID_OFFSET if this is not first sst instance
+			my $key = "SCCP_CONN_ID_OFFSET";
+			my $newval = 65536;
+			`/bin/sed -i 's/$key.*0/'$key\\\t$newval'/g' $toFile` ;
+		}
+
+		$sgwsecname = sprintf("CCToMCCMapping_%d_%d", $sstinstance, $sgwinstance);
+		&replaceSectionInIni($configHash, "CCToMCCMapping", $sgwsecname);
+		&writeConfigVal($configHash, $sgwsecname, "", "", false);
+
+		$sgwsecname = sprintf("NCToMNCMapping_%d_%d", $sstinstance, $sgwinstance);
+		&replaceSectionInIni($configHash, "NCToMNCMapping", $sgwsecname);
+		&writeConfigVal($configHash, $sgwsecname, "", "", false);
+
+		my $m3uasecname = sprintf("M3UA_%d_%d", $sstinstance, $appinstance);
+
+		$sgwsecname = sprintf("SGW_%d_%d", $sstinstance, $sgwinstance);
+		#&replaceSectionInIni($configHash, "SGW", $sgwsecname);
+		&updateSgwAppConfig($configHash, $licconfig, "SIGTRAN", $standard, \@stackPorts, $sgwsecname, $sgwssn, $sigtrandir, "", $m3uasecname, $sgwdata[0], $currentRelPath);
+		&updateFaultMonConfig($configHash, "SgwAppSections", $sgwsecname);
+
+		my $operMode = &getParam($licconfig, "FEATURES", "DeploymentMode");
+		&replaceSectionInIni($configHash, "M3UA", $m3uasecname);
+		&updateM3uaAppConfig($configHash, $standard, \@stackPorts, $m3uasecname, $sgwdata[2], $sgwsecname, $operMode);
+		&updateFaultMonConfig($configHash, "M3uaSections", $m3uasecname);
+
+		$sgwsecname = sprintf("SIGTRANStack_%d_%d", $sstinstance, $appinstance);
+		&delSection($configHash, $sgwsecname);
+
+		$sgwinstance++;
+
+# have to tell oam not to monitor m3ua seperately as its monitored by the sigtran
+# wrapper scripts
+		my $value = "";
+		if($appinstance == 1) {
+			$value = "M3UA";
+			updateIgnoreForPm($configHash, $value);
+		}
+
+		if($smecmdinst == 1) {
+			$value = "SmeCmdSender";
+			updateIgnoreForPm($configHash, $value);
+			delParam ($configHash, "APPDATA", "SmeCmdSender");
+		}
+
+		$value = sprintf("M3UA%d", $appinstance);
+		updateIgnoreForPm($configHash, $value);
+		$value = sprintf("SmeCmdSender%d", $smecmdinst);
+		updateIgnoreForPm($configHash, $value);
+
+		$value = sprintf("SmeCmdSender%d", $smecmdinst);
+		delParam ($configHash, "APPDATA", $value);
+		$smecmdinst++;
+
+		$value = &getParam($configHash, "APPDATA", $sgwapp);
+		if($value eq "") {
+			$value = &getParam($configHash, "APPDATA", $licapp);
+			&writeConfigVal($configHash, "APPDATA", "$licapp", sprintf("%s %d %d", $value, $sstinstance, $appinstance), true);
+		} else {
+			&writeConfigVal($configHash, "APPDATA", "$sgwapp", sprintf("%s %d %d", $value, $sstinstance, $appinstance), true);
+		}
+
+		if($onedone == false) {
+			if($gIsLinux == true) {
+				my $logFile = sprintf("\*.log", $sstinstance, $appinstance);
+				&updLogRetentionPeriod($configHash, $logFile, "1", "$gLogsDirPath/SIGTRANStackLogs", $gLogRetentionPeriod, "1");
+			}
+		}
+
+		$onedone = true;
+	}
+
+	&writeConfigVal($configHash, "FaultMonitor", "SS7CardDetail", "1:4", true);
+	&writeConfigVal($configHash, "FaultMonitor", "HDCDriver", "/dev/hdcx", true);
+	&writeConfigVal($configHash, "FaultMonitor", "QCX_PATH", "/usr/net/Adax/qcx", true);
+	# remove unwanted legacy paramters
+	delParam($configHash, "FaultMonitor", "Monitor");
+	delParam($configHash, "FaultMonitor", "SgwOamListenPort");
+	delParam($configHash, "FaultMonitor", "M3uaListenPort");
+#&writeConfigVal($configHash, "FaultMonitor", "ConfigPath", "$gActiveBinDir/");
+#&writeConfigVal($configHash, "FaultMonitor", "SmeConfFile", "SS7Stack/cfg/smeport/configuration_files/smeconf.dat");
+#&writeConfigVal($configHash, "FaultMonitor", "SMEClientPort", "19876");
+
+	# cleanup
+	my $idnames = &getSectionPararms($configHash, "IdToNameMapping");
+	my @idnamescpy = @{$idnames};
+	foreach my $idinfo (@idnamescpy) {
+		my @idvalues = split(",", $idinfo->{'value'});
+		if($idvalues[1] eq "BSC" || $idvalues[1] eq "HLR" || $idvalues[1] eq "RNC" || $idvalues[1] eq "STP" || $idvalues[1] eq "MSC") {
+			&delParam($configHash, "IdToNameMapping", $idinfo->{'name'});
+		}
+	}
+	if($gUsingVMware == true) {
+		&writeConfigVal($configHash, "SGW", "CNAppConnDownForFailover", "-1", true);
+		&writeConfigVal($configHash, "SGW", "CNAppConnDownFailureCnt", "-1", true);
+		&writeConfigVal($configHash, "SGW", "CNAppConnDownFailureDuration", "-1", true);
+		&writeConfigVal($configHash, "SGW", "CNPeerConnDownForFailover", "-1", true);
+		&writeConfigVal($configHash, "SGW", "CNPeerConnDownFailureCnt", "-1", true);
+		&writeConfigVal($configHash, "SGW", "CNPeerConnDownFailureDuration", "-1", true);
+	} else {
+		&writeConfigVal($configHash, "SGW", "CNAppConnDownForFailover", "5", false);
+		&writeConfigVal($configHash, "SGW", "CNAppConnDownFailureCnt", "3", false);
+		&writeConfigVal($configHash, "SGW", "CNAppConnDownFailureDuration", "10", false);
+		&writeConfigVal($configHash, "SGW", "CNPeerConnDownForFailover", "60", false);
+		&writeConfigVal($configHash, "SGW", "CNPeerConnDownFailureCnt", "-1", true);
+		&writeConfigVal($configHash, "SGW", "CNPeerConnDownFailureDuration", "-1", true);
+	}
+
+	&writeConfigVal($configHash, "SGW", "IncrRefNum", "false", false);
+	&writeConfigVal($configHash, "SGW", "IncrExtRefNum", "false", false);
+	&writeConfigVal($configHash, "SGW", "SMLCCode", "0", false);
+}
+
+sub writeGsmLeConfig($$) {
+	my $configHash = shift;
+	my $ftEnabled = shift;
+
+	&writeConfigVal($configHash, "GLE", "IPADDRESS", "127.0.0.1", false);
+	&writeConfigVal($configHash, "CallMgr", "LEPort", "$gPortNumbers{6}", false);
+	&writeConfigVal($configHash, "GLE", "GRID_RES", "100", false);
+	&writeConfigVal($configHash, "GLE", "SIG7", "0.0", false);
+	&writeConfigVal($configHash, "GLE", "X2LON", "1.000e-5", false);
+	&writeConfigVal($configHash, "GLE", "Y2LAT", "1.000e-5", false);
+
+	&writeConfigVal($configHash, "GLE", "BIASAVG", "-5.5", false);
+	&writeConfigVal($configHash, "GLE", "BIASSTD", "1e12", false);
+	&writeConfigVal($configHash, "GLE", "BIASSPREAD", "3.5", false);
+	&writeConfigVal($configHash, "GLE", "TA_OFFSET_MIN", "-1800", false);
+	&writeConfigVal($configHash, "GLE", "TA_OFFSET_MAX", "500", false);
+	&writeConfigVal($configHash, "GLE", "TA_OFFSET_AVG", "-500", false);
+	&writeConfigVal($configHash, "GLE", "TA_OFFSET_STD", "260", false);
+	&writeConfigVal($configHash, "GLE", "DELTAB", "0", false);
+	&writeConfigVal($configHash, "GLE", "PSTAY", "0.5", false);
+	&writeConfigVal($configHash, "GLE", "SIGM", "5.0", false);
+	&writeConfigVal($configHash, "GLE", "TAVG", "2.5", false);
+	&writeConfigVal($configHash, "GLE", "SA_MIN", "0.0001", false);
+	&writeConfigVal($configHash, "GLE", "SERV_DECODE_RSSI", "-90", false);
+	&writeConfigVal($configHash, "GLE", "SERV_DECODE_C2I", "5", false);
+	&writeConfigVal($configHash, "GLE", "SIGMA_RSSI", "6", false);
+	&writeConfigVal($configHash, "GLE", "ADJ_CHAN_OFFSET", "-30", false);
+	&writeConfigVal($configHash, "GLE", "SERV_OFFSET_DIST", "1000", false);
+	&writeConfigVal($configHash, "GLE", "SERV_OFFSET_MAX", "15", false);
+	&writeConfigVal($configHash, "GLE", "SERV_MIN", "0", false);
+	&writeConfigVal($configHash, "GLE", "SERV_OFFSET_MIN", "0", false);
+	&writeConfigVal($configHash, "GLE", "SERV_MAX", "0.95", false);
+	&writeConfigVal($configHash, "GLE", "NBR_DECODE_RSSI", "-110", false);
+	&writeConfigVal($configHash, "GLE", "NBR_DECODE_C2I", "-10", false);
+	&writeConfigVal($configHash, "GLE", "NBR_MIN", "0", false);
+	&writeConfigVal($configHash, "GLE", "USE_PSD_DIST", "0", false);
+	&writeConfigVal($configHash, "GLE", "LE_DEBUG", "0", false);
+	&writeConfigVal($configHash, "GLE", "PSD_PRELOAD_FLAG", "0", false);
+	-d "$gPsdPathGsm/PSDPath1" or system("$mkdirCmd -p $gPsdPathGsm/PSDPath1 2> /dev/null > /dev/null") ;
+	system("$chmodCmd -R 777 $gPsdPathGsm/PSDPath1 2> /dev/null > /dev/null");
+
+	-d "$gPsdPathGsm/PSDPath2" or system("$mkdirCmd -p $gPsdPathGsm/PSDPath2 2> /dev/null > /dev/null") ;
+	system("$chmodCmd -R 777 $gPsdPathGsm/PSDPath2 2> /dev/null > /dev/null");
+
+	if($ftEnabled ne "") {
+		&writeConfigVal($configHash, "GLE", "TRACKING", "1", false);
+	} else {
+		&writeConfigVal($configHash, "GLE", "TRACKING", "0", false);
+	}
+	&writeConfigVal($configHash, "GLE", "SNAPPING_DISTANCE", "500", false);
+	&writeConfigVal($configHash, "GLE", "NUM_CLOSEST_ROADS", "10", false);
+	&writeConfigVal($configHash, "GLE", "SIGMA_A", "1", false);
+	&writeConfigVal($configHash, "GLE", "SIGMA_Z", "500", false);
+	&writeConfigVal($configHash, "GLE", "AVG_SPEED", "3", false);
+	&writeConfigVal($configHash, "GLE", "MAX_SPEED", "60", false);
+	&writeConfigVal($configHash, "GLE", "RESET_COUNT", "2", false);
+	&writeConfigVal($configHash, "GLE", "MAX_TIME_GAP", "300", false);
+	&writeConfigVal($configHash, "GLE", "DELTAT_MAX", "50", false);
+	&writeConfigVal($configHash, "GLE", "MOVING_SPEED_THRESHOLD", "1", false);
+	&writeConfigVal($configHash, "GLE", "SKIP_DIST_THRES", "10", false);
+	&writeConfigVal($configHash, "GLE", "TOO_MANY_MEAS_NUM", "50", false);
+	&writeConfigVal($configHash, "GLE", "MAX_TOT_PSD_SIZE", "20", false);
+}
+
+sub writeNrLeConfig($) {
+	my $configHash = shift;
+}
+
+sub writeLteLeConfig($) {
+	my $configHash = shift;
+
+	&writeConfigVal($configHash, "LE", "IPADDRESS", "127.0.0.1", false);
+	&writeConfigVal($configHash, "CallMgr", "LTELEPort", "$gPortNumbers{5}", false);
+	&writeConfigVal($configHash, "LE", "GRID_RES" ,"50", "false");
+	&writeConfigVal($configHash, "LE", "DELTAR", "10", "false");
+	&writeConfigVal($configHash, "LE", "SIG1", "83", "false");
+	&writeConfigVal($configHash, "LE", "SIG2", "0.33", "false");
+	&writeConfigVal($configHash, "LE", "SIG3", "170", "false");
+	&writeConfigVal($configHash, "LE", "SIG4", "11", "false");
+	&writeConfigVal($configHash, "LE", "SIG5", "94", "false");
+	&writeConfigVal($configHash, "LE", "SIG6", "0.0255", "false");
+	&writeConfigVal($configHash, "LE", "SIG7", "0.00001157", "false");
+	&writeConfigVal($configHash, "LE", "LE_DEBUG", "0", "false");
+	&writeConfigVal($configHash, "LE", "TA_OFFSET_MIN", "-2214", "false");
+	&writeConfigVal($configHash, "LE", "TA_OFFSET_MAX", "453", "false");
+	&writeConfigVal($configHash, "LE", "TA_OFFSET_AVG", "-928", "false");
+	&writeConfigVal($configHash, "LE", "TA_OFFSET_STD", "100", "false");
+	&writeConfigVal($configHash, "LE", "SIGM", "5.0", "false");
+	&writeConfigVal($configHash, "LE", "PSTAY", "0.5", "false");
+	&writeConfigVal($configHash, "LE", "BIASAVG", "-4.5", "false");
+	&writeConfigVal($configHash, "LE", "BIASSTD", "1e12", "false");
+	&writeConfigVal($configHash, "LE", "DELTA", "1.0", "false");
+	&writeConfigVal($configHash, "LE", "PCUM", "0.9999", "false");
+	&writeConfigVal($configHash, "LE", "SA_MIN", "0.0001", "false");
+	&writeConfigVal($configHash, "LE", "TAVG", "2.0", "false");
+	&writeConfigVal($configHash, "LE", "MSRVRSRP", "5", "false");
+	&writeConfigVal($configHash, "LE", "SIGMARSRP", "5", "false");
+	&writeConfigVal($configHash, "LE", "MSRVRSRQ", "7", "false");
+	&writeConfigVal($configHash, "LE", "SIGMARSRQ", "7", "false");
+	&writeConfigVal($configHash, "LE", "MAX_ISLAND_PTS", "10000", "false");
+	&writeConfigVal($configHash, "LE", "MAX_PSD_IN_MEMORY", "250", "false");
+	&writeConfigVal($configHash, "LE", "ECID_ALGORITHM", "1", "false");
+	&writeConfigVal($configHash, "LE", "MIN_NUM_RSSI", "0", "false");
+	&writeConfigVal($configHash, "LE", "MIN_NUM_TA", "0", "false");
+	&writeConfigVal($configHash, "LE", "ECID_MIN_NUM_RSSI", "0", "false");
+	&writeConfigVal($configHash, "LE", "ECID_MIN_NUM_TA", "0", "false");
+	&writeConfigVal($configHash, "LE", "MAX_UNC_METRES", "5000", "false");
+	&writeConfigVal($configHash, "LE", "CONFIDENCE", "67", false);
+	-d $gPsdPathLte or system("$mkdirCmd -p $gPsdPathLte 2> /dev/null > /dev/null") ;
+	system("$chmodCmd -R 777 $gPsdPathLte 2> /dev/null > /dev/null");
+}
+
+sub writeUmtsLeConfig($$) {
+	my $configHash = shift;
+	my $ftEnabled = shift;
+
+	&writeConfigVal($configHash, "CallMgr", "CallManagerLEListenTCPPort", "$gPortNumbers{4}", true);
+	&writeConfigVal($configHash, "ULE", "IPADDRESS", "127.0.0.1", false);
+	&writeConfigVal($configHash, "ULE", "SA_MIN", "0.0001", false);
+	&writeConfigVal($configHash, "ULE", "SIGM", "3", false);
+	&writeConfigVal($configHash, "ULE", "PSTAY", "0.7", false);
+	&writeConfigVal($configHash, "ULE", "TAVG", "2.0", false);
+	&writeConfigVal($configHash, "ULE", "BIASAVG", "-8", false);
+	&writeConfigVal($configHash, "ULE", "BIASSTD", "1e12", false);
+	&writeConfigVal($configHash, "ULE", "MSRVRSSI", "-10", false);
+	&writeConfigVal($configHash, "ULE", "SIGMARSSI", "4.242", false);
+	&writeConfigVal($configHash, "ULE", "MSRVECIO", "-10", false);
+	&writeConfigVal($configHash, "ULE", "SIGMAECIO", "4.242", false);
+	&writeConfigVal($configHash, "ULE", "MACTRSSI", "-15", false);
+	&writeConfigVal($configHash, "ULE", "MACTECIO", "-15", false);
+	&writeConfigVal($configHash, "ULE", "MRPTRSSI", "-20", false);
+	&writeConfigVal($configHash, "ULE", "MRPTECIO", "-20", false);
+	&writeConfigVal($configHash, "ULE", "MFTRSSI", "-10", false);
+	&writeConfigVal($configHash, "ULE", "MFTECIO", "-20", false);
+	&writeConfigVal($configHash, "ULE", "BIASSPREAD", "5", false);
+	&writeConfigVal($configHash, "ULE", "PSD_VERSION", "7", false);
+	&writeConfigVal($configHash, "ULE", "LE_DEBUG", "0", false);
+	&writeConfigVal($configHash, "ULE", "USE_PSD_DIST", "0", false);
+	-d $gPsdPathUmts or system("$mkdirCmd -p $gPsdPathUmts 2> /dev/null > /dev/null") ;
+	system("$chmodCmd -R 777 $gPsdPathUmts 2> /dev/null > /dev/null");
+	&writeConfigVal($configHash, "ULE", "REPORTING_MODE", "all", false);
+	if($ftEnabled ne "") {
+		&writeConfigVal($configHash, "ULE", "TRACKING", "1", false);
+	} else {
+		&writeConfigVal($configHash, "ULE", "TRACKING", "0", false);
+	}
+	&writeConfigVal($configHash, "ULE", "SNAPPING_DISTANCE", "500", false);
+	&writeConfigVal($configHash, "ULE", "NUM_CLOSEST_ROADS", "10", false);
+	&writeConfigVal($configHash, "ULE", "SIGMA_A", "1", false);
+	&writeConfigVal($configHash, "ULE", "SIGMA_Z", "500", false);
+	&writeConfigVal($configHash, "ULE", "AVG_SPEED", "3", false);
+	&writeConfigVal($configHash, "ULE", "MAX_SPEED", "60", false);
+	&writeConfigVal($configHash, "ULE", "RESET_COUNT", "2", false);
+	&writeConfigVal($configHash, "ULE", "MAX_TIME_GAP", "300", false);
+	&writeConfigVal($configHash, "ULE", "DELTAT_MAX", "50", false);
+	&writeConfigVal($configHash, "ULE", "MOVING_SPEED_THRESHOLD", "1", false);
+	&writeConfigVal($configHash, "ULE", "SKIP_DIST_THRES", "10", false);
+	&writeConfigVal($configHash, "ULE", "TOO_MANY_MEAS_NUM", "5", false);
+	&writeConfigVal($configHash, "ULE", "CONFIDENCE", "67", false);
+}
+
+sub ldsInstall($$$) {
+	my $sstrec = shift;
+	my $releaseDir = shift;
+	my $licconfig = shift;
+
+}
+
+sub ldsConfig ($$$$) {
+	my $configHash = shift;
+	my $currentRelPath = shift;
+	my $oldRelPath = shift;
+	my $licconfig = shift;
+
+	my $pltinstance = $gPltSstDetail{'Instance'};
+	my $sstinstance = $gLdsSstDetail{'Instance'};
+
+	my @licapps = getLicensedAppsForSst($gLdsSstDetail{'LicName'}, $licconfig, $pltinstance);
+	my $ldsapps = $gLdsSstDetail{'Apps'};
+	my $ldsapp = @{$ldsapps}[1];
+	my $onegcmdone = false;
+
+	my $leapp = @{$ldsapps}[4];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$leapp/) {
+			my $ftEnabled = &getParam($licconfig, "LDS_GSM_LICENSE_SETTINGS","FastTrackingEnabledClients");
+			&writeGsmLeConfig($configHash, $ftEnabled);
+		}
+	}
+
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ldsapp/) {
+			my $appinstance = &getAppInstanceId($gLdsSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			my $section = sprintf("GsmCallMgr_%d_%d", $sstinstance, $appinstance);
+			&updateNodeSpecicParam($configHash, $section, "*");
+			if($onegcmdone == false) {
+				&writeConfigVal($configHash, $section, "LEPort", "$gPortNumbers{6}", false);
+				$onegcmdone = true;
+				$gLdsSstDetail{'Mode'} = sprintf("%s&GSM", $gLdsSstDetail{'Mode'});
+			}
+			&writeConfigVal($configHash, $section, "MaxRAM", "24000000000", false);
+		}
+	}
+
+	# DBBE
+	$ldsapp = @{$ldsapps}[9];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ldsapp/) {
+			#&writeConfigVal($configHash, "DBBE", "WLDMPollTime", "24", false);
+			#&writeConfigVal($configHash, "DBBE", "WSDMPollTime", "5", false);
+			#my $wldDir = sprintf("%s/WLD_%d", $gLogsDirPath, $sstinstance);
+			#-d "$wldDir" or system("$mkdirCmd -p $wldDir 2> /dev/null > /dev/null") ;
+			#&writeConfigVal($configHash, "DBBE", "WLDMOpDir", "$wldDir", false);
+			#-d "$gLogsDirPath/WSD" or system("$mkdirCmd -p $gLogsDirPath/WSD 2> /dev/null > /dev/null") ;
+			#&writeConfigVal($configHash, "DBBE", "WSDMOpDir", "$gLogsDirPath/WSD", false);
+			last;
+		}
+	}
+
+	$ldsapp = @{$ldsapps}[2];
+	$onegcmdone = false;
+#function
+	my $leapp = @{$ldsapps}[5];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$leapp/) {
+			my $ftEnabled = &getParam($licconfig, "LDS_UMTS_LICENSE_SETTINGS","FastTrackingEnabledClients");
+			&writeUmtsLeConfig($configHash, $ftEnabled);
+		}
+	}
+
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ldsapp/) {
+			my $appinstance = &getAppInstanceId($gLdsSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			my $section = sprintf("UmtsCallMgr_%d_%d", $sstinstance, $appinstance);
+			if($onegcmdone == false) {
+				&writeConfigVal($configHash, "MASS_DIRECT_UMTS_NUM_NBR","UmtsNumNbr", 32, false);
+				&writeConfigVal($configHash, $section, "CallManagerLEListenTCPPort", "$gPortNumbers{4}", true);
+				$onegcmdone = true;
+			}
+			&writeConfigVal($configHash, $section, "MaxRAM", "24000000000", false);
+			$gLdsSstDetail{'Mode'} = sprintf("%s&UMTS", $gLdsSstDetail{'Mode'});
+		}
+	}
+
+	$ldsapp = @{$ldsapps}[6];
+	my $lteWlsPresent = false;
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ldsapp/) {
+			$lteWlsPresent = true;
+			&writeLteLeConfig($configHash);
+		}
+	}
+
+	$ldsapp = @{$ldsapps}[3];
+	$onegcmdone = false;
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ldsapp/) {
+			if($onegcmdone == false) {
+				if($lteWlsPresent == true) {
+					my $appinstance = &getAppInstanceId($gLdsSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+					my $section = sprintf("LteCallMgr_%d_%d", $sstinstance, $appinstance);
+					&writeConfigVal($configHash, $section, "LEPort", "$gPortNumbers{5}", false);
+					&writeConfigVal($configHash, $section, "MaxRAM", "24000000000", false);
+				}
+				$gLdsSstDetail{'Mode'} = sprintf("%s&LTE", $gLdsSstDetail{'Mode'});
+				$onegcmdone = true;
+			}
+		}
+	}
+
+	my $nrWlsPresent = false;
+	$ldsapp = @{$ldsapps}[11];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ldsapp/) {
+			$nrWlsPresent = true;
+		}
+	}
+
+	$ldsapp = @{$ldsapps}[10];
+	$onegcmdone = false;
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ldsapp/) {
+			if($onegcmdone == false) {
+				if($nrWlsPresent == true) {
+					my $appinstance = &getAppInstanceId($gLdsSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+					my $section = sprintf("NrCallMgr_%d_%d", $sstinstance, $appinstance);
+					&writeConfigVal($configHash, $section, "LEPort", "$gPortNumbers{12}", false);
+					&writeConfigVal($configHash, $section, "MaxRAM", "24000000000", false);
+				}
+				$gLdsSstDetail{'Mode'} = sprintf("%s&NR", $gLdsSstDetail{'Mode'});
+				$onegcmdone = true;
+			}
+		}
+	}
+	
+	$ldsapp = @{$ldsapps}[0];
+	my $lrdpresent = false;
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ldsapp/) {
+			$lrdpresent = true;
+			-d "$gLogsDirPath/ABR" or system("$mkdirCmd -p $gLogsDirPath/ABR 2> /dev/null > /dev/null") ;
+			my $logFile = "PSD-TO-LES-MAP";
+			&updLogRetentionPeriod($configHash, $logFile, "0", "$gLogsDirPath/ABR", $gLogRetentionPeriod, "0");
+		}
+	}
+
+	$ldsapp = @{$ldsapps}[8];
+	my $pmpresent = false;
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ldsapp/) {
+			$pmpresent = true;
+			if($nrWlsPresent == true || $lteWlsPresent == true) {
+				-d "$gLogsDirPath/ABR" or system("$mkdirCmd -p $gLogsDirPath/ABR 2> /dev/null > /dev/null") ;
+				my $logFile = "PSD-TO-LES-MAP";
+				&updLogRetentionPeriod($configHash, $logFile, "0", "$gLogsDirPath/ABR", $gLogRetentionPeriod, "0");
+			}
+		}
+	}
+
+	my $ratPresent = "";
+	my $appnames = &getSectionPararms($licconfig, "SERVICEIDLIST");
+	foreach my $idinfo (@{$appnames}) {
+		if ($idinfo->{'name'} =~ /GsmCallManager/) {
+			$ratPresent = sprintf("%s,GSM", $ratPresent);
+		} elsif ($idinfo->{'name'} =~ /UmtsCallManager/) {
+			$ratPresent = sprintf("%s,UMTS", $ratPresent);
+		} elsif ($idinfo->{'name'} =~ /LdsLteCm/) {
+			$ratPresent = sprintf("%s,LTE", $ratPresent);
+		} elsif ($idinfo->{'name'} =~ /LdsNrCm/) {
+			$ratPresent = sprintf("%s,NR", $ratPresent);
+		}
+	}
+
+	if($ratPresent eq "") {
+		logToFile ("No call manager licensed", LOGFATAL | LOGCONS);
+	}
+
+	my @clients = ( "VAS", "PLMN", "E911", "LI", "MASSMTLR", "NOTRCVD", "UNKNOWN");
+
+	if ($gLdsSstDetail{'Mode'} =~ /GSM/ || $lrdpresent == true && $ratPresent =~ /GSM/){
+
+		my $ftEnabled = &getParam($licconfig, "LDS_GSM_LICENSE_SETTINGS","FastTrackingEnabledClients");
+#For Bug 7388
+		&writeConfigVal($configHash, "SEND_SERVER_RSSI", "", "", false);
+		&writeConfigVal($configHash, "CallMgr", "LEPort", "$gPortNumbers{2}", false);
+		&delParam($configHash, "CallMgr", "GSMLRConfig");
+
+		# before 7.4
+		&replaceSectionInIni($configHash, "PreparatoryMRCollectionAGPSGsm", "LDS_AGPS_MRCollection_BscLevel_USER_SETTINGS");
+
+		# from 7.4
+		foreach my $client (@clients) {
+			my $newsec = sprintf("LDS_AGPS_%s_MRCollection_BscLevel_USER_SETTINGS", $client);
+			&copySectionInIni($configHash, "LDS_AGPS_MRCollection_BscLevel_USER_SETTINGS", $newsec);
+			&writeConfigVal($configHash, $newsec, "", "", false);
+		}
+
+		# from 7.4
+		foreach my $client (@clients) {
+			my $newsec = sprintf("LDS_HYBRID_%s_MRCollection_BscLevel_USER_SETTINGS", $client);
+			&copySectionInIni($configHash, "LDS_HYBRID_MRCollection_BscLevel_USER_SETTINGS", $newsec);
+			&writeConfigVal($configHash, $newsec, "", "", false);
+		}
+
+		# from 7.4 - since copy is used, it has to be deleted explicitly
+		&delSection($configHash, "LDS_AGPS_MRCollection_BscLevel_USER_SETTINGS");
+		&delSection($configHash, "LDS_HYBRID_MRCollection_BscLevel_USER_SETTINGS");
+
+#Positioning data info
+		#Fix for Bug #15096
+		&delParam($configHash, "CallMgr", "PositioningData");
+		&delParam($configHash, "CallMgr", "LEIntfCellId");
+
+		# before 7.4
+		my $loctimevalue = &replaceParamInIni($configHash, "CallMgr", "LDS_GSM_AGPS_USER_SETTINGS", "AGPSLocationEstimationTime", "LocationEstimationTime");
+		if($loctimevalue eq "") {
+			$loctimevalue = "29500";
+		}
+		&writeConfigVal($configHash, "LDS_GSM_AGPS_USER_SETTINGS", "LocationEstimationTime", $loctimevalue, false);
+
+		# "BeforeAGPS", "AfterAGPS", "WithAGPS"
+		my $highMeasRatioDef = "0.05,0.05,0.80";
+		my $medMeasRatioDef = "0.05,0.05,0.20";
+		&migratePreMrColl($configHash, "LDS_GSM_AGPS_USER_SETTINGS", "GSMPreparatoryMRCollnTimeForWls", "MeasurementCollRatio_WLS", $loctimevalue, $highMeasRatioDef);
+		&migratePreMrColl($configHash, "LDS_GSM_AGPS_USER_SETTINGS", "GSMPreparatoryMRCollnTimeForRwls", "MeasurementCollRatio_rWLS", $loctimevalue, $highMeasRatioDef);
+		&migratePreMrColl($configHash, "LDS_GSM_AGPS_USER_SETTINGS", "GSMPreparatoryMRCollnTimeForEcid", "MeasurementCollRatio_ECID", $loctimevalue, $medMeasRatioDef);
+
+		&replaceParamInIni($configHash, "CallMgr", "LDS_GSM_AGPS_USER_SETTINGS", "AgpsDefaultGpsModel", "InitialAgpsModels");
+
+		&replaceParamInIni($configHash, "CallMgr", "LDS_GSM_WLS_USER_SETTINGS", "WLSLocationEstimationTime", "LocationEstimationTime");
+		&replaceParamInIni($configHash, "CallMgr", "LDS_GSM_rWLS_USER_SETTINGS", "rWLSLocationEstimationTime", "LocationEstimationTime");
+		&replaceParamInIni($configHash, "CallMgr", "LDS_GSM_ECID_USER_SETTINGS", "ECIDLocationEstimationTime", "LocationEstimationTime");
+
+		&replaceParamInIni($configHash, "CallMgr", "LDS_GSM_WLS_USER_SETTINGS", "WLSMeasurementCollectionTimerRatio", "MeasurementCollRatio");
+		&replaceParamInIni($configHash, "CallMgr", "LDS_GSM_rWLS_USER_SETTINGS", "rWLSMeasurementCollectionTimerRatio", "MeasurementCollRatio");
+		&replaceParamInIni($configHash, "CallMgr", "LDS_GSM_ECID_USER_SETTINGS", "ECIDMeasurementCollectionTimerRatio", "MeasurementCollRatio");
+
+		# from 7.4
+		@clients = ( "VAS", "PLMN", "E911", "LI", "MASSMTLR", "NOTRCVD", "UNKNOWN", "MASSDIRECT");
+		my @locMthds = ( "HYBRID", "AGPS", "WLS", "rWLS", "ECID", "CID" );
+		foreach my $locMthd (@locMthds) {
+			my $oldsec = sprintf("LDS_GSM_%s_USER_SETTINGS", $locMthd);
+			foreach my $client (@clients) {
+				if(($client eq "MASSDIRECT") && (($locMthd eq "HYBRID") || ($locMthd eq "AGPS"))) {
+					next;
+				}
+				my $newsec = sprintf("LDS_GSM_%s_%s_USER_SETTINGS", $client, $locMthd);
+				if( exists $configHash->{$newsec} ) {
+					# upgrade from 8.0 onwards. If section already exists, ignore old section
+					next;
+				}
+				&copySectionInIni($configHash, $oldsec, $newsec);
+			}
+			&delSection($configHash, $oldsec);
+		}
+
+		my $secnames = &getSectionPararms($licconfig, "SECTIONS");
+		foreach my $secname (@{$secnames}) {
+			if($secname->{'name'} =~ /^LDS_GSM/) {
+				my $secNameUser = $secname->{'name'};
+				if($secNameUser eq "LDS_GSM_POLARIS_SETTINGS") {
+					if ($lrdpresent == true) {
+						&writeConfigVal($configHash, "LDS_ABR_CFG_GSM", "", "", false);
+					}
+					# no other rat level parameter
+					next;
+				}
+
+				$secNameUser =~ s/POLARIS/USER/g;
+
+				if($secNameUser =~ /_LICENSE_/) {
+					#consider only polaris settings for now
+					next;
+				}
+
+				my $clientBased = true;
+				foreach my $locMthd (@locMthds) {
+					if($secNameUser =~ /$locMthd/) {
+						$clientBased = false;
+						last;
+					}
+				}
+
+				if($clientBased == true) {
+						my $timer = &getParam($configHash, "CallMgr", "MeasurementReportTime");
+						if($timer eq "") {
+							$timer = 480;
+						}
+						&writeConfigVal($configHash, $secNameUser, "MaxMRInterval", "480", false);
+					next;
+				}
+
+				my $fieldCnt = () = $secNameUser =~ /_/g;
+				if($fieldCnt != 5) {
+					next;
+				}
+
+				my $secPrefix;
+				if($secNameUser =~ m/(.*?)_USER_SETTINGS/) {
+					$secPrefix = $1;
+				}
+
+
+				if($secNameUser =~ /ECID/) {
+					&writeConfigVal($configHash, $secNameUser, "LocationEstimationTime", "3000", false);
+					&writeConfigVal($configHash, $secNameUser, "FallBackRatio", "CID:0", false);
+				} elsif($secNameUser =~ /CID/) {
+					# location estimation timer is not required for CID
+				} else {
+					&writeConfigVal($configHash, $secNameUser, "LocationEstimationTime", "29500", false);
+				}
+
+				if($secNameUser =~ /ECID/ || $secNameUser =~ /WLS/ || $secNameUser =~ /rWLS/) {
+					&writeConfigVal($configHash, $secNameUser, "MeasurementCollRatio", "0.75", false);
+					&writeConfigVal($configHash, $secNameUser,  "MinMRs", "1", false);
+				}
+				if($secNameUser =~ /WLS/ || $secNameUser =~ /rWLS/) {
+					&writeConfigVal($configHash, $secNameUser, "FallBackRatio", "ECID:0,CID:0", false);
+				}
+				if($secNameUser =~ /AGPS/ || $secNameUser =~ /HYBRID/) {
+					&writeConfigVal($configHash, $secNameUser,  "InitialAgpsModels", "1058", false);
+					&writeConfigVal($configHash, $secNameUser, "PeerAgpsRspTime", "12000", false);
+				}
+				if($secNameUser =~ /AGPS/) {
+					$highMeasRatioDef = "0.05,0.05,0.80";
+					$medMeasRatioDef = "0.05,0.05,0.20";
+
+					my $fbSec = sprintf("%s_WLS_USER_SETTINGS", $secPrefix);
+					&writeConfigVal($configHash, $fbSec, "MeasurementCollRatio", $highMeasRatioDef, false);
+
+					$fbSec = sprintf("%s_rWLS_USER_SETTINGS", $secPrefix);
+					&writeConfigVal($configHash, $fbSec, "MeasurementCollRatio", $highMeasRatioDef, false);
+
+					$fbSec = sprintf("%s_ECID_USER_SETTINGS", $secPrefix);
+					&writeConfigVal($configHash, $fbSec, "MeasurementCollRatio", $medMeasRatioDef, false);
+
+					&writeConfigVal($configHash, $secNameUser, "FallBackRatio", "WLS:0.80,rWLS:0.80,ECID:0,CID:0", false);
+				}
+				if($secNameUser =~ /HYBRID/) {
+					$highMeasRatioDef = "0.20,0.10,0.80";
+					my $fbSec = sprintf("%s_WLS_USER_SETTINGS", $secPrefix);
+					&writeConfigVal($configHash, $fbSec, "MeasurementCollRatio", $highMeasRatioDef, false);
+					&writeConfigVal($configHash, $fbSec, "MinMRs", "1", false);
+
+					$fbSec = sprintf("%s_rWLS_USER_SETTINGS", $secPrefix);
+					&writeConfigVal($configHash, $fbSec, "MeasurementCollRatio", $highMeasRatioDef, false);
+					&writeConfigVal($configHash, $fbSec, "MinMRs", "1", false);
+
+					&writeConfigVal($configHash, $secNameUser, "AgpsTimerRatio", "0.80", false);
+					&writeConfigVal($configHash, $secNameUser, "FallBackRatio", "ECID:0,CID:0", false);
+				}
+
+				&delParam($configHash, $secNameUser, "MeasurementCollRatio_WLS");
+				&delParam($configHash, $secNameUser, "MeasurementCollRatio_rWLS");
+				&delParam($configHash, $secNameUser, "MeasurementCollRatio_ECID");
+				&delParam($configHash, $secNameUser, "MinMRs_WLS");
+				&delParam($configHash, $secNameUser, "MinMRs_rWLS");
+			}
+		}
+
+
+# write le paramters
+		&writeGsmLeConfig($configHash, $ftEnabled);
+
+		&writeConfigVal($configHash, "LRD", "GSM_SystemlevelCallFailureTreshold", "8", false);
+		&writeConfigVal($configHash, "LRD", "GSM_BsclevelCallFailureTreshold", "8", false);
+		&writeConfigVal($configHash, "LRD", "GSM_CgilevelCallFailureTreshold", "8", false);
+		if($gUsingVMware == true) {
+			&writeConfigVal($configHash, "CallMgr", "CNAppConnDownForFailover", "-1", true);
+			&writeConfigVal($configHash, "CallMgr", "CNAppConnDownFailureCnt", "-1", true);
+			&writeConfigVal($configHash, "CallMgr", "CNAppConnDownFailureDuration", "-1", true);
+		} else {
+			&writeConfigVal($configHash, "CallMgr", "CNAppConnDownForFailover", "5", false);
+			&writeConfigVal($configHash, "CallMgr", "CNAppConnDownFailureCnt", "3", false);
+			&writeConfigVal($configHash, "CallMgr", "CNAppConnDownFailureDuration", "10", false);
+		}
+	}
+
+	my ($cdtFileGsm, $cdtFileUmts, $cdtFileLte, $cdtFileNr) = &getCdtFileNames($configHash);
+
+	if(($gLdsSstDetail{'Mode'} =~ /GSM/) || ($lrdpresent == true && $ratPresent =~ /GSM/) || ($gLdsSstDetail{'Mode'} =~ /LTE/)) {
+		#workaround to pick the last configuration
+
+		my $ip = &getParam($configHash, "DCMServer", "GSMDCMIPAddress");
+# special case, check for legacy paramter also along with current parameter
+		if($ip eq "") {
+			$ip = getIp("Enter GSM LAM IP address", false, true);
+		}
+		&writeConfigVal($configHash, "DCMServer", "GSMDCMIPAddress", "$ip", false);
+
+		my $dcmPort = &getParam($configHash, "DCMServer", "GSMMRFPort");
+# special case, check for legacy paramter also along with current parameter
+		if($dcmPort eq "") {
+			$dcmPort = getPort("Enter GSM LAM Port", $gPortNumbers{3});
+		}
+		&writeConfigVal($configHash, "DCMServer", "GSMMRFPort", "$dcmPort", false);
+
+		&writeConfigVal($configHash, "PBManager", "PSDPath1", sprintf("%s/PSDPath1/",$gPsdPathGsm), false);
+		-d "$gPsdPathGsm/PSDPath1" or system("$mkdirCmd -p $gPsdPathGsm/PSDPath1 2> /dev/null > /dev/null") ;
+		system("$chmodCmd -R 777 $gPsdPathGsm/PSDPath1 2> /dev/null > /dev/null");
+
+		&writeConfigVal($configHash, "PBManager", "PSDPath2", sprintf("%s/PSDPath2/",$gPsdPathGsm), false);
+		-d "$gPsdPathGsm/PSDPath2" or system("$mkdirCmd -p $gPsdPathGsm/PSDPath2 2> /dev/null > /dev/null") ;
+		system("$chmodCmd -R 777 $gPsdPathGsm/PSDPath2 2> /dev/null > /dev/null");
+
+		#&writeConfigVal($configHash, "PBManager", "PRTFile", sprintf("%s/PRT.txt",$gPsdPathGsm), false);
+		&delParam($configHash, "PBManager", "PRTFile");
+
+		&writeConfigVal($configHash, "DCMServer", "GSMMATLoadPath", "$gCdtPathGsm", false);
+		-d $gCdtPathGsm or system("$mkdirCmd -p $gCdtPathGsm 2> /dev/null > /dev/null") ;
+		system("$chmodCmd -R 777 $gCdtPathGsm 2> /dev/null > /dev/null");
+	}
+
+	if ($gLdsSstDetail{'Mode'} =~ /UMTS/ || $lrdpresent == true && $ratPresent =~ /UMTS/) {
+
+		my $ftEnabled = &getParam($licconfig, "LDS_UMTS_LICENSE_SETTINGS","FastTrackingEnabledClients");
+		&delParam($configHash, "CallMgr", "UMTSLRConfig");
+
+		my $loctimevalue = &replaceParamInIni($configHash, "CallMgr", "LDS_UMTS_AGPS_USER_SETTINGS", "AGPSLocationEstimationTime", "LocationEstimationTime");
+		if($loctimevalue eq "") {
+			$loctimevalue = "29500";
+		}
+		&writeConfigVal($configHash, "LDS_UMTS_AGPS_USER_SETTINGS", "LocationEstimationTime", $loctimevalue, false);
+
+		# "BeforeAGPS", "AfterAGPS", "WithAGPS"
+		my $highMeasRatioDef = "0.05,0.05,";
+		my $medMeasRatioDef = "0.05,0.05,";
+		&migratePreMrColl($configHash, "LDS_UMTS_AGPS_USER_SETTINGS", "UMTSPreparatoryMRCollnTimeForWls", "MeasurementCollRatio_WLS", $loctimevalue, $highMeasRatioDef);
+		&migratePreMrColl($configHash, "LDS_UMTS_AGPS_USER_SETTINGS", "UMTSPreparatoryMRCollnTimeForEcid", "MeasurementCollRatio_ECID", $loctimevalue, $medMeasRatioDef);
+
+		&replaceParamInIni($configHash, "CallMgr", "LDS_UMTS_AGPS_USER_SETTINGS", "AgpsDefaultGpsModelUmts", "InitialAgpsModels");
+
+		&replaceParamInIni($configHash, "CallMgr", "LDS_UMTS_WLS_USER_SETTINGS", "WLSLocationEstimationTime", "LocationEstimationTime");
+		&replaceParamInIni($configHash, "CallMgr", "LDS_UMTS_ECID_USER_SETTINGS", "ECIDLocationEstimationTime", "LocationEstimationTime");
+
+		&replaceParamInIni($configHash, "CallMgr", "LDS_UMTS_WLS_USER_SETTINGS", "WLSMeasurementCollectionTimerRatio", "MeasurementCollRatio");
+		&replaceParamInIni($configHash, "CallMgr", "LDS_UMTS_ECID_USER_SETTINGS", "ECIDMeasurementCollectionTimerRatio", "MeasurementCollRatio");
+
+		# from 7.4
+		@clients = ( "VAS", "PLMN", "E911", "LI", "MASSMTLR","NOTRCVD", "UNKNOWN", "MASSDIRECT");
+		my @locMthds = ( "HYBRID", "AGPS", "WLS", "rWLS", "ECID", "CID" );
+		foreach my $locMthd (@locMthds) {
+			my $oldsec = sprintf("LDS_UMTS_%s_USER_SETTINGS", $locMthd);
+			foreach my $client (@clients) {
+				if(($client eq "MASSDIRECT") && (($locMthd eq "HYBRID") || ($locMthd eq "AGPS"))) {
+					next;
+				}
+				my $newsec = sprintf("LDS_UMTS_%s_%s_USER_SETTINGS", $client, $locMthd);
+				if( exists $configHash->{$newsec} ) {
+					# upgrade from 8.0 onwards. If section already exists, ignore old section
+					next;
+				}
+
+				&copySectionInIni($configHash, $oldsec, $newsec);
+			}
+			&delSection($configHash, $oldsec);
+		}
+
+		my $secnames = &getSectionPararms($licconfig, "SECTIONS");
+		foreach my $secname (@{$secnames}) {
+			if($secname->{'name'} =~ /^LDS_UMTS/) {
+				my $secNameUser = $secname->{'name'};
+				if($secNameUser eq "LDS_UMTS_POLARIS_SETTINGS") {
+					if ($lrdpresent == true) {
+						&writeConfigVal($configHash, "LDS_ABR_CFG_UMTS", "", "", false);
+					}
+					# no other rat level parameter
+					next;
+				}
+
+				$secNameUser =~ s/POLARIS/USER/g;
+
+				if($secNameUser =~ /_LICENSE_/) {
+					#consider only polaris settings for now
+					next;
+				}
+
+				my $clientBased = true;
+				foreach my $locMthd (@locMthds) {
+					if($secNameUser =~ /$locMthd/) {
+						$clientBased = false;
+						last;
+					}
+				}
+
+				if($clientBased == true) {
+
+					if($secNameUser =~ /_MASSDIRECT_/) {
+						# nothing required for mass direct as of now
+					} else {
+						my $timer = &getParam($configHash, "CallMgr", "MeasurementReportTime");
+						if($timer eq "") {
+							$timer = 480;
+						}
+						&writeConfigVal($configHash, $secNameUser, "MaxMRInterval", $timer, false);
+
+						my $timer = &getParam($configHash, "CallMgr", "MinimumTimeForPAReq");
+						if($timer eq "") {
+							$timer = 0;
+						}
+						&writeConfigVal($configHash, $secNameUser, "MinMRInterval", $timer, false);
+						&writeConfigVal($configHash, $secNameUser, "PeerMRRspTime", 250, false);
+					}
+					next;
+				}
+
+				my $fieldCnt = () = $secNameUser =~ /_/g;
+				if($fieldCnt != 5) {
+					next;
+				}
+
+				my $secPrefix;
+				if($secNameUser =~ m/(.*?)_USER_SETTINGS/) {
+					$secPrefix = $1;
+				}
+
+
+				if($secNameUser =~ /ECID/) {
+					&writeConfigVal($configHash, $secNameUser, "LocationEstimationTime", "3000", false);
+					&writeConfigVal($configHash, $secNameUser, "FallBackRatio", "CID:0", false);
+
+					my $mrparam;
+					my $param = &getParam($configHash, "CallMgr", "RTTInfoType1RequiredFlagForEcid");
+					if($param eq "true") {
+						$mrparam = sprintf("RTT1,");
+					}
+
+					$param = &getParam($configHash, "CallMgr", "RTTInfoType2RequiredFlagForEcid");
+					if($param eq "true") {
+						$mrparam = sprintf("%sRTT2,", $mrparam);
+					}
+
+					$param = &getParam($configHash, "CallMgr", "PathLossRequiredFlagForEcid");
+					if($param eq "true") {
+						$mrparam = sprintf("%sPATHLOSS,", $mrparam);
+					}
+
+					$param = &getParam($configHash, "CallMgr", "CPICH_RSCPRequiredFlagForEcid");
+					if($param eq "true") {
+						$mrparam = sprintf("%sRSCP,", $mrparam);
+					}
+
+					$param = &getParam($configHash, "CallMgr", "CPICH_ECN0RequiredFlagForEcid");
+					if($param eq "true") {
+						$mrparam = sprintf("%sECNO", $mrparam);
+					}
+
+					if($mrparam eq "") {
+						$mrparam = "RTT1,RTT2,PATHLOSS,RSCP,ECNO";
+					}
+					if($secNameUser =~ /_MASSDIRECT_/) {
+						# nothing required for mass direct as of now
+					} else {
+						&writeConfigVal($configHash, $secNameUser, "MrParameter", $mrparam, false);
+					}
+				} elsif($secNameUser =~ /CID/) {
+					# location estimation timer is not required for CID
+				} else {
+					&writeConfigVal($configHash, $secNameUser, "LocationEstimationTime", "29500", false);
+				}
+				if($secNameUser =~ /ECID/ || $secNameUser =~ /WLS/ || $secNameUser =~ /rWLS/) {
+					&writeConfigVal($configHash, $secNameUser, "MeasurementCollRatio", "0.75", false);
+					&writeConfigVal($configHash, $secNameUser, "MinMRs", "1", false);
+				}
+				if($secNameUser =~ /WLS/) {
+					my $mrparam;
+					my $param = &getParam($configHash, "CallMgr", "RTTInfoType1RequiredFlagForWls");
+					if($param eq "true") {
+						$mrparam = sprintf("RTT1,");
+					}
+					&delParam($configHash, "CallMgr", "RTTInfoType1RequiredFlagForWls");
+
+					$param = &getParam($configHash, "CallMgr", "RTTInfoType2RequiredFlagForWls");
+					if($param eq "true") {
+						$mrparam = sprintf("%sRTT2,", $mrparam);
+					}
+					&delParam($configHash, "CallMgr", "RTTInfoType2RequiredFlagForWls");
+
+					$param = &getParam($configHash, "CallMgr", "PathLossRequiredFlagForWls");
+					if($param eq "true") {
+						$mrparam = sprintf("%sPATHLOSS,", $mrparam);
+					}
+					&delParam($configHash, "CallMgr", "PathLossRequiredFlagForWls");
+
+					$param = &getParam($configHash, "CallMgr", "CPICH_RSCPRequiredFlagForWls");
+					if($param eq "true") {
+						$mrparam = sprintf("%sRSCP,", $mrparam);
+					}
+					&delParam($configHash, "CallMgr", "CPICH_RSCPRequiredFlagForWls");
+
+					$param = &getParam($configHash, "CallMgr", "CPICH_ECN0RequiredFlagForWls");
+					if($param eq "true") {
+						$mrparam = sprintf("%sECNO", $mrparam);
+					}
+					&delParam($configHash, "CallMgr", "CPICH_ECN0RequiredFlagForWls");
+
+					if($mrparam eq "") {
+						$mrparam = "RTT1,RTT2,PATHLOSS,RSCP,ECNO";
+					}
+
+					if($secNameUser =~ /_MASSDIRECT_/) {
+						# nothing required for mass direct as of now
+					} else {
+						&writeConfigVal($configHash, $secNameUser, "MrParameter", $mrparam, false);
+					}
+					&writeConfigVal($configHash, $secNameUser, "FallBackRatio", "ECID:0,CID:0", false);
+				}
+				if($secNameUser =~ /rWLS/) {
+					if($secNameUser =~ /_MASSDIRECT_/) {
+						# nothing required for mass direct as of now
+					} else {
+						&writeConfigVal($configHash, $secNameUser, "MrParameter", "RTT1,RTT2,PATHLOSS,RSCP,ECNO", false);
+					}
+					&writeConfigVal($configHash, $secNameUser, "FallBackRatio", "ECID:0,CID:0", false);
+				}
+				if($secNameUser =~ /AGPS/ || $secNameUser =~ /HYBRID/) {
+					&writeConfigVal($configHash, $secNameUser, "InitialAgpsModels", "1058", false);
+					&writeConfigVal($configHash, $secNameUser, "PeerAgpsRspTime", "12000", false);
+					&writeConfigVal($configHash, $secNameUser, "FirstPAAdditionalAsstDataAllowed","true",false);
+				}
+				if($secNameUser =~ /AGPS/) {
+					&writeConfigVal($configHash, $secNameUser, "FallBackRatio", "WLS:0.80,rWLS:0.80,ECID:0,CID:0", false);
+
+					$highMeasRatioDef = "0.05,0.05,";
+					$medMeasRatioDef = "0.05,0.05,";
+					my $fbSec = sprintf("%s_WLS_USER_SETTINGS", $secPrefix);
+					&writeConfigVal($configHash, $fbSec, "MeasurementCollRatio", $highMeasRatioDef, false);
+					$fbSec = sprintf("%s_rWLS_USER_SETTINGS", $secPrefix);
+					&writeConfigVal($configHash, $fbSec, "MeasurementCollRatio", $highMeasRatioDef, false);
+					$fbSec = sprintf("%s_ECID_USER_SETTINGS", $secPrefix);
+					&writeConfigVal($configHash, $fbSec, "MeasurementCollRatio", $medMeasRatioDef, false);
+				}
+
+				if($secNameUser =~ /HYBRID/) {
+					$highMeasRatioDef = "0.20,0.10,";
+					my $fbSec = sprintf("%s_WLS_USER_SETTINGS", $secPrefix);
+					&writeConfigVal($configHash, $fbSec, "MeasurementCollRatio", $highMeasRatioDef, false);
+					&writeConfigVal($configHash, $fbSec, "MinMRs", "1", false);
+					&writeConfigVal($configHash, $fbSec, "MrParameter", "RTT1,RTT2,PATHLOSS,RSCP,ECNO", false);
+
+					$fbSec = sprintf("%s_rWLS_USER_SETTINGS", $secPrefix);
+					&writeConfigVal($configHash, $fbSec, "MeasurementCollRatio", $highMeasRatioDef, false);
+					&writeConfigVal($configHash, $fbSec, "MinMRs", "1", false);
+					&writeConfigVal($configHash, $fbSec, "MrParameter", "RTT1,RTT2,PATHLOSS,RSCP,ECNO", false);
+
+					&writeConfigVal($configHash, $secNameUser, "AgpsTimerRatio", "0.80", false);
+					&writeConfigVal($configHash, $secNameUser, "FallBackRatio", "ECID:0,CID:0", false);
+				}
+				&delParam($configHash, $secNameUser, "MeasurementCollRatio_WLS");
+				&delParam($configHash, $secNameUser, "MeasurementCollRatio_rWLS");
+				&delParam($configHash, $secNameUser, "MeasurementCollRatio_ECID");
+				&delParam($configHash, $secNameUser, "MinMRs_WLS");
+				&delParam($configHash, $secNameUser, "MinMRs_rWLS");
+				&delParam($configHash, $secNameUser, "MrParameter_WLS");
+				&delParam($configHash, $secNameUser, "MrParameter_rWLS");
+			}
+		}
+
+		&writeUmtsLeConfig($configHash, $ftEnabled);
+
+		&writeConfigVal($configHash, "LRD", "UMTS_SystemlevelCallFailureTreshold", "8", false);
+		&writeConfigVal($configHash, "LRD", "UMTS_RnclevelCallFailureTreshold", "8", false);
+		&writeConfigVal($configHash, "LRD", "UMTS_CgilevelCallFailureTreshold", "8", false);
+		if($gUsingVMware == true) {
+			&writeConfigVal($configHash, "CallMgr", "CNAppConnDownForFailover", "-1", true);
+			&writeConfigVal($configHash, "CallMgr", "CNAppConnDownFailureCnt", "-1", true);
+			&writeConfigVal($configHash, "CallMgr", "CNAppConnDownFailureDuration", "-1", true);
+		} else {
+			&writeConfigVal($configHash, "CallMgr", "CNAppConnDownForFailover", "5", false);
+			&writeConfigVal($configHash, "CallMgr", "CNAppConnDownFailureCnt", "3", false);
+			&writeConfigVal($configHash, "CallMgr", "CNAppConnDownFailureDuration", "10", false);
+		}
+
+
+
+#Bug 9518
+		&writeConfigVal($configHash, "CallMgr", "WLSMRObservationTime", "22", false);
+		&writeConfigVal($configHash, "CallMgr", "ECIDMRObservationTime", "2", false);
+		&delParam($configHash, "CallMgr", "MinimumNoOfCellInfoForValidMR");
+	}
+
+	if (($gLdsSstDetail{'Mode'} =~ /UMTS/) || ($lrdpresent == true && $ratPresent =~ /UMTS/) || ($gLdsSstDetail{'Mode'} =~ /LTE/)) {
+		#workaround to pick the last configuration
+
+		my $ip = &getParam($configHash, "DCMServer", "UMTSDCMIPAddress");
+# special case, check for legacy paramter also along with current parameter
+		if($ip eq "") {
+			$ip = getIp("Enter UMTS LAM IP address", false, true);
+		}
+		&writeConfigVal($configHash, "DCMServer", "UMTSDCMIPAddress", "$ip", false);
+
+		my $dcmPort = &getParam($configHash, "DCMServer", "UMTSMRFPort");
+		if($dcmPort eq "") {
+			$dcmPort = getPort("Enter UMTS LAM Port", $gPortNumbers{3});
+		}
+		&writeConfigVal($configHash, "DCMServer", "UMTSMRFPort", "$dcmPort", false);
+		&writeConfigVal($configHash, "DCMServer", "PSDPath", sprintf("%s/",$gPsdPathUmts), false);
+		-d $gPsdPathUmts or system("$mkdirCmd -p $gPsdPathUmts 2> /dev/null > /dev/null") ;
+		system("$chmodCmd -R 777 $gPsdPathUmts 2> /dev/null > /dev/null");
+
+		&writeConfigVal($configHash, "DCMServer", "UMTSMATLoadPath", "$gCdtPathUmts", false);
+		-d $gCdtPathUmts or system("$mkdirCmd -p $gCdtPathUmts 2> /dev/null > /dev/null") ;
+		system("$chmodCmd -R 777 $gCdtPathUmts 2> /dev/null > /dev/null");
+	}
+
+	if (($gLdsSstDetail{'Mode'} =~ /GSM/) || ($gLdsSstDetail{'Mode'} =~ /UMTS/)) {
+#common for both GSM and UMTS
+
+#AGPS related configurations
+		&delParam($configHash, "CallMgr", "AgpsDefaultMsPosReqAccuracy");
+		&delParam($configHash, "CallMgr", "UncertaintyForEllipsoidPoint");
+
+# Bug - 9711. Faster Response
+		&delParam($configHash, "CallMgr", "FasterResponseTime");
+		&delParam($configHash, "CallMgr", "FasterResponseMCRatio");
+
+		&delSection($configHash, "LDS_UMTS_LICENSE_SETTINGS");
+
+	}
+
+	if($lrdpresent == true) {
+		&writeConfigVal($configHash, "LRD", "CELLIDConfiguredDurationCompTime", "5", false);
+		&writeConfigVal($configHash, "LRD", "WLSConfiguredDurationCompTime", "500", false);
+		&writeConfigVal($configHash, "LRD", "rWLSConfiguredDurationCompTime", "500", false);
+		&writeConfigVal($configHash, "LRD", "ECIDConfiguredDurationCompTime", "10", false);
+		&writeConfigVal($configHash, "LRD", "AGPSConfiguredDurationCompTime", "65535", false);
+		&writeConfigVal($configHash, "LRD", "TimerResolutionIdleTime", "1000", false);
+		#&writeConfigVal($configHash, "LRD", "ConfiguredReqDurationIdleTime", "3600", false);
+		&writeConfigVal($configHash, "LRD", "ConfiguredReqDurationIdleTimeBsc", "3600", false);
+		&writeConfigVal($configHash, "LRD", "ConfiguredReqDurationIdleTimeBscSystem", "3600", false);
+		&writeConfigVal($configHash, "LRD", "ConfiguredReqDurationIdleTimeRnc", "3600", false);
+		&writeConfigVal($configHash, "LRD", "ConfiguredReqDurationIdleTimeRncSystem", "3600", false);
+		&writeConfigVal($configHash, "LRD", "MinCMForFailover", "50", false);
+
+	}
+
+	if($pmpresent == true) {
+		#&writeConfigVal($configHash, "LDSPM", "IdleTimeLteReqSystem", "3600", false);
+		&writeConfigVal($configHash, "LDSPM", "IdleTimeLteReqMme", "3600", false);
+		writeConfigVal($configHash, "LDSPM", "IdleTimeNrReqSystem", "3600", false);
+		&writeConfigVal($configHash, "LDSPM", "DebugIMSIs", "", false);
+		delParam($configHash, "LDSPM", "IdleTimeNrReqAmf");
+	}
+
+	if ($gLdsSstDetail{'Mode'} =~ /LTE/	|| ($pmpresent == true && $ratPresent =~ /LTE/)) {
+	
+		# pmConfig -- policy manager config
+		# cmConfig -- call manager config
+		my $pmConfig = false;
+		if($pmpresent == true && $ratPresent =~ /LTE/) {
+			$pmConfig = true;
+		}
+		
+		my $cmConfig = false;
+		if($gLdsSstDetail{'Mode'} =~ /LTE/) {
+			$cmConfig = true;
+		}
+
+		&updCmConfig($configHash, $licconfig, $pmConfig, $cmConfig, $pmpresent, "LTE");
+	}
+	
+	if ($gLdsSstDetail{'Mode'} =~ /NR/	|| ($pmpresent == true && $ratPresent =~ /NR/)) {
+		# pmConfig -- policy manager config
+		# cmConfig -- call manager config
+		my $pmConfig = false;
+		if($pmpresent == true && $ratPresent =~ /NR/) {
+			$pmConfig = true;
+		}
+		
+		my $cmConfig = false;
+		if($gLdsSstDetail{'Mode'} =~ /NR/) {
+			$cmConfig = true;
+		}
+
+		&updCmConfig($configHash, $licconfig, $pmConfig, $cmConfig, $pmpresent, "NR");
+	}
+	#workaround to pick the last configuration
+	#&writeConfigVal($configHash, "SYSTEM", "SubSystemNames", "lte", false);
+	if($gUsingVMware == true) {
+		&writeConfigVal($configHash, "CallMgr", "CNAppConnDownForFailover", "-1", true);
+		&writeConfigVal($configHash, "CallMgr", "CNAppConnDownFailureCnt", "-1", true);
+		&writeConfigVal($configHash, "CallMgr", "CNAppConnDownFailureDuration", "-1", true);
+	} else {
+		&writeConfigVal($configHash, "CallMgr", "CNAppConnDownForFailover", "5", false);
+		&writeConfigVal($configHash, "CallMgr", "CNAppConnDownFailureCnt", "3", false);
+		&writeConfigVal($configHash, "CallMgr", "CNAppConnDownFailureDuration", "10", false);
+	}
+	my $ftEnabled = &getParam($licconfig, "LDS_NR_LICENSE_SETTINGS","FastTrackingEnabledClients");
+	if($nrWlsPresent == true) {
+		&writeConfigVal($configHash, "NLE", "PORT", "$gPortNumbers{12}", "false");
+		&writeConfigVal($configHash, "NLE", "LE_DEBUG", "0", "false");
+		&writeConfigVal($configHash, "NLE", "BIASAVG" ,"-8.5", "false");
+		&writeConfigVal($configHash, "NLE", "BIASSTD", "3.9", "false");
+		&writeConfigVal($configHash, "NLE", "BIASSPREAD", "-4.5", "false");
+		&writeConfigVal($configHash, "NLE", "TA_OFFSET_MIN", "-1360", "false");
+		&writeConfigVal($configHash, "NLE", "TA_OFFSET_MAX", "300", "false");
+		&writeConfigVal($configHash, "NLE", "TA_OFFSET_AVG", "-450", "false");
+		&writeConfigVal($configHash, "NLE", "TA_OFFSET_STD", "300", "false");
+		&writeConfigVal($configHash, "NLE", "DELTAB", "0", "false");
+		&writeConfigVal($configHash, "NLE", "PSTAY", "0.5", "false");
+		&writeConfigVal($configHash, "NLE", "SIGM", "5.0", "false");
+		&writeConfigVal($configHash, "NLE", "SA_MIN", "0", "false");
+		if($ftEnabled ne "") {
+			&writeConfigVal($configHash, "NLE", "TRACKING", "1", false);
+		} else {
+			&writeConfigVal($configHash, "NLE", "TRACKING", "0", false);
+		}
+		&writeConfigVal($configHash, "NLE", "TRACKING", "0", "false");
+		&writeConfigVal($configHash, "NLE", "TAVG", "2.0", "false");
+		&writeConfigVal($configHash, "NLE", "GRID_RES", "50", "false");
+		&writeConfigVal($configHash, "NLE", "DELTAR", "10", "false");
+		&writeConfigVal($configHash, "NLE", "SIG1", "83", "false");
+		&writeConfigVal($configHash, "NLE", "SIG2", "127", "false");
+		&writeConfigVal($configHash, "NLE", "SIG3", "170", "false");
+		&writeConfigVal($configHash, "NLE", "SIG4", "11", "false");
+		&writeConfigVal($configHash, "NLE", "SIG5", "94", "false");
+		&writeConfigVal($configHash, "NLE", "SIG6", "0.0255", "false");
+		&writeConfigVal($configHash, "NLE", "SIG7", "0.00001157", "false");
+	}
+
+	&delParam($configHash, "LRD", "ESMLCDefPosMthd");
+	&delSection($configHash, "LRDLteDefLocMthdAndHA");
+	&delParam($configHash, "LRD", "LTE_SystemlevelCallFailureTreshold");
+	&delParam($configHash, "LRD", "LTE_MmelevelCallFailureTreshold");
+	&delParam($configHash, "LRD", "LTE_CgilevelCallFailureTreshold");
+	&delParam($configHash, "LRD", "ConfiguredReqDurationIdleTimeMmeSystem");
+	&delParam($configHash, "LRD", "ConfiguredReqDurationIdleTimeMme");
+
+	if ($gLdsSstDetail{'Mode'} =~ /LTE/ || ($pmpresent == true && $ratPresent =~ /LTE/)) {
+		my $ip = &getParam($configHash, "DCMServer", "LTEDCMIPAddress");
+		if($ip eq "") {
+			$ip = getIp("Enter LTE LAM IP address", false, true);
+		}
+		&writeConfigVal($configHash, "DCMServer", "LTEDCMIPAddress", "$ip", false);
+
+		my $dcmPort = &getParam($configHash, "DCMServer", "LTEMRFPort");
+		if($dcmPort eq "") {
+			$dcmPort = getPort("Enter LTE LAM Port", $gPortNumbers{3});
+		}
+		&writeConfigVal($configHash, "DCMServer", "LTEMRFPort", "$dcmPort", false);
+		&writeConfigVal($configHash, "DCMServer", "LTEMATLoadPath", "$gCdtPathLte", false);
+		-d $gCdtPathLte or system("$mkdirCmd -p $gCdtPathLte 2> /dev/null > /dev/null") ;
+		system("$chmodCmd -R 777 $gCdtPathLte 2> /dev/null > /dev/null");
+
+		&writeConfigVal($configHash, "PBManager", "LTEPSDPath", sprintf("%s/", $gPsdPathLte), false);
+		-d $gPsdPathLte or system("$mkdirCmd -p $gPsdPathLte 2> /dev/null > /dev/null") ;
+		system("$chmodCmd -R 777 $gPsdPathLte 2> /dev/null > /dev/null");
+
+		#&writeConfigVal($configHash, "PBManager", "LTEPRTFile", sprintf("%s/PRT.txt",$gPsdPathLte), true);
+		&delParam($configHash, "PBManager", "LTEPRTFile");
+	}
+
+	if ($gLdsSstDetail{'Mode'} =~ /NR/ || ($pmpresent == true && $ratPresent =~ /NR/)) {
+		my $ip = &getParam($configHash, "DCMServer", "NRDCMIPAddress");
+		if($ip eq "") {
+			$ip = getIp("Enter NR LAM IP address", false, true);
+		}
+		&writeConfigVal($configHash, "DCMServer", "NRDCMIPAddress", "$ip", false);
+
+		my $dcmPort = &getParam($configHash, "DCMServer", "NRMRFPort");
+		if($dcmPort eq "") {
+			$dcmPort = getPort("Enter NR LAM Port", $gPortNumbers{3});
+		}
+		&writeConfigVal($configHash, "DCMServer", "NRMRFPort", "$dcmPort", false);
+		&writeConfigVal($configHash, "DCMServer", "NRMATLoadPath", "$gCdtPathNr", false);
+		-d $gCdtPathNr or system("$mkdirCmd -p $gCdtPathNr 2> /dev/null > /dev/null") ;
+		system("$chmodCmd -R 777 $gCdtPathNr 2> /dev/null > /dev/null");
+
+		&writeConfigVal($configHash, "PBManager", "NRPSDPath", sprintf("%s/", $gPsdPathNr), false);
+		-d $gPsdPathNr or system("$mkdirCmd -p $gPsdPathNr 2> /dev/null > /dev/null") ;
+		system("$chmodCmd -R 777 $gPsdPathNr 2> /dev/null > /dev/null");
+
+		&writeConfigVal($configHash, "DCMServer", "NRMATFileName", $cdtFileNr, false);
+	}
+
+	if (($gLdsSstDetail{'Mode'} =~ /GSM/) || ($lrdpresent == true && $ratPresent =~ /GSM/) || $gLdsSstDetail{'Mode'} =~ /LTE/) {
+		&writeConfigVal($configHash, "DCMServer", "GSMMATFileName", $cdtFileGsm, false);
+	}
+
+	if (($gLdsSstDetail{'Mode'} =~ /UMTS/) || ($lrdpresent == true && $ratPresent =~ /UMTS/) || $gLdsSstDetail{'Mode'} =~ /LTE/) {
+		&writeConfigVal($configHash, "DCMServer", "UMTSMATFileName", $cdtFileUmts, false);
+	}
+
+	if ($gLdsSstDetail{'Mode'} =~ /LTE/ || ($pmpresent == true && $ratPresent =~ /LTE/)) {
+		&writeConfigVal($configHash, "DCMServer", "LTEMATFileName", $cdtFileLte, false);
+	}
+
+	if ($gLdsSstDetail{'Mode'} =~ /NR/ || ($pmpresent == true && $ratPresent =~ /NR/)) {
+		&writeConfigVal($configHash, "DCMServer", "NRMATFileName", $cdtFileNr, false);
+	}
+
+	&delParam($configHash, "DCMServer", "MATLoadPath");
+
+	if($lrdpresent == true) {
+		my $siteLicPathGsm	= "$gBasePath/SITELIC/GSM/";
+		my $siteLicPathUmts	= "$gBasePath/SITELIC/UMTS/";
+
+		if ($ratPresent =~ /GSM/) {
+			-d $siteLicPathGsm or system("$mkdirCmd -p $siteLicPathGsm 2> /dev/null > /dev/null") ;
+			system("$chmodCmd -R 777 $siteLicPathGsm 2> /dev/null > /dev/null");
+			&writeConfigVal($configHash, "LRD", "GSM_LicenseFilePath", $siteLicPathGsm, false);
+		}
+
+		if ($ratPresent =~ /UMTS/) {
+			-d $siteLicPathUmts or system("$mkdirCmd -p $siteLicPathUmts 2> /dev/null > /dev/null") ;
+			system("$chmodCmd -R 777 $siteLicPathUmts 2> /dev/null > /dev/null");
+			&writeConfigVal($configHash, "LRD", "UMTS_LicenseFilePath", $siteLicPathUmts, false);
+		}
+
+		&writeConfigVal($configHash, "LRD", "SiteLicensingPollTime", "60", false);
+		if($gUsingVMware == true) {
+			&writeConfigVal($configHash, "LRD", "CNAppConnDownForFailover", "-1", true);
+			&writeConfigVal($configHash, "LRD", "CNAppConnDownFailureCnt", "-1", true);
+			&writeConfigVal($configHash, "LRD", "CNAppConnDownFailureDuration", "-1", true);
+
+			&writeConfigVal($configHash, "LRD", "TransactionFailureForFailover", "-1", true);
+			&writeConfigVal($configHash, "LRD", "TransactionFailureFailureCnt", "-1", true);
+			&writeConfigVal($configHash, "LRD", "TransactionFailureFailureDuration", "-1", true);
+			&writeConfigVal($configHash, "LRD", "MinTransFailureCount", "-1", true);
+
+
+		} else {
+			&writeConfigVal($configHash, "LRD", "CNAppConnDownForFailover", "5", false);
+			&writeConfigVal($configHash, "LRD", "CNAppConnDownFailureCnt", "3", false);
+			&writeConfigVal($configHash, "LRD", "CNAppConnDownFailureDuration", "10", false);
+
+			&writeConfigVal($configHash, "LRD", "TransactionFailureForFailover", "5", false);
+			&writeConfigVal($configHash, "LRD", "TransactionFailureFailureCnt", "-1", false);
+			&writeConfigVal($configHash, "LRD", "TransactionFailureFailureDuration", "60", false);
+			&writeConfigVal($configHash, "LRD", "MinTransFailureCount", "5", false);
+		}
+	}
+
+	if($pmpresent == true) {
+		my $siteLicPathLte	= "$gBasePath/SITELIC/LTE/";
+
+		if ($ratPresent =~ /LTE/) {
+			-d $siteLicPathLte or system("$mkdirCmd -p $siteLicPathLte 2> /dev/null > /dev/null") ;
+			system("$chmodCmd -R 777 $siteLicPathLte 2> /dev/null > /dev/null");
+			&writeConfigVal($configHash, "LDSPM", "LTE_LicenseFilePath", $siteLicPathLte, false);
+		}
+
+		my $siteLicPathNr	= "$gBasePath/SITELIC/NR/";
+		if ($ratPresent =~ /NR/) {
+			-d $siteLicPathNr or system("$mkdirCmd -p $siteLicPathNr 2> /dev/null > /dev/null") ;
+			system("$chmodCmd -R 777 $siteLicPathNr 2> /dev/null > /dev/null");
+			&writeConfigVal($configHash, "LDSPM", "NR_LicenseFilePath", $siteLicPathNr, false);
+		}
+
+		&writeConfigVal($configHash, "LDSPM", "SiteLicensingPollTime", "60", false);
+		if($gUsingVMware == true) {
+			&writeConfigVal($configHash, "LRD", "CNAppConnDownForFailover", "-1", true);
+			&writeConfigVal($configHash, "LRD", "CNAppConnDownFailureCnt", "-1", true);
+			&writeConfigVal($configHash, "LRD", "CNAppConnDownFailureDuration", "-1", true);
+
+			&writeConfigVal($configHash, "LRD", "TransactionFailureForFailover", "-1", true);
+			&writeConfigVal($configHash, "LRD", "TransactionFailureFailureCnt", "-1", true);
+			&writeConfigVal($configHash, "LRD", "TransactionFailureFailureDuration", "-1", true);
+			&writeConfigVal($configHash, "LRD", "MinTransFailureCount", "-1", true);
+
+
+		} else {
+			&writeConfigVal($configHash, "LRD", "CNAppConnDownForFailover", "5", false);
+			&writeConfigVal($configHash, "LRD", "CNAppConnDownFailureCnt", "3", false);
+			&writeConfigVal($configHash, "LRD", "CNAppConnDownFailureDuration", "10", false);
+
+			&writeConfigVal($configHash, "LRD", "TransactionFailureForFailover", "5", false);
+			&writeConfigVal($configHash, "LRD", "TransactionFailureFailureCnt", "-1", false);
+			&writeConfigVal($configHash, "LRD", "TransactionFailureFailureDuration", "60", false);
+			&writeConfigVal($configHash, "LRD", "MinTransFailureCount", "5", false);
+		}
+	}
+
+	if($gUsingVMware == true) {
+		&writeConfigVal($configHash, "LamFailOverParams", "LAMConnDownForFailover", "-1", true);
+		&writeConfigVal($configHash, "LamFailOverParams", "LAMConnDownFailureCnt", "-1", true);
+		&writeConfigVal($configHash, "LamFailOverParams", "LAMConnDownFailureDuration", "-1", true);
+	} else {
+		&writeConfigVal($configHash, "LamFailOverParams", "LAMConnDownForFailover", "3600", false);
+		&writeConfigVal($configHash, "LamFailOverParams", "LAMConnDownFailureCnt", "2", false);
+		&writeConfigVal($configHash, "LamFailOverParams", "LAMConnDownFailureDuration", "10", false);
+	}
+
+	&delParam($configHash, "LRD", "MasterLRD");
+	&delParam($configHash, "LRD", "LrdNodeIPPorts");
+	&delParam($configHash, "LRD", "CoverageLicenseFile");
+	&delParam($configHash, "LRD", "GuiListenPort");
+	&delParam($configHash, "LRD", "GuiListenIP");
+	&delParam($configHash, "CallMgr", "MeasurementReportTime");
+	&delParam($configHash, "CallMgr", "MinimumTimeForPAReq");
+
+	&delParam($configHash, "CallMgr", "RTTInfoType1RequiredFlagForEcid");
+	&delParam($configHash, "CallMgr", "RTTInfoType2RequiredFlagForEcid");
+	&delParam($configHash, "CallMgr", "PathLossRequiredFlagForEcid");
+	&delParam($configHash, "CallMgr", "CPICH_RSCPRequiredFlagForEcid");
+	&delParam($configHash, "CallMgr", "CPICH_ECN0RequiredFlagForEcid");
+
+	&delParam($configHash, "CallMgr", "RTTInfoType1RequiredFlagForWls");
+	&delParam($configHash, "CallMgr", "RTTInfoType2RequiredFlagForWls");
+	&delParam($configHash, "CallMgr", "PathLossRequiredFlagForWls");
+	&delParam($configHash, "CallMgr", "CPICH_RSCPRequiredFlagForWls");
+	&delParam($configHash, "CallMgr", "CPICH_ECN0RequiredFlagForWls");
+}
+
+sub prgwInstall($$$) {
+	my $sstrec = shift;
+	my $releaseDir = shift;
+	my $licconfig = shift;
+	
+	
+	-d $gCdtPathGsm or system("$mkdirCmd -p $gCdtPathGsm 2> /dev/null > /dev/null") ;
+	system("$chmodCmd -R 777 $gCdtPathGsm 2> /dev/null > /dev/null");
+	system("$cpCmd $gCdtPath/*_GSM_CDT.txt $gCdtPathGsm 2> /dev/null > /dev/null");
+
+	-d $gCdtPathUmts or system("$mkdirCmd -p $gCdtPathUmts 2> /dev/null > /dev/null") ;
+	system("$chmodCmd -R 777 $gCdtPathUmts 2> /dev/null > /dev/null");
+
+	-d $gCdtPathLte or system("$mkdirCmd -p $gCdtPathLte 2> /dev/null > /dev/null") ;
+	system("$chmodCmd -R 777 $gCdtPathLte 2> /dev/null > /dev/null");
+	
+	-d $gCdtPathNr or system("$mkdirCmd -p $gCdtPathNr 2> /dev/null > /dev/null") ;
+	system("$chmodCmd -R 777 $gCdtPathNr 2> /dev/null > /dev/null");
+	
+	System("$rmCmd  $gLogsDirPath/EventsToBeSet*", 0, "Could not remove: $gLogsDirPath/EventsToBeSet");
+	System("$rmCmd  $gLogsDirPath/OnGoingEvents*", 0, "Could not remove: $gLogsDirPath/EventsToBeSet");
+}
+
+
+sub updCmConfig($$$$) {
+	my $configHash = shift;
+	my $licConfig = shift;
+	my $pmConfig = shift;
+	my $cmConfig = shift;
+	my $pmpresent = shift;
+	my $rat = shift;
+	my @locMthds = ( "HYBRID", "AGPS", "WLS", "OTDOA", "WLAN", "ECID", "CID" );
+	if($rat eq "NR") {
+		@locMthds = ( "AGPS", "WLS", "ECID", "CID" );
+	}
+	my $secnames = &getSectionPararms($licConfig, "SECTIONS");
+	foreach my $secname (@{$secnames}) {
+		if($secname->{'name'} =~ /^LDS_${rat}/) {
+			my $secNameUser = $secname->{'name'};
+			if($secNameUser eq "LDS_${rat}_POLARIS_SETTINGS") {
+				if($pmpresent == true) {
+					&writeConfigVal($configHash, "LDS_ABR_CFG_${rat}", "", "", false);
+				}
+				# no other rat level parameter
+				next;
+			}
+
+			$secNameUser =~ s/POLARIS/USER/g;
+
+			if($secNameUser =~ /_LICENSE_/) {
+				#consider only polaris settings for now
+				next;
+			}
+
+			my $clientBased = true;
+			foreach my $locMthd (@locMthds) {
+				if($secNameUser =~ /$locMthd/) {
+					$clientBased = false;
+					last;
+				}
+			}
+
+			my $massDirect = false;
+			if($secNameUser =~ /_MASSDIRECT_/) {
+				$massDirect = true;
+			}
+
+			if($clientBased == true) {
+				if($massDirect == false) {
+					# moved to SGW, Nothing needed for LDS now
+				}
+				next;
+			}
+
+			my $fieldCnt = () = $secNameUser =~ /_/g;
+			if($fieldCnt != 5) {
+				next;
+			}
+
+			my $secPrefix;
+			if($secNameUser =~ m/(.*?)_USER_SETTINGS/) {
+				$secPrefix = $1;
+			}
+
+			if($pmConfig == true) {
+				if($massDirect == false) {
+					if($rat eq "LTE") {
+						&writeConfigVal($configHash, $secNameUser, "UBP-LPPE_StartTime", "0", false);
+						&writeConfigVal($configHash, $secNameUser, "UBP-LPPE_Duration", "24000", false);
+					}
+				}
+			}
+			if($secNameUser =~ /ECID/) {
+				if($pmConfig == true) {
+					if($massDirect == false) {
+						if($rat eq "LTE") {
+							&writeConfigVal($configHash, $secNameUser, "ECID-LPPa_StartTime", "0", false);
+							&writeConfigVal($configHash, $secNameUser, "ECID-LPPa_Duration", "24000", false);
+							&writeConfigVal($configHash, $secNameUser, "ECID-LPP_StartTime", "0", false);
+							&writeConfigVal($configHash, $secNameUser, "ECID-LPP_Duration", "5000", false);
+						} else {
+							&writeConfigVal($configHash, $secNameUser, "ECID-NRPPa_StartTime", "0", false);
+							&writeConfigVal($configHash, $secNameUser, "ECID-NRPPa_Duration", "24000", false);
+						}
+					}
+				}
+				if($cmConfig == true) {
+					&delParam($configHash, $secNameUser, "ECID-LPPa_MinMRs");
+					if($rat eq "LTE") {
+						&writeConfigVal($configHash, $secNameUser, "ECID-LPP_MinMRs", "1", false);
+					} else {
+						&writeConfigVal($configHash, $secNameUser, "ECID-NRPPa_MinMRs", "1", false);
+					}
+				}
+				my $fbSec = sprintf("%s_CID_USER_SETTINGS", $secPrefix);
+				&delParam($configHash, $fbSec, "ComputationDuration", "100", false);
+
+			} elsif($secNameUser =~ /CID/) {
+				&delParam($configHash, $secNameUser, "ComputationDuration", "100", false);
+			} elsif($secNameUser =~ /WLS/) {
+				if($pmConfig == true) {
+					if($massDirect == false) {
+						if($rat eq "LTE") {
+							&writeConfigVal($configHash, $secNameUser, "ECID-LPPa_StartTime", "0", false);
+							&writeConfigVal($configHash, $secNameUser, "ECID-LPPa_Duration", "24000", false);
+							&writeConfigVal($configHash, $secNameUser, "ECID-LPP_StartTime", "0", false);
+							&writeConfigVal($configHash, $secNameUser, "ECID-LPP_Duration", "5000", false);				
+							if($secNameUser =~ /_WLS_/) {
+								&writeConfigVal($configHash, $secNameUser, "IRAT-LPPa_StartTime", "0", false);
+								&writeConfigVal($configHash, $secNameUser, "IRAT-LPPa_Duration", "24000", false);
+							}
+						} else {
+							&writeConfigVal($configHash, $secNameUser, "ECID-NRPPa_StartTime", "0", false);
+							&writeConfigVal($configHash, $secNameUser, "ECID-NRPPa_Duration", "24000", false);
+						}
+					}
+				}
+
+				if($cmConfig == true) {
+					my $fbSec = sprintf("%s_ECID_USER_SETTINGS",$secPrefix);
+					#  WLS_ECID combination is not present in polaris settings
+					#  add this combination manually
+					&delParam($configHash, $fbSec, "ComputationDuration");
+					if($rat eq "LTE") {
+						&delParam($configHash, $fbSec, "ECID-LPPa_MinMRs");
+						&writeConfigVal($configHash, $fbSec, "ECID-LPP_MinMRs", "1", false);
+					} else {
+						&writeConfigVal($configHash, $fbSec, "ECID-NRPPa_MinMRs", "1", false);
+					}
+
+					$fbSec = sprintf("%s_CID_USER_SETTINGS",$secPrefix);
+					&delParam($configHash, $fbSec, "ComputationDuration");
+
+					&writeConfigVal($configHash, $secNameUser, "ComputationDuration", "3000", false);
+					&delParam($configHash, $secNameUser, "ECID-LPPa_MinMRs");
+					if($rat eq "LTE") {
+						&writeConfigVal($configHash, $secNameUser, "ECID-LPP_MinMRs", "1", false);
+					} else {
+						&writeConfigVal($configHash, $secNameUser, "ECID-NRPPa_MinMRs", "1", false);
+					}
+					if($massDirect == false) {
+						if($secNameUser =~ /_WLS_/) {
+							if($rat eq "LTE") {
+								&writeConfigVal($configHash, $secNameUser, "IRAT-LPPa_MinMRs", "1", false);
+							}
+						}
+					}
+				}
+			} elsif($secNameUser =~ /AGPS/ || $secNameUser =~ /HYBRID/ || $secNameUser =~ /AGPSUA/ || $secNameUser =~ /OTDOA/ || $secNameUser =~ /WLAN/) {
+				my $fbSec;
+				if($secNameUser =~ /AGPS/  || $secNameUser =~ /HYBRID/) {
+					$fbSec = $secNameUser;
+					if($secNameUser =~ /HYBRID/) {
+						$fbSec = sprintf("%s_AGPS_USER_SETTINGS",$secPrefix);
+					}
+					#use this later to migrate AGPS to AGPSUA
+					if($pmConfig == true) {
+						&writeConfigVal($configHash, $fbSec, "AGPS-LPP_StartTime", "0", false);
+						&writeConfigVal($configHash, $fbSec, "AGPS-LPP_LocationCalculationDuration", "24000", false);
+					}
+				}
+				#add hybrid later as adding of hybrid results into adding of AGPAUA by default
+				#if($secNameUser =~ /AGPSUA/ || $secNameUser =~ /HYBRID/) {
+				if($secNameUser =~ /AGPSUA/ ) {
+					$fbSec = $secNameUser;
+					if($secNameUser =~ /HYBRID/) {
+						$fbSec = sprintf("%s_AGPSUA_USER_SETTINGS",$secPrefix);
+					}
+					if($pmConfig == true) {
+						&writeConfigVal($configHash, $fbSec, "AGPSUA-LPP_StartTime", "0", false);
+						&writeConfigVal($configHash, $fbSec, "AGPSUA-LPP_LocationCalculationDuration", "24000", false);
+					}
+				}
+
+				#hybrid doesn't have otdoa as fallback
+				#if($secNameUser =~ /OTDOA/) {
+				if($secNameUser =~ /OTDOA/ || $secNameUser =~ /HYBRID/) {
+					$fbSec = $secNameUser;
+					if($secNameUser =~ /HYBRID/) {
+						$fbSec = sprintf("%s_OTDOA_USER_SETTINGS",$secPrefix);
+					} else {
+						if($cmConfig == true) {
+							&writeConfigVal($configHash, $secNameUser, "ComputationDuration", "3000", false);
+						}
+					}
+					if($pmConfig == true) {
+						# no OTDOA for now
+						#&writeConfigVal($configHash, $fbSec, "OTDOA-LPP_StartTime", "0", false);
+						#&writeConfigVal($configHash, $fbSec, "OTDOA-LPP_AssistanceDataDuration", "1000", false);
+						#&writeConfigVal($configHash, $fbSec, "OTDOA-LPP_LocationCalculationDuration", "24000", false);
+					}
+				}
+
+				if($secNameUser =~ /WLAN/ || $secNameUser =~ /HYBRID/) {
+					$fbSec =  $secNameUser;
+					if($secNameUser =~ /HYBRID/) {
+						$fbSec = sprintf("%s_WLAN_USER_SETTINGS",$secPrefix);
+					} else {
+						if($cmConfig == true) {
+							&writeConfigVal($configHash, $secNameUser, "ComputationDuration", "3000", false);
+						}
+					}
+
+					if($pmConfig == true) {
+						# no WLAN for now
+						#&writeConfigVal($configHash, $fbSec, "WLAN-LPPE_StartTime", "0", false);
+						#&writeConfigVal($configHash, $fbSec, "WLAN-LPPE_Duration", "24000", false);
+					}
+				}
+
+				my $fbSec = sprintf("%s_CID_USER_SETTINGS", $secPrefix);
+				#&writeConfigVal($configHash, $fbSec, "ComputationDuration", "100", false);
+
+				if($secNameUser =~ /HYBRID/) {
+				# All WLS MPs are to be added for HYBID also apart from seperately for WLS
+					# ECID config for hybrid is removed
+					if($pmConfig == true) {
+						# &writeConfigVal($configHash, $secNameUser, "ECID-LPPa_StartTime", "0", false);
+						# &writeConfigVal($configHash, $secNameUser, "ECID-LPPa_Duration", "24000", false);
+						# &writeConfigVal($configHash, $secNameUser, "ECID-LPP_StartTime", "0", false);
+						# &writeConfigVal($configHash, $secNameUser, "ECID-LPP_Duration", "5000", false);
+					}
+					
+					if($cmConfig == true) {
+						# &writeConfigVal($configHash, $secNameUser, "ComputationDuration", "3000", false);
+						&delParam($configHash, $secNameUser, "ECID-LPPa_MinMRs");
+						# &writeConfigVal($configHash, $secNameUser, "ECID-LPP_MinMRs", "1", false);
+					}
+				}
+
+				if($secNameUser =~ /WLAN/  || $secNameUser =~ /OTDOA/ || $secNameUser =~ /AGPS/  || $secNameUser =~ /AGPSUA/ || $secNameUser =~ /HYBRID/) {
+				# add for ECID as fallback.
+					$fbSec = sprintf("%s_ECID_USER_SETTINGS", $secPrefix);
+						if($pmConfig == true) {
+							if($rat eq "LTE") {
+								&writeConfigVal($configHash, $fbSec, "ECID-LPPa_StartTime", "0", false);
+								&writeConfigVal($configHash, $fbSec, "ECID-LPPa_Duration", "24000", false);
+								&writeConfigVal($configHash, $fbSec, "ECID-LPP_StartTime", "0", false);
+								&writeConfigVal($configHash, $fbSec, "ECID-LPP_Duration", "5000", false);
+							} else {
+								&writeConfigVal($configHash, $fbSec, "ECID-NRPPa_StartTime", "0", false);
+								&writeConfigVal($configHash, $fbSec, "ECID-NRPPa_Duration", "24000", false);
+							}
+						}
+					
+					if($cmConfig == true) {
+						#&writeConfigVal($configHash, $fbSec, "ComputationDuration", "500", false);
+						&delParam($configHash, $fbSec, "ECID-LPPa_MinMRs");
+						if($rat eq "LTE") {
+							&writeConfigVal($configHash, $fbSec, "ECID-LPP_MinMRs", "1", false);
+						} else {
+							&writeConfigVal($configHash, $fbSec, "ECID-NRPPa_MinMRs", "1", false);
+						}
+					}
+				}
+
+				if($secNameUser =~ /AGPS/  || $secNameUser =~ /AGPSUA/ || $secNameUser =~ /HYBRID/) {
+				# add for WLS as fallback.
+					$fbSec = sprintf("%s_WLS_USER_SETTINGS", $secPrefix);
+					if($pmConfig == true) {
+						if($rat eq "LTE") {
+							&writeConfigVal($configHash, $fbSec, "ECID-LPPa_StartTime", "0", false);
+							&writeConfigVal($configHash, $fbSec, "ECID-LPPa_Duration", "24000", false);
+							&writeConfigVal($configHash, $fbSec, "ECID-LPP_StartTime", "0", false);
+							&writeConfigVal($configHash, $fbSec, "ECID-LPP_Duration", "5000", false);
+							&writeConfigVal($configHash, $fbSec, "IRAT-LPPa_StartTime", "0", false);
+							&writeConfigVal($configHash, $fbSec, "IRAT-LPPa_Duration", "24000", false);
+						} else {
+							&writeConfigVal($configHash, $fbSec, "ECID-NRPPa_StartTime", "0", false);
+							&writeConfigVal($configHash, $fbSec, "ECID-NRPPa_Duration", "24000", false);
+						}
+					}
+					if($cmConfig == true) {
+						&writeConfigVal($configHash, $fbSec, "ComputationDuration", "3000", false);
+						#&writeConfigVal($configHash, $fbSec, "ECID-LPPa_MinMRs", "1", false);
+						&delParam($configHash, $fbSec, "ECID-LPPa_MinMRs");
+						if($rat eq "LTE") {
+							&writeConfigVal($configHash, $fbSec, "ECID-LPP_MinMRs", "1", false);
+							&writeConfigVal($configHash, $fbSec, "IRAT-LPPa_MinMRs", "1", false);
+						} else {
+							&writeConfigVal($configHash, $fbSec, "ECID-NRPPa_MinMRs", "1", false);
+						}
+					}
+					if($rat eq "LTE") {
+						$fbSec = sprintf("%s_rWLS_USER_SETTINGS", $secPrefix);
+						if($pmConfig == true) {
+							&writeConfigVal($configHash, $fbSec, "ECID-LPPa_StartTime", "0", false);
+							&writeConfigVal($configHash, $fbSec, "ECID-LPPa_Duration", "24000", false);
+							&writeConfigVal($configHash, $fbSec, "ECID-LPP_StartTime", "0", false);
+							&writeConfigVal($configHash, $fbSec, "ECID-LPP_Duration", "5000", false);
+						}
+						if($cmConfig == true) {
+							&writeConfigVal($configHash, $fbSec, "ComputationDuration", "3000", false);
+							&delParam($configHash, $fbSec, "ECID-LPPa_MinMRs");
+							&writeConfigVal($configHash, $fbSec, "ECID-LPP_MinMRs", "1", false);
+						}
+					}
+				}
+			}
+		}
+	}	
+}
+
+
+sub AddAmountOfFileConfigs($$$$){
+	my $configHash = shift;
+	my $section = shift;
+	my $sstinstance = shift;
+	my $appinstance = shift;
+	
+	&writeConfigVal($configHash, $section, "AmountOfFilesAsConfigureDuration", "true", false);
+	&writeConfigVal($configHash, $section, "RemoveFileAfterProcessing", "true", false);				
+	my $arcPath = &getParam($configHash, $section, "ULArchivePath");			
+	#if ($arcPath eq ""){				
+	my $tmpPath = "$gBasePath/dump/UL"."_".$sstinstance."_".$appinstance;
+	#my $tmpPath = "$gBasePath/dump/UL"."_".$section;
+	$arcPath = $tmpPath . "/" . "Archive"."/";			
+	
+	&writeConfigVal($configHash, $section, "ULArchivePath", $arcPath, false);
+		
+	##Write entry to LogsManager
+	#$keyOpt = sprintf(".*%s.*bin", $licPrefix);
+	
+	##Bug 1044
+	#my $prgwInstSpecificSec = sprintf("PRGW_%d_%d", $sstinstance, $appinstance);
+	my $keyOpt =  sprintf("*__%s", $section);
+	
+	my $logFileOpt = sprintf("0,%s,%d,1", $arcPath, 7);
+	&writeConfigVal($configHash, "LogsManager", $keyOpt, $logFileOpt, true);
+	
+	-d $arcPath or system("$mkdirCmd -p $arcPath 2> /dev/null > /dev/null") ;
+	system("$chmodCmd -R 777 $arcPath 2> /dev/null > /dev/null");	
+}
+
+sub UpgradeLogsManagerForInnovileCIP($){
+	#my $rat = shift;
+	my $configHash = shift;
+	my @rats = ("GSM", "UMTS", "LTE");
+		
+	foreach my $rat (@rats){
+		my $oldKey = ".*" . $rat . ".*csv";
+		my $newKey = "*" . $rat . "*.csv";
+		my $LogsMngKeyVal = &getParam($configHash, "LogsManager", $newKey);
+		my $LogsMngOldKeyVal = &getParam($configHash, "LogsManager", $oldKey);
+		if($LogsMngKeyVal eq ""){
+			my $path = $gBasePath."/dump/UL/CIP/" . $rat . "/";
+			my $logFileOpt = sprintf("0,%s,%d,1", $path, 10);
+			&writeConfigVal($configHash, "LogsManager", $newKey, $logFileOpt, true);
+		}elsif($LogsMngOldKeyVal ne ""){
+			&writeConfigVal($configHash, "LogsManager", $newKey, $LogsMngOldKeyVal, true);
+			&delParam($configHash, "LogsManager", $oldKey);
+		}
+	}
+}
+
+sub AddCommonProblessParams($$){
+	my $configHash = shift;	
+	my $section = shift;
+	
+	my $key = &getParam($configHash, $section, "FetchQueueThresh");
+	if($key eq ""){
+		&writeConfigVal($configHash, $section, "FetchQueueThresh", "1000000", true);	
+	}	
+	$key = &getParam($configHash, $section, "FetchThreads");
+	if($key eq ""){
+		&writeConfigVal($configHash, $section, "FetchThreads", "10", true);	
+	}
+	$key = &getParam($configHash, $section, "ParserQueueThresh");
+	if($key eq ""){
+		&writeConfigVal($configHash, $section, "ParserQueueThresh", "100000", true);	
+	}	
+	$key = &getParam($configHash, $section, "ParserThreads");
+	if($key eq ""){
+		&writeConfigVal($configHash, $section, "ParserThreads", "10", true);	
+	}		
+}
+
+
+#PRGW 10.x Support
+sub PromptPrgwSpecificEntries($$$$){
+	my $configHash = shift;
+	my $sstinstance = shift;
+	my $appinstance = shift;	
+	my $licconfig = shift;
+	
+	my $prgwInstLmlSpecificSec = sprintf("PRGW:PRGWAgent:%d:%d", $sstinstance, $appinstance);
+	my $pllInstanceExist = &getParam($licconfig, "UL_INSTANCES", $prgwInstLmlSpecificSec);
+
+	my $prgwInstSpecificSec = sprintf("PRGW_%d_%d", $sstinstance, $appinstance);
+		
+	#my $domainSupported = &getParam($configHash, $prgwInstSpecificSec, "DomainSupported");
+	my $prgwName = &getParam($configHash, $prgwInstSpecificSec, "PrgwName");
+	
+	my $log_str = sprintf("SubSystem Id %d and PrgwAppId %d", $sstinstance, $appinstance);
+	my $isPLL=false;
+	my $isPGL=false;
+	my $isPUL=false;
+	my $isPNL=false;
+	if($pllInstanceExist ne "") {
+		my $licPrefix;
+		if ($pllInstanceExist eq "PGL") {
+			$licPrefix = "GSM";
+		} elsif ($pllInstanceExist eq "PUL") {
+			$licPrefix = "UMTS";
+		} elsif ($pllInstanceExist eq "PLL") {
+			&writeLteLeConfig($configHash);
+			$licPrefix = "LTE";
+		} elsif ($pllInstanceExist eq "PNL") {
+			&writeNrLeConfig($configHash);
+			$licPrefix = "NR";
+		}  
+		
+		##Bug 1033
+		&writeConfigVal($configHash, $prgwInstSpecificSec, "WorkerQueueThresh", "100000", false);	
+		&writeConfigVal($configHash, $prgwInstSpecificSec, "WorkerThreads", "8", false);	
+
+		&writeConfigVal($configHash, $prgwInstSpecificSec, "LRThreshold", "2000000", false);	
+	
+		my $keyOpt = sprintf(".*%s.*csv.gz", $licPrefix);
+
+		# replace CIP section if it exists
+		my $provider = "CIP";
+		my $sectionOld = "PRGW_".$licPrefix."_".$provider;
+		my $sectionNew = "PRGW_".$licPrefix."_".$provider."_NONMR";
+		&replaceSectionInIni($configHash, $sectionOld, $sectionNew);
+
+		#Bug 922 - LogsManager section for CIP
+		UpgradeLogsManagerForInnovileCIP($configHash);
+		
+		my $provider = &getParam($configHash, $prgwInstSpecificSec, "Providers");		
+		if($provider eq "CIP" || $provider eq "HUAWEI") {
+			# provider is already existing, which means its upgrade
+			my $section = "PRGW_".$licPrefix."_".$provider;
+			if($provider eq "HUAWEI") {
+				$section = $section."_MR";
+			} else {
+				$section = $section."_NONMR";
+			}
+			&replaceParamInIni($configHash, $prgwInstSpecificSec, $section, "ULLocalPath", "ULLocalPath");
+			my $path = &getParam($configHash, $section, "ULLocalPath");			
+			if ($path eq ""){				
+				$path = "$gBasePath/dump/UL"."_".$sstinstance."_".$appinstance;
+				-d $path or system("$mkdirCmd -p $path 2> /dev/null > /dev/null") ;
+				system("$chmodCmd -R 777 $path 2> /dev/null > /dev/null");				
+			} elsif($provider eq "HUAWEI") {	##Bug 1014
+				my $newpath = "$gBasePath/dump/UL"."_".$sstinstance."_".$appinstance;
+				-d $path or system("$mkdirCmd -p $path 2> /dev/null > /dev/null") ;
+				system("mv -f $path $newpath 2> /dev/null > /dev/null");
+				$path = $newpath;					
+			}
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, true);
+			# 10.2.1.X to 10.2.2.x upgrade specific code as paramters were in different section in 10.2.1
+			&replaceParamInIni($configHash, $prgwInstSpecificSec, $section, "ULProducerPath", "ULProducerPath");
+			&replaceParamInIni($configHash, $prgwInstSpecificSec, $section, "FileTransferMode", "FileTransferMode");
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+			
+			if($provider eq "HUAWEI") {
+				# these paramters are present on on Huawei to migrate
+				#&replaceParamInIni($configHash, $prgwInstSpecificSec, $section, "MRDuration", "100");
+				#&replaceParamInIni($configHash, $prgwInstSpecificSec, $section, "ULUserName", "ULUserName");
+				#&replaceParamInIni($configHash, $prgwInstSpecificSec, $section, "ULPassWord", "ULPassWord");
+				#&replaceParamInIni($configHash, $prgwInstSpecificSec, $section, "ULProducerIp", "ULProducerIp");
+				#&replaceParamInIni($configHash, $prgwInstSpecificSec, $section, "ULProducerPort", "ULProducerPort");			
+			} 
+		
+			else { 
+			##CIP
+				&replaceParamInIni($configHash, $prgwInstSpecificSec, $prgwInstSpecificSec, "Providers", "NonMRProviders");
+					##Commented - bug 922
+				# override new path for cleanup as well
+				#$keyOpt = sprintf(".*%s.*csv", $licPrefix);
+				#my $logFileOpt = sprintf("0,%s,%d,1", $path, 10);
+				#&writeConfigVal($configHash, "LogsManager", $keyOpt, $logFileOpt, true);
+			}
+		}
+		
+		my $path = "$gBasePath/dump/UL"."_".$sstinstance."_".$appinstance;		
+		-d $path or system("$mkdirCmd -p $path 2> /dev/null > /dev/null") ;
+		# BUG-902: commenting all change modes, as it takes log of time over nas. 
+		# On need selective directories can be added
+		#system("$chmodCmd -R 777 $path 2> /dev/null > /dev/null");			
+		my $section = "";
+		##Write Deletion entry to LogsManager section for the archived files.
+		##Bug 47556
+		#my $logFileOpt = sprintf("0,%s,%d,0", $path, 10);
+		#&writeConfigVal($configHash, "LogsManager", $keyOpt, $logFileOpt, false);		
+
+		if ($pllInstanceExist eq "PLL" || $pllInstanceExist eq "PUL" || $pllInstanceExist eq "PGL" 
+				|| $pllInstanceExist eq "PNL") {
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "MinMrForEcid", "1", false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "MinMrForWls", "1", false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "MinMrForRwls", "1", false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "SchedulerTps", "200", false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "SchedulerTpsRwls", "200", false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "LocationSessionContextDuration", "30", false);					
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "DeterminedLocMandatory", "true", false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "EcidLmEnabled", "true", false);
+			&replaceParamInIni($configHash, $prgwInstSpecificSec, $prgwInstSpecificSec, "MultipleLocationPerSession", "LocateAllSessCtx");
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "LocateAllSessCtx", "true", false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "LocateFirstSessCtxOnly", "true", false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "PraWaitDuration", "2", false);					
+					
+			# There is common PLL for CIP also, so this parameter is always added
+			my $licpath	= "$gBasePath/SITELIC/$licPrefix/";
+			-d $licpath or system("$mkdirCmd -p $licpath 2> /dev/null > /dev/null") ;
+			system("$chmodCmd -R 777 $licpath 2> /dev/null > /dev/null");
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "${licPrefix}_LicenseFilePath", $licpath, false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "SiteLicensingPollTime", "60", false);
+			
+			if ($pllInstanceExist eq "PLL" || $pllInstanceExist eq "PUL") {
+				$section  = "PRGW_".$licPrefix."_ERICSSON_MR";	
+				&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+				&writeConfigVal($configHash, $section, "MRDuration", "500", false);
+				&writeConfigVal($configHash, $section, "EventTimestampUtc", "true", false);
+				&writeConfigVal($configHash, $section, "FileEndCheck", "false", false);
+				&writeConfigVal($configHash, $section, "FileEndSuffix", "bin.gz", false);
+				&writeConfigVal($configHash, $section, "FileRejectionEnabled", "false", false);
+				&writeConfigVal($configHash, $section, "FileRejectionKey", "=5G,", false);
+			}
+			
+			if ($pllInstanceExist eq "PLL") {
+				&writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+				&writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);
+				&writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);	
+				&writeConfigVal($configHash, $section, "SessOffsetDuration", "1", false);
+				&writeConfigVal($configHash, "PRGW", "NoOfWorkerThreads", "1", false);
+				&writeConfigVal($configHash, $prgwInstSpecificSec, "ProbeImsiMapInstance", "16", false);
+				&delParam($configHash, $prgwInstSpecificSec, "ImsiMapCopyInterval");
+				&writeConfigVal($configHash, $section, "TcpListenIp", "127.0.0.1", false);
+				&writeConfigVal($configHash, $section, "TcpServerPort", "0", false);
+				&writeConfigVal($configHash, $section, "TcpEventWaitDuration", "30", false);
+			}
+			if ($pllInstanceExist eq "PLL" || $pllInstanceExist eq "PUL") {
+				AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);
+				##Bug 1033
+				AddCommonProblessParams($configHash, $section);			
+				my $ulsection = "";
+				$ulsection = $section."_SERVER";
+				&copyULConfigFromLegacy($configHash, $section,$ulsection);
+				&writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+				&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+			}
+
+			if ($pllInstanceExist eq "PUL") {
+				&writeConfigVal($configHash, "MASS_DIRECT_UMTS_NUM_NBR","UmtsNumNbr", 32, false);
+
+				&writeConfigVal($configHash, $section, "PLMN_MCC", "424", false);
+				&writeConfigVal($configHash, $section, "PLMN_MNC", "02", false);
+				&writeConfigVal($configHash, $section, "RncKeyStartTag", "_SubNetwork=", false);
+				&writeConfigVal($configHash, $section, "RncKeyEndTag", ",MeContext", false);
+				&writeConfigVal($configHash, $section, "UseNeNameForFetchRouting", "true", false);
+                &writeConfigVal($configHash, $section, "OffsetTime", "1", false);
+
+                $section  = "PRGW_".$licPrefix."_ERICSSON_NONMR";
+                my $ulsection = "";
+                $ulsection = $section."_SERVER";
+                &copyULConfigFromLegacy($configHash, $section,$ulsection);
+                &writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+                &writeConfigVal($configHash, $section, "EventTimestampUtc", "true", false);
+                &writeConfigVal($configHash, $section, "FileEndCheck", "false", false);
+                &writeConfigVal($configHash, $section, "FileEndSuffix", "bin.gz", false);
+                &writeConfigVal($configHash, $section, "FileRejectionEnabled", "false", false);
+                &writeConfigVal($configHash, $section, "FileRejectionKey", "=5G,", false);
+                AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);
+                ##Bug 1033
+                AddCommonProblessParams($configHash, $section);
+                &writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+                &writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+                &writeConfigVal($configHash, $section, "PLMN_MCC", "424", false);
+                &writeConfigVal($configHash, $section, "PLMN_MNC", "02", false);
+                &writeConfigVal($configHash, $section, "RncKeyStartTag", "_SubNetwork=", false);
+                &writeConfigVal($configHash, $section, "RncKeyEndTag", ",MeContext", false);
+                &writeConfigVal($configHash, $section, "UseNeNameForFetchRouting", "true", false);
+                &writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);
+                &writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+                &writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);
+                &writeConfigVal($configHash, $section, "OffsetTime", "1", false);
+				
+				$section  = "PRGW_".$licPrefix."_HUAWEIRNC_MR";			
+				my $ulsection = "";
+				$ulsection = $section."_SERVER";
+				&copyULConfigFromLegacy($configHash, $section,$ulsection);	
+				&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);										
+				&writeConfigVal($configHash, $section, "EventTimestampUtc", "true", false);
+				&writeConfigVal($configHash, $section, "RncKeyStartTag", "", false);
+				&writeConfigVal($configHash, $section, "RncKeyEndTag", "_[PCHR]", false);	
+				&writeConfigVal($configHash, $section, "MRDuration", "500", false);
+				&writeConfigVal($configHash, $section, "Domain", "invalid", false);
+				&writeConfigVal($configHash, $section, "ReleaseToProcess", "false", false);
+				&writeConfigVal($configHash, $section, "SupportedMainVersion", "V900R019:13,V900R020:13,V900R021:13,V900R022:13,V100R019:17,V100R020:17,V100R021:17,V100R022:17", false);
+				&writeConfigVal($configHash, $section, "SessOffsetDuration", "0", false);
+				#HP4, HP5 and HP6	
+				&writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+				&writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);
+				&writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);				
+				&writeConfigVal($configHash, $section, "IsFileCompressed", "false", false);
+				&writeConfigVal($configHash, $section, "FileCompressedSuffix", "zip", false);
+				&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+				&writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+				AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);	
+										
+				##Bug 1033
+				AddCommonProblessParams($configHash, $section);
+			
+				$section  = "PRGW_".$licPrefix."_HUAWEIRNC_NONMR";			
+				my $ulsection = "";
+				$ulsection = $section."_SERVER";
+				&copyULConfigFromLegacy($configHash, $section,$ulsection);	
+				&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);										
+				&writeConfigVal($configHash, $section, "EventTimestampUtc", "true", false);
+				&writeConfigVal($configHash, $section, "RncKeyStartTag", "", false);
+				&writeConfigVal($configHash, $section, "RncKeyEndTag", "_[PCHR]", false);					
+				&writeConfigVal($configHash, $section, "Domain", "invalid", false);
+				&writeConfigVal($configHash, $section, "ReleaseToProcess", "false", false);
+				&writeConfigVal($configHash, $section, "SupportedMainVersion", "V900R019:13,V900R020:13,V900R021:13,V900R022:13,V100R019:17,V100R020:17,V100R021:17,V100R022:17", false);				
+				#HP4, HP5 and HP6	
+				&writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+				&writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);
+				&writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);				
+				&writeConfigVal($configHash, $section, "IsFileCompressed", "false", false);
+				&writeConfigVal($configHash, $section, "FileCompressedSuffix", "zip", false);
+				&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+				&writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+				AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);
+				
+				##Bug 1033
+				AddCommonProblessParams($configHash, $section);
+				
+				$section  = "PRGW_".$licPrefix."_HUAWEIU2000_MR";	
+				$ulsection = $section."_SERVER";
+				&copyULConfigFromLegacy($configHash, $section,$ulsection);
+				&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+				&delParam($configHash, $section, "EventTimestampUtc");				
+				&writeConfigVal($configHash, $section, "NeKeyStartTag", "", false);
+				&writeConfigVal($configHash, $section, "NeKeyEndTag", "_", false);				
+				&writeConfigVal($configHash, $section, "MRDuration", "500", false);														
+				&writeConfigVal($configHash, $section, "SessOffsetDuration", "0", false);	
+				#HP4, HP5 and HP6					
+				&writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+				&writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);	
+				&writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);			
+				&writeConfigVal($configHash, $section, "IsFileCompressed", "false", false);
+				&writeConfigVal($configHash, $section, "FileCompressedSuffix", "zip", false);
+				&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+				&writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+				AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);
+				
+				##Bug 1033
+				AddCommonProblessParams($configHash, $section);
+				
+				$section  = "PRGW_".$licPrefix."_HUAWEIU2000_NONMR";				
+				$ulsection = $section."_SERVER";
+				&copyULConfigFromLegacy($configHash, $section,$ulsection);
+				&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+				&delParam($configHash, $section, "EventTimestampUtc");					
+				&writeConfigVal($configHash, $section, "NeKeyStartTag", "", false);
+				&writeConfigVal($configHash, $section, "NeKeyEndTag", "_", false);		
+				&writeConfigVal($configHash, $section, "Domain", "invalid", false);
+				&writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+				&writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);
+				&writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);				
+				&writeConfigVal($configHash, $section, "IsFileCompressed", "false", false);
+				&writeConfigVal($configHash, $section, "FileCompressedSuffix", "zip", false);
+				&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+				&writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+				AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);
+				
+				##Bug 1033
+				AddCommonProblessParams($configHash, $section);
+			
+				$section = "PRGW_UMTS_NOKIA_MR";
+				my $oldSection = "PRGW_UMTS_NOKIA_NONMR";
+				my $secSz = getSectionSize($configHash, $oldSection);
+				if($secSz != 0){
+					&replaceSectionInIni($configHash, $oldSection, $section);
+				}
+				&writeConfigVal($configHash, $section, "ConnectAckWaitDuration", "5", false);
+				&writeConfigVal($configHash, $section, "MessageWaitDuration", "5", false);
+				&writeConfigVal($configHash, $section, "RncNameWaitTimeDuration", "5", false);
+				&writeConfigVal($configHash, $section, "ReconnectWaitDuration", "240", false);
+				&writeConfigVal($configHash, $section, "OffSetTime", "1", false);
+				&writeConfigVal($configHash, $section, "MRDuration", "500", false);
+								
+				##Bug 1033
+				AddCommonProblessParams($configHash, $section);
+				
+				$section = "PRGW_NOKIA_UMTS_TRACE_SERVER";
+				my $traceServUmts = "ip,port,version,mlc-id,mcc,mnc,rncId";
+				&writeConfigVal($configHash, $section, "syntax", $traceServUmts, true);				
+				
+			} elsif ($pllInstanceExist eq "PLL") {
+				&writeConfigVal($configHash, $section, "ENodeBKeyStartTag", "_SubNetwork=", false);
+				&writeConfigVal($configHash, $section, "ENodeBKeyEndTag", ",MeContext", false);	
+				$section  = "PRGW_".$licPrefix."_ERICSSON_NONMR";	
+				&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+				&writeConfigVal($configHash, $section, "EventTimestampUtc", "true", false);
+				&writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+				&writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);
+				&writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);	
+				&writeConfigVal($configHash, $section, "FileEndCheck", "false", false);
+				&writeConfigVal($configHash, $section, "FileEndSuffix", "bin.gz", false);
+				&writeConfigVal($configHash, $section, "FileRejectionEnabled", "false", false);
+				&writeConfigVal($configHash, $section, "FileRejectionKey", "=5G,", false);
+				&writeConfigVal($configHash, $section, "TcpListenIp", "127.0.0.1", false);
+				&writeConfigVal($configHash, $section, "TcpServerPort", "0", false);
+				&writeConfigVal($configHash, $section, "TcpEventWaitDuration", "30", false);
+				AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);
+				
+				##Bug 1033
+				AddCommonProblessParams($configHash, $section);
+				
+				&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+				my $ulsection = "";
+				$ulsection = $section."_SERVER";
+				&copyULConfigFromLegacy($configHash, $section,$ulsection);
+			}			
+		}
+
+		if ($pllInstanceExist eq "PLL") {
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "NonMRSource", "ProbeLess", false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "ImsiProviders", "HUAWEI:EVENT", false);				
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "ProbeKeyToImsiMap", "GUTI", false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "ProbeImsiKeyCapacity", "1000000", false);
+			
+			$section = "PRGW_LTE_HUAWEI_MR";					
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+			&writeConfigVal($configHash, $section, "MRDuration", "100", false);
+			&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+			my $ulsection = "";
+			$ulsection = $section."_SERVER";
+			&copyULConfigFromLegacy($configHash, $section,$ulsection);
+			&writeConfigVal($configHash, $section, "FileTransferDuration", "5", false);
+			&writeConfigVal($configHash, $section, "SessOffsetDuration", "1", false);
+
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+				
+			$section = "PRGW_LTE_HUAWEI_NONMR";
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+			&writeConfigVal($configHash, $section, "EventTimestampUtc", "true", false);
+			&writeConfigVal($configHash, $section, "TS_FORMAT", "ABSOLUTE", false);
+			&writeConfigVal($configHash, $section, "ENB_PLMN", "SEPARATE", false);
+			&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+			&writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+			my $ulsection = "";
+			$ulsection = $section."_SERVER";
+			&copyULConfigFromLegacy($configHash, $section,$ulsection);
+			
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+
+			$section  = "PRGW_".$licPrefix."_ERICSSONEBM_NONMR";
+            $ulsection = $section."_SERVER";
+            &copyULConfigFromLegacy($configHash, $section,$ulsection);
+            &writeConfigVal($configHash, $section, "EventTimestampUtc", "true", false);
+            &writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+            &writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+            &writeConfigVal($configHash, $section, "LteKeyStartTag", "_", false);
+            &writeConfigVal($configHash, $section, "LteKeyEndTag", "_", false);
+            AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);
+            &writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+            &writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);
+            &writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);
+            &writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+
+				
+			$section = "PRGW_LTE_HUAWEI_NONMR_EVENT_MAP";
+			&writeConfigVal($configHash, $section, "0x64", "IMSI_ATTACH:LTE_EPS_ATTACH", false);
+			&writeConfigVal($configHash, $section, "0x65", "IMSI_DETACH:LTE_EPS_DETACH", false);									
+			&writeConfigVal($configHash, $section, "0x66", "IMSI_DETACH:LTE_EPS_DETACH", false);									
+			&writeConfigVal($configHash, $section, "0x67", "LOCATION_UPDATE:LTE_TRACKING_AREA_UPDATE", false);
+			&writeConfigVal($configHash, $section, "0x71", "HO", false);
+			&writeConfigVal($configHash, $section, "0x72", "HO", false);
+			&writeConfigVal($configHash, $section, "0x73", "LTE_CE", false);
+			&writeConfigVal($configHash, $section, "0x74", "LTE_CE", false);
+			&writeConfigVal($configHash, $section, "0x77", "MO_SMS:LTE", false);
+			&writeConfigVal($configHash, $section, "0x78", "MT_SMS:LTE", false);
+			&writeConfigVal($configHash, $section, "0xFFFF1", "LOCATION_UPDATE:LTE_COMBINED_UPDATE", false);
+			&writeConfigVal($configHash, $section, "0xFFFF2", "IMSI_ATTACH:LTE_COMBINED_ATTACH", false);
+			&writeConfigVal($configHash, $section, "0xFFFF3", "IMSI_ATTACH:LTE_IMSI_ATTACH", false);
+			&writeConfigVal($configHash, $section, "0xFFFF4", "IMSI_DETACH:LTE_COMBINED_DETACH", false);									
+			&writeConfigVal($configHash, $section, "0xFFFF5", "IMSI_DETACH:LTE_IMSI_DETACH", false);									
+			&writeConfigVal($configHash, $section, "0xFFFF6", "MT_LR", false);									
+			&writeConfigVal($configHash, $section, "0xFFFF7", "LTE_CS", false);									
+			&writeConfigVal($configHash, $section, "0xFFFF8", "SMS_REPORT:LTE", false);									
+
+			$section = "PRGW_LTE_HUAWEI_NONMR_COLUMN_NUMBER";
+			&writeConfigVal($configHash, $section, "TIMESTAMP", "2", false);
+			&writeConfigVal($configHash, $section, "IMSI", "4", false);
+			&writeConfigVal($configHash, $section, "EVENTID", "6", false);
+			&writeConfigVal($configHash, $section, "CI", "60", false);
+			&writeConfigVal($configHash, $section, "ENBPLMN", "63", false);
+			&writeConfigVal($configHash, $section, "ENBID", "64", false);
+			&writeConfigVal($configHash, $section, "IMEISV", "88", false);
+			&writeConfigVal($configHash, $section, "MSISDN", "118", false);									
+
+			$section = "PRGW_LTE_HUAWEIBIN_NONMR";
+			&writeConfigVal($configHash, $section, "ULUserName", "lmluser", false);
+			&writeConfigVal($configHash, $section, "ULPassWord", "lmlpwd", false);
+			&writeConfigVal($configHash, $section, "ULProducerIp", "127.0.0.1", false);
+			&writeConfigVal($configHash, $section, "ULProducerPort", "22", false);					
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+			&writeConfigVal($configHash, $section, "FileTransferMode", "SFTP", false);
+			&writeConfigVal($configHash, $section, "ULProducerPath", "/Disk/ul", false);
+			&writeConfigVal($configHash, $section, "EventStart","123", false);									
+			&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+			&writeConfigVal($configHash, $section, "IsFileCompressed", "false", false);
+			&writeConfigVal($configHash, $section, "FileCompressedSuffix", "zip", false);
+			&writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+
+			$section = "PRGW_LTE_HUAWEIBIN_IMSI";
+			&writeConfigVal($configHash, $section, "ULUserName", "lmluser", false);
+			&writeConfigVal($configHash, $section, "ULPassWord", "lmlpwd", false);
+			&writeConfigVal($configHash, $section, "ULProducerIp", "127.0.0.1", false);
+			&writeConfigVal($configHash, $section, "ULProducerPort", "22", false);					
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+			&writeConfigVal($configHash, $section, "FileTransferMode", "SFTP", false);
+			&writeConfigVal($configHash, $section, "ULProducerPath", "/Disk/ul", false);
+			&writeConfigVal($configHash, $section, "EventStart","123", false);									
+			&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+			&writeConfigVal($configHash, $section, "IsFileCompressed", "false", false);
+			&writeConfigVal($configHash, $section, "FileCompressedSuffix", "zip", false);
+			&writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+	
+			
+			$section = "PRGW_LTE_HUAWEIBIN_NONMR_EVENT_MAP";
+			&writeConfigVal($configHash, $section, "0x03", "LTE_CE", false);
+			&writeConfigVal($configHash, $section, "0x04", "LTE_CE", false);									
+			&writeConfigVal($configHash, $section, "0x06", "IMSI_DETACH:LTE_EPS_DETACH", false);									
+			&writeConfigVal($configHash, $section, "0x07", "HO", false);
+			&writeConfigVal($configHash, $section, "0x08", "HO", false);
+			&writeConfigVal($configHash, $section, "0x09", "HO", false);
+			&writeConfigVal($configHash, $section, "0x0b", "LTE_CS", false);
+			&writeConfigVal($configHash, $section, "0x18", "IMSI_ATTACH:LTE_COMBINED_ATTACH", false);
+			&writeConfigVal($configHash, $section, "0x19", "LOCATION_UPDATE:LTE_COMBINED_UPDATE", false);
+			&writeConfigVal($configHash, $section, "0x20", "IMSI_DETACH:LTE_COMBINED_DETACH", false);
+			&writeConfigVal($configHash, $section, "0x23", "IMSI_DETACH:LTE_EPS_DETACH", false);
+			&writeConfigVal($configHash, $section, "0x24", "LOCATION_UPDATE:LTE_TRACKING_AREA_UPDATE", false);
+			&writeConfigVal($configHash, $section, "0x1a", "LOCATION_UPDATE:LTE_COMBINED_UPDATE", false);
+			&writeConfigVal($configHash, $section, "0x41", "MT_SMS:LTE", false);
+			&writeConfigVal($configHash, $section, "0xFF1", "IMSI_ATTACH:LTE_EPS_ATTACH", false);
+			&writeConfigVal($configHash, $section, "0xFF2", "IMSI_ATTACH:LTE_IMSI_ATTACH", false);
+			&writeConfigVal($configHash, $section, "0xFF3", "IMSI_DETACH:LTE_IMSI_DETACH", false);									
+			&writeConfigVal($configHash, $section, "0xFF4", "MT_LR", false);									
+			&writeConfigVal($configHash, $section, "0xFF5", "MO_SMS:LTE", false);									
+			&writeConfigVal($configHash, $section, "0xFF6", "SMS_REPORT:LTE", false);									
+
+			$section = "PRGW_LTE_HUAWEI_IMSI";
+			&writeConfigVal($configHash, $section, "ULUserName", "lmluser", false);		
+			&writeConfigVal($configHash, $section, "ULPassWord", "lmlpwd", false);
+			&writeConfigVal($configHash, $section, "ULProducerIp", "127.0.0.1", false);
+			&writeConfigVal($configHash, $section, "ULProducerPort", "22", false);
+			&writeConfigVal($configHash, $section, "FileTransferMode", "SFTP", false);
+			&writeConfigVal($configHash, $section, "EventTimestampUtc", "true", false);
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+			&writeConfigVal($configHash, $section, "MaxImsiKeySession", "1000000", false);
+			&writeConfigVal($configHash, $section, "ULProducerPath", "/Disk/ul", false);					
+			&writeConfigVal($configHash, $section, "OffsetTime", "0", false);					
+			&writeConfigVal($configHash, $section, "IsFileCompressed", "false", false);
+			&writeConfigVal($configHash, $section, "FileCompressedSuffix", "zip", false);
+			&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+			&writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+			
+			$section = "PRGW_LTE_ERICSSON_IMSI";
+			&writeConfigVal($configHash, $section, "ULUserName", "lmluser", false);
+			&writeConfigVal($configHash, $section, "ULPassWord", "lmlpwd", false);
+			&writeConfigVal($configHash, $section, "ULProducerIp", "127.0.0.1", false);
+			&writeConfigVal($configHash, $section, "ULProducerPort", "22", false);
+			&writeConfigVal($configHash, $section, "FileTransferMode", "SFTP", false);
+			&writeConfigVal($configHash, $section, "EventTimestampUtc", "true", false);
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+			&writeConfigVal($configHash, $section, "MaxImsiKeySession", "1000000", false);
+			&writeConfigVal($configHash, $section, "ULProducerPath", "/Disk/ul", false);
+			&writeConfigVal($configHash, $section, "OffsetTime", "1", false);					
+			&writeConfigVal($configHash, $section, "IsFileCompressed", "false", false);
+			&writeConfigVal($configHash, $section, "FileCompressedSuffix", "zip", false);
+			AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);
+			&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+			&writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+			&writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);
+			&writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);	
+			&writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+			&writeConfigVal($configHash, $section, "TcpListenIp", "127.0.0.1", false);
+			&writeConfigVal($configHash, $section, "TcpServerPort", "0", false);
+			&writeConfigVal($configHash, $section, "TcpEventWaitDuration", "30", false);
+			
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+			
+			$section = "PRGW_LTE_HUAWEI_IMSI_COLUMN_NUMBER";
+			&writeConfigVal($configHash, $section, "TIMESTAMP", "2", false);
+			&writeConfigVal($configHash, $section, "IMSI", "4", false);
+			&writeConfigVal($configHash, $section, "ENBPLMN", "63", false);
+			&writeConfigVal($configHash, $section, "ENBID", "64", false);
+			&writeConfigVal($configHash, $section, "ENODEBUES1APID", "67", false);
+			&writeConfigVal($configHash, $section, "IMEISV", "88", false);
+			&writeConfigVal($configHash, $section, "MSISDN", "118", false);									
+
+			$section = "PRGW_LTE_NOKIA_MR";
+			&writeConfigVal($configHash, $section, "ConnectAckWaitDuration", "5", false);
+			&writeConfigVal($configHash, $section, "MessageWaitDuration", "5", false);
+			&writeConfigVal($configHash, $section, "ReconnectWaitDuration", "240", false);
+			&writeConfigVal($configHash, $section, "MRDuration", "500", false);
+			&writeConfigVal($configHash, $section, "ImsiByTraceServer", "true", false);
+			&writeConfigVal($configHash, $section, "MRSupport", "true", false);
+			&writeConfigVal($configHash, $section, "NonMRSupport", "true", false);
+			
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+			
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+			
+			$section = "PRGW_NOKIA_LTE_TRACE_SERVER";
+			my $traceServLte = "ip,port,version,mlc-id";
+			&writeConfigVal($configHash, $section, "syntax", $traceServLte, true);
+						
+			$provider = "CIP";
+			$licPrefix = "LTE";
+			$section  = "PRGW_".$licPrefix."_".$provider."_NONMR";	
+			&writeConfigVal($configHash, $section, "FileTransferMode", "LOCAL", false);
+			&writeConfigVal($configHash, $section, "ULProducerPath", "/Disk/ul", false);
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+			
+			#print "Since this PRGW ($log_str) is PLL, Overiding the Domain Supported as LTE\n";
+
+			my $provider = &getParam($configHash, $prgwInstSpecificSec, "Providers");		
+			if($provider eq "HUAWEI_MR") {
+				&writeConfigVal($configHash, $prgwInstSpecificSec, "Providers", "HUAWEI", true);
+			}
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "Providers", "HUAWEI", false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "NonMRProviders", "", false); 
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "MessageServer", "", false);			
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "OffsetTime", "1", false);							
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "SshAsNonMRSource", "false", false);				
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "LRColumnToLog", "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23", false);
+			##Bug 2366
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "ULPollTimeToReadFile", "1", false);
+			$isPLL=true;
+		} elsif ($pllInstanceExist eq "PGL") {
+			$provider = "CIP";
+			$licPrefix = "GSM";
+			$section  = "PRGW_".$licPrefix."_".$provider."_NONMR";	
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "ImsiProviders", "HUAWEIU2000:EVENT", false);				
+			my $provider = &getParam($configHash, $prgwInstSpecificSec, "NonMRProviders");		
+			if($provider eq "CIP") {
+				# during upgrade if CIP is configured
+				&writeConfigVal($configHash, $prgwInstSpecificSec, "Providers", "", false);
+			} else {
+				&writeConfigVal($configHash, $prgwInstSpecificSec, "Providers", "HUAWEIU2000", false);
+			}
+			#Bug 368, 383
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "NonMRSource", "ProbeLess", false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "NonMRProviders", "HUAWEI", false);
+			&writeConfigVal($configHash, $section , "FileTransferMode", "LOCAL", false);
+			&writeConfigVal($configHash, $section, "ULProducerPath", "/Disk/ul", false);	
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+						
+			$section  = "PRGW_GSM_HUAWEI_NONMR";
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+			&writeConfigVal($configHash, $section, "EventTimestampUtc", "true", false);
+			&writeConfigVal($configHash, $section, "BscKeyStartTag", "", false);
+			&writeConfigVal($configHash, $section, "BscKeyEndTag", "_[GCHR]", false);
+			#Bug 369
+			&writeConfigVal($configHash, $section, "HuaweiBscNames", "", false);
+			&writeConfigVal($configHash, $section, "CellIdConfiguration", "Proprietary", false);
+			&writeConfigVal($configHash, $section, "ImeiLenConfiguration", "0", false);
+		#
+			#HP4, HP5 and HP6	
+			&writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+			&writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);			
+			&writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);	
+			&writeConfigVal($configHash, $section, "IsFileCompressed", "false", false);
+			&writeConfigVal($configHash, $section, "FileCompressedSuffix", "zip", false);			
+			&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+			AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+			#Multiple File server for 2G Huawei
+			my $ulsection = "";
+			$ulsection = $section."_SERVER";
+			&copyULConfigFromLegacy($configHash, $section,$ulsection);
+
+			$section  = "PRGW_GSM_HUAWEI_MR";
+			&writeConfigVal($configHash, $section, "MRDuration", "100", false);														
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+			&writeConfigVal($configHash, $section, "EventTimestampUtc", "true", false);
+			&writeConfigVal($configHash, $section, "BscKeyStartTag", "", false);
+			&writeConfigVal($configHash, $section, "BscKeyEndTag", "_[GCHR]", false);
+			#Bug 369
+			&writeConfigVal($configHash, $section, "HuaweiBscNames", "", false);
+			&writeConfigVal($configHash, $section, "CellIdConfiguration", "Proprietary", false);
+			&writeConfigVal($configHash, $section, "ImeiLenConfiguration", "0", false);
+			#HP4, HP5 and HP6	
+			&writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+			&writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);			
+			&writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);	
+			&writeConfigVal($configHash, $section, "IsFileCompressed", "false", false);
+			&writeConfigVal($configHash, $section, "FileCompressedSuffix", "zip", false);			
+			&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+			AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+			#Multiple File server for 2G Huawei
+			my $ulsection = $section."_SERVER";
+			&copyULConfigFromLegacy($configHash, $section,$ulsection);
+				
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "LRColumnToLog", "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21", false);
+			$section  = "PRGW_".$licPrefix."_HUAWEIU2000_MR";	
+			$ulsection = $section."_SERVER";
+			&copyULConfigFromLegacy($configHash, $section,$ulsection);
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+			##&writeConfigVal($configHash, $section, "EventTimestampUtc", "true", false);	
+			&delParam($configHash, $section, "EventTimestampUtc");					
+			&writeConfigVal($configHash, $section, "NeKeyStartTag", "", false);
+			&writeConfigVal($configHash, $section, "NeKeyEndTag", "_", false);
+			&writeConfigVal($configHash, $section, "MRDuration", "500", false);														
+			&writeConfigVal($configHash, $section, "SessOffsetDuration", "0", false);					
+			&writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+			&writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);			
+			&writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);	
+			&writeConfigVal($configHash, $section, "IsFileCompressed", "false", false);
+			&writeConfigVal($configHash, $section, "FileCompressedSuffix", "zip", false);
+			&writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+
+			&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+			AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);
+			AddCommonProblessParams($configHash, $section);
+
+			$section  = "PRGW_".$licPrefix."_HUAWEIU2000_NONMR";
+			$ulsection = $section."_SERVER";
+			&copyULConfigFromLegacy($configHash, $section,$ulsection);
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+			##&writeConfigVal($configHash, $section, "EventTimestampUtc", "true", false);
+			&delParam($configHash, $section, "EventTimestampUtc");					
+			&writeConfigVal($configHash, $section, "NeKeyStartTag", "", false);
+			&writeConfigVal($configHash, $section, "NeKeyEndTag", "_", false);
+			&writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+			&writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);
+			&writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);	
+			&writeConfigVal($configHash, $section, "IsFileCompressed", "false", false);
+			&writeConfigVal($configHash, $section, "FileCompressedSuffix", "zip", false);
+			&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+			&writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+			AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);
+			AddCommonProblessParams($configHash, $section);
+
+			$section = "PRGW_GSM_HUAWEIU2000_IMSI";
+			&writeConfigVal($configHash, $section, "ULUserName", "lmluser", false);		
+			&writeConfigVal($configHash, $section, "ULPassWord", "lmlpwd", false);
+			&writeConfigVal($configHash, $section, "ULProducerIp", "127.0.0.1", false);
+			&writeConfigVal($configHash, $section, "ULProducerPort", "22", false);
+			&writeConfigVal($configHash, $section, "FileTransferMode", "SFTP", false);
+			##&writeConfigVal($configHash, $section, "EventTimestampUtc", "true", false);
+			&delParam($configHash, $section, "EventTimestampUtc");					
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+			&writeConfigVal($configHash, $section, "ULProducerPath", "/Disk/ul", false);					
+			&writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+			&writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);
+			&writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);	
+			&writeConfigVal($configHash, $section, "IsFileCompressed", "false", false);
+			&writeConfigVal($configHash, $section, "FileCompressedSuffix", "zip", false);
+			&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+			&writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+			AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);
+
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+
+			$section  = "PRGW_GSM_ERICSSON_MR";
+			$ulsection = $section."_SERVER";
+			&copyULConfigFromLegacy($configHash, $section,$ulsection);
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+			&writeConfigVal($configHash, $section, "EventTimestampUtc", "true", false);
+			&writeConfigVal($configHash, $section, "NeKeyStartTag", ",MeContext=", false);
+			&writeConfigVal($configHash, $section, "NeKeyEndTag", ",ManagedElement", false);
+			&writeConfigVal($configHash, $section, "BscKeyStartTag", ",MeContext=", false);
+			&writeConfigVal($configHash, $section, "BscKeyEndTag", ",ManagedElement", false);
+			&writeConfigVal($configHash, $section, "SectorKeyStartTag", ",GeranCell=", false);
+			&writeConfigVal($configHash, $section, "SectorKeyEndTag", "", false);
+			&writeConfigVal($configHash, $section, "MRDuration", "500", false);
+			&writeConfigVal($configHash, $section, "SessOffsetDuration", "0", false);
+			&writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+			&writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);
+			&writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);
+			&writeConfigVal($configHash, $section, "FileCompressedSuffix", "zip", false);
+			&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+			&writeConfigVal($configHash, $section, "FileTransferDuration", "0", false);
+			&writeConfigVal($configHash, $section, "IMEIType", "Number", false);
+			AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);
+
+			$section  = "PRGW_E2G_COLUMN_NUMBER";
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_EVENTID", "2", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_MO_NAME", "3", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_TIME_STAMP", "4", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_MS_INDIVIDUAL", "18", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_TIMING_ADVANCE", "103", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_RXLVL_STRENGTH_DOWN", "108", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_REQUEST_TYPE", "188", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_TRAFFIC_CAUSE", "191", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_MSG_TYPE", "194", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_SERVICE_TYPE", "195", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_IMEI_TAC", "281", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_IMEI_FAC", "282", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_IMEI_SLR", "283", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_IMEI_SVN", "284", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_IMEI_NUMBER", "396", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_IMSI", "397", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_BSS_NBR_CELL1", "398", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_BSS_NBR_CELL2", "399", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_BSS_NBR_CELL3", "400", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_BSS_NBR_CELL4", "401", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_BSS_NBR_CELL5", "402", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_BSS_NBR_CELL6", "403", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_RXLVL_STRENGTH_CELL1", "197", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_RXLVL_STRENGTH_CELL2", "198", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_RXLVL_STRENGTH_CELL3", "199", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_RXLVL_STRENGTH_CELL4", "200", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_RXLVL_STRENGTH_CELL5", "201", false);
+			&writeConfigVal($configHash, $section, "E2G_COLUMN_RXLVL_STRENGTH_CELL6", "202", false);
+			##Bug 2366
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "ULPollTimeToReadFile", "5", false);
+
+
+			$isPGL=true;				
+		} elsif ($pllInstanceExist eq "PUL") {
+			$provider = "CIP";
+			$licPrefix = "UMTS";
+			$section  = "PRGW_".$licPrefix."_".$provider."_NONMR";	
+
+			my $provider = &getParam($configHash, $prgwInstSpecificSec, "NonMRProviders");		
+			if($provider eq "CIP") {
+				# during upgrade if CIP is configured
+				&writeConfigVal($configHash, $prgwInstSpecificSec, "Providers", "", false);
+			} else {
+				&writeConfigVal($configHash, $prgwInstSpecificSec, "Providers", "HUAWEIU2000", false);
+			}
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "NonMRSource", "ProbeLess", false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "MessageServer", "", false);	
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "NonMRProviders", "ERICSSON", false);
+			&writeConfigVal($configHash, $section, "FileTransferMode", "LOCAL", false);
+			&writeConfigVal($configHash, $section, "ULProducerPath", "/Disk/ul", false);
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+			##Bug 1033
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "LRColumnToLog", "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22", false);
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+			##Bug 2366
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "ULPollTimeToReadFile", "1", false);
+			
+			$isPUL=true;
+		} elsif ($pllInstanceExist eq "PNL") {
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "NonMRSource", "PNL", false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "ImsiProviders", "PROBE", false);				
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "ProbeImsiKeyCapacity", "1000000", false);
+			
+			$section = "PRGW_NR_HUAWEI_MR";					
+			&writeConfigVal($configHash, $section, "ULLocalPath", $path, false);
+			&writeConfigVal($configHash, $section, "MRDuration", "100", false);
+			&writeConfigVal($configHash, $section, "RemoveFileFromServer", "false", false);
+			&writeConfigVal($configHash, $section, "OffSetDuration", "0", false);
+			&writeConfigVal($configHash, $section, "MaxNumberOfReadPeriodicity", "1", false);
+			&writeConfigVal($configHash, $section, "InitialNumberOfReadPeriodicity", "1", false);				
+	        &writeConfigVal($configHash, $section, "NeKeyStartTag", "", false);
+            &writeConfigVal($configHash, $section, "NeKeyEndTag", "_", false);
+            &writeConfigVal($configHash, $section, "FileRejectionEnabled", "false", false);
+            &writeConfigVal($configHash, $section, "FileRejectionKey", "=5G,", false);
+            &writeConfigVal($configHash, $section, "FileNameSuffixCheck", "false", false);
+            &writeConfigVal($configHash, $section, "FileNameSuffix", "log.gz", false);
+            &writeConfigVal($configHash, $section, "CellIdLength", "14", false);
+            &writeConfigVal($configHash, $section, "ConfiguredMcc", "123", false);
+            &writeConfigVal($configHash, $section, "ConfiguredMnc", "456", false);
+			AddAmountOfFileConfigs($configHash, $section, $sstinstance, $appinstance);
+
+			my $ulsection = "";
+			$ulsection = $section."_SERVER";
+			&copyULConfigFromLegacy($configHash, $section,$ulsection);
+			&writeConfigVal($configHash, $section, "FileTransferDuration", "5", false);
+			&writeConfigVal($configHash, $section, "SessOffsetDuration", "1", false);
+
+			##Bug 1033
+			AddCommonProblessParams($configHash, $section);
+				
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "Providers", "HUAWEI", false);
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "NonMRProviders", "", false); 
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "MessageServer", "", false);			
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "OffsetTime", "1", false);							
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "SshAsNonMRSource", "true", false);				
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "LRColumnToLog", "1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21", false);
+			##Bug 2366
+			&writeConfigVal($configHash, $prgwInstSpecificSec, "ULPollTimeToReadFile", "1", false);
+			$isPNL=true;
+		} else {
+			next;
+		}
+		&writeConfigVal($configHash, $prgwInstSpecificSec, "PRGWType", $pllInstanceExist, false);
+			
+
+		#Bug 47615
+		&writeConfigVal($configHash, $prgwInstSpecificSec, "LocationRecordLog", "true", false);
+		&writeConfigVal($configHash, $prgwInstSpecificSec, "LocationRecordLogEvent", "true", false);
+		&writeConfigVal($configHash, $prgwInstSpecificSec, "LRTimeInUtc", "true", false);		
+		&writeConfigVal($configHash, $prgwInstSpecificSec, "ULNodeWriteDurMax", "5", false);
+		&writeConfigVal($configHash, $prgwInstSpecificSec, "ULFileEndEvtDelta", "-1", false);
+	}
+	#2011
+	&delParam($configHash, $prgwInstSpecificSec, "DomainSupported");				
+
+	if ($prgwName eq "") {	
+		if($isPLL) {
+			$prgwName = getInputString("Please Enter PLL name for [$log_str]");
+		}elsif($isPGL) {
+			$prgwName = getInputString("Please Enter PGL name for [$log_str]");
+		}elsif($isPUL) {
+			$prgwName = getInputString("Please Enter PUL name for [$log_str]");
+		}elsif($isPNL) {
+			$prgwName = getInputString("Please Enter PNL name for [$log_str]");
+		}else {
+			$prgwName = getInputString("Please Enter PRGW name for [$log_str]");
+		}
+		&writeConfigVal($configHash, $prgwInstSpecificSec, "PrgwName", $prgwName, false);
+			
+	}
+}
+
+sub writeDiaIni($$) {
+	my $currentRelPath = shift;
+    my $endFile = shift;
+    my %diaConfig = ();
+
+    &writeConfigVal(\%diaConfig, "AVP", "User-Name", "1,,,STRING,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Class", "25,,,OCTETSTR,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Host-IP-Address", "257,,,OCTETSTR,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Auth-Application-Id", "258,,,UINT32,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Acct-Application-Id", "259,,,UINT32,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Vendor-Specific-Application-Id", "260,,,GROUPED,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Session-Id", "263,,,STRING,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Origin-Host", "264,,,STRING,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Supported-Vendor-Id", "265,,,UINT32,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Vendor-Id", "266,,,UINT32,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Firmware-Revision", "267,,,UINT32,0", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Result-Code", "268,,,UINT32,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Product-Name", "269,,,STRING,0", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Disconnect-Cause", "273,,,INT32,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Auth-Session-State", "277,,,UINT32,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Origin-State-Id", "278,,,UINT32,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Failed-AVP", "279,,,GROUPED,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Error-Message", "281,,,STRING,0", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Route-Record", "282,,,STRING,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Destination-Realm", "283,,,STRING,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Proxy-Info", "284,,,OCTETSTR,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Re-Auth-Request-Type", "285,,,INT32,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Destination-Host", "293,,,STRING,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Termination-Cause", "295,,,INT32,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Origin-Realm", "296,,,STRING,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Experimental-Result", "297,,,GROUPED,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Experimental-Result-Code", "298,,,UINT32,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Inband-Security-Id", "299,,,UINT32,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "3GPP-AAA-Server-Name", "318,16777291,10415,STRING,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "User-Identity", "700,16777217,10415,GROUPED,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "MSISDN", "701,,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Data-Reference", "703,16777217,10415,INT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Requested-Domain", "706,16777217,10415,INT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Current-Location", "707,16777217,10415,INT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Requested-Nodes", "713,16777217,10415,UINT32,128", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Supported-Features", "628,16777217,10415,GROUPED,128", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Wildcarded-Public-Identity", "634,16777217,10415,STRING,128", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Wildcarded-IMPU", "636,16777217,10415,STRING,128", true);
+    &writeConfigVal(\%diaConfig, "AVP", "User-Data", "702,16777217,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "LCS-Format-Indicator", "1237,16777255,10415,INT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "LCS-Name-String", "1238,16777255,10415,STRING,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "LCS-Client-Type", "1241,16777255,10415,INT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Location-Estimate", "1242,16777255,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "GMLC-Number", "1474,16777291,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "SGSN-Number", "1489,16777291,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "LMSI", "2400,16777291,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Serving-Node", "2401,,10415,GROUPED,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "MME-Name", "2402,,10415,STRING,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "MSC-Number", "2403,,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "LCS-Capabilities-Sets", "2404,,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "GMLC-Address", "2405,,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Additional-Serving-Node", "2406,16777291,10415,GROUPED,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Horizontal-Accuracy", "2505,16777255,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "MME-Realm", "2408,,10415,STRING,128", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Location-Type", "2500,16777255,10415,INT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "LCS-EPS-Client-Name", "2501,16777255,10415,GROUPED,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "LCS-Priority", "2503,16777255,10415,INT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "LCS-QoS", "2504,16777255,10415,GROUPED,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Vertical-Accuracy", "2506,16777255,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "PPR-Address", "2407,16777291,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Vertical-Requested", "2507,16777255,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Response-Time", "2509,16777255,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Supported-GAD-Shapes", "2510,16777255,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Accuracy-Fulfilment-Indicator", "2513,16777255,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Age-Of-Location-Estimate", "2514,16777255,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Velocity-Estimate", "2415,16777291,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "EUTRAN-Positioning-Data", "2416,16777291,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "ECGI", "2417,16777291,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "LCS-Privacy-Check-Non-Session", "2521,16777255,10415,GROUPED,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "LCS-QoS-Class", "2523,16777255,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "LCS-Privacy-Check", "2512,16777255,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "EUTRAN-Positioning-Data", "2516,16777255,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "ECGI", "2517,16777255,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "SGSN-Name", "2409,16777291,10415,STRING,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "SGSN-Realm", "2410,16777291,10415,STRING,128", true);
+    &writeConfigVal(\%diaConfig, "AVP", "RIA-Flags", "2411,16777291,10415,UINT32,128", true);
+    &writeConfigVal(\%diaConfig, "AVP", "PLR-Flags", "2545,16777255,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "RAT-Type", "1032,16777251,10415,UINT32,128", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Subscription-Data", "1400,16777251,10415,GROUPED,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Terminal-Information", "1401,16777251,10415,GROUPED,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "IMEI", "1402,,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Software-Version", "1403,16777251,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "QoS-Subscribed", "1404,16777251,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "ULR-Flags", "1405,16777251,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "ULA-Flags", "1406,16777251,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Visited-PLMN-Id", "1407,16777251,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Requested-EUTRAN-Authentication-Info", "1408,16777251,10415,GROUPED,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Requested-UTRAN-GERAN-Authentication-Info", "1409,16777251,10415,GROUPED,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Number-Of-Requested-Vectors", "1410,16777251,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Re-Synchronization-Info", "1411,16777251,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Immediate-Response-Preferred", "1412,16777251,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Authentication-Info", "1413,16777251,10415,GROUPED,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "E-UTRAN-Vector", "1414,16777251,10415,GROUPED,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "UTRAN-Vector", "1415,16777251,10415,GROUPED,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Item-Number", "1419,16777251,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "NOR-Flags", "1443,16777251,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "RAND", "1447,16777251,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "XRES", "1448,16777251,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "AUTN", "1449,16777251,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "KASME", "1450,16777251,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "IDR-Flags", "1490,16777251,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "AIR-Flags", "1679,16777251,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "OC-Feature-Vector", "622,16777251,10415,UINT64,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "3GPP2-MEID", "1471,16777251,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "UE-SRVCC-Capability", "1615,16777251,10415,UINT32,128", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Feature-List-ID", "629,16777251,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Feature-List", "630,16777251,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Route-Record", "282,16777251,10415,OCTETSTR,64", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Subscriber-Status", "1424,16777251,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "ICS-Indicator", "1491,16777251,10415,UINT32,128", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Network-Access-Mode", "1417,16777251,10415,UINT32,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Framed-Compression", "13,,10415,UINT32,128", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Cell-Global-Identity", "1604,16777255,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Service-Area-Identity", "1607,16777255,10415,OCTETSTR,192", true);
+    &writeConfigVal(\%diaConfig, "AVP", "Location-Event", "2518,16777255,10415,UINT32,192", true);                              
+    &writeConfigVal(\%diaConfig, "AVP", "Pseudonym-Indicator", "2519,16777255,10415,UINT32,192", true);                         
+    &writeConfigVal(\%diaConfig, "AVP", "LCS-Service-Type-ID", "2520,16777255,10415,UINT32,192", true);                         
+    &writeConfigVal(\%diaConfig, "AVP", "GERAN-Positioning-Info", "2524,16777255,10415,GROUPED,192", true);                     
+    &writeConfigVal(\%diaConfig, "AVP", "GERAN-Positioning-Data", "2525,16777255,10415,OCTETSTR,192", true);                    
+    &writeConfigVal(\%diaConfig, "AVP", "GERAN-GANSS-Positioning-Data", "2526,16777255,10415,OCTETSTR,192", true);              
+    &writeConfigVal(\%diaConfig, "AVP", "UTRAN-Positioning-Info", "2527,16777255,10415,GROUPED,192", true);                     
+    &writeConfigVal(\%diaConfig, "AVP", "UTRAN-Positioning-Data", "2528,16777255,10415,OCTETSTR,192", true);                    
+    &writeConfigVal(\%diaConfig, "AVP", "UTRAN-GANSS-Positioning-Data", "2529,16777255,10415,OCTETSTR,192", true);              
+    &writeConfigVal(\%diaConfig, "AVP", "UTRAN-Additional-Positioning-Data", "2558,16777255,10415,OCTETSTR,192", true);              
+    &writeConfigVal(\%diaConfig, "AVP", "LRR-Flags", "2530,16777255,10415,UINT32,192", true);                    
+    &writeConfigVal(\%diaConfig, "AVP", "LRA-Flags", "2549,16777255,10415,UINT32,192", true);                                   
+    &writeConfigVal(\%diaConfig, "AVP", "ESMLC-Cell-Info", "2552,16777255,10415,GROUPED,192", true);                            
+    &writeConfigVal(\%diaConfig, "AVP", "Delayed-Location-Reporting-Data", "2555,16777255,10415,GROUPED,192", true);  
+    &writeConfigVal(\%diaConfig, "AVP", "Cell-Portion-ID", "2553,16777255,10415,UINT32,192", true);  
+
+    &writeConfigVal(\%diaConfig, "DIACMD", "CER-257-R", "Origin-Host:M:1,Origin-Realm:M:1,Host-IP-Address:M:255,Vendor-Id:M:1,Product-Name:M:1,Origin-State-Id:O:1,Supported-Vendor-Id:O:255,Auth-Application-Id:O:255,Inband-Security-Id:O:255,Acct-Application-Id:O:255,Vendor-Specific-Application-Id:O:255,Firmware-Revision:O:1", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "CEA-257-A", "Result-Code:M:1,Origin-Host:M:1,Origin-Realm:M:1,Host-IP-Address:M:255,Vendor-Id:M:1,Product-Name:M:1,Origin-State-Id:O:1,Error-Message:0:1,Failed-AVP:0:1,Supported-Vendor-Id:O:255,Auth-Application-Id:O:255,Inband-Security-Id:O:255,Acct-Application-Id:O:255,Vendor-Specific-Application-Id:O:255,Firmware-Revision:O:1", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "UDR-306-R-16777217", "Session-Id:F:1,Vendor-Specific-Application-Id:M:1,Auth-Session-State:M:1,Origin-Host:M:1,Origin-Realm:M:1,Destination-Realm:M:1,User-Identity:M:1,Data-Reference:M:1,Requested-Domain:O:1,Current-Location:O:1,Requested-Nodes:O:1", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "UDA-306-A-16777217", "Session-Id:F:1,Vendor-Specific-Application-Id:M:1,Result-Code:O:1,Experimental-Result:O:1,Auth-Session-State:M:1,Origin-Host:M:1,Origin-Realm:M:1,Supported-Features:O:255,Wildcarded-Public-Identity:O:1,Wildcarded-IMPU:O:1,User-Data:O:1,Failed-AVP:O:255,Proxy-Info:O:255,Route-Record:O:255", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "DPR-282-R", "Origin-Host:M:1,Origin-Realm:M:1,Disconnect-Cause:M:1", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "DPA-282-A", "Result-Code:M:1,Origin-Host:M:1,Origin-Realm:M:1,Failed-AVP:O:255", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "DWR-280-R", "Origin-Host:M:1,Origin-Realm:M:1,Origin-State-Id:O:1", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "DWA-280-A", "Result-Code:M:1,Origin-Host:M:1,Origin-Realm:M:1,Error-Message:O:1,Failed-AVP:O:255,Origin-State-Id:O:1", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "RAR-258-R", "Session-Id:F:1,Origin-Host:M:1,Origin-Realm:M:1,Destination-Host:M:1,Destination-Realm:M:1,Auth-Application-Id:M:1,Re-Auth-Request-Type:M:1,User-Name:O:1,Origin-State-Id:O:1,Proxy-Info:O:255,Route-Record:O:255", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "RAA-258-A", "Session-Id:F:1,Result-Code:M:1,Origin-Host:M:1,Origin-Realm:M:1,User-Name:O:1,Failed-AVP:O:1,Proxy-Info:O:255", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "STR-275-R", "Session-Id:F:1,Origin-Host:M:1,Origin-Realm:M:1,Destination-Realm:M:1,Auth-Application-Id:M:1,Termination-Cause:M:1,User-Name:O:1,Destination-Host:O:1,Class:O:255,Origin-State-Id:O:1,Proxy-Info:O:255,Route-Record:O:255", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "STA-275-A", "Session-Id:F:1,Result-Code:M:1,Origin-Host:M:1,Origin-Realm:M:1,User-Name:O:1,Failed-AVP:O:1,Proxy-Info:O:255", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "ANS-0-A", "Session-Id:F:0,Result-Code:M:1,Origin-Host:M:1,Origin-Realm:M:1,Failed-AVP:O:1,Proxy-Info:O:255", true);
+#&writeConfigVal(\%diaConfig, "DIACMD", "ASR-274-R", "Session-Id:F:1,Origin-Host:M:1,Origin-Realm:M:1,Destination-Host:M:1,Destination-Realm:M:1,Auth-Application-Id:M:1,User-Name:O:1,Origin-State-Id:O:1,Proxy-Info:O:255,Route-Record:O:255", true);
+#&writeConfigVal($\%diaConfig, "DIACMD", "ASA-274-A", "Session-Id:F:1,Result-Code:M:1,Origin-Host:M:1,Origin-Realm:M:1,User-Name:O:1,Failed-AVP:O:1,Proxy-Info:O:255", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "RIR-8388622-R-16777291", "Session-Id:F:1,Vendor-Specific-Application-Id:O:255,Auth-Session-State:M:1,Origin-Host:M:1,Origin-Realm:M:1,Destination-Realm:M:1,Destination-Host:O:1,User-Name:O:1,MSISDN:O:1,GMLC-Number:O:1", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "RIA-8388622-A-16777291", "Session-Id:F:1,Result-Code:O:1,Experimental-Result:O:1,Auth-Session-State:M:1,Origin-Host:M:1,Origin-Realm:M:1,Supported-Features:O:255,User-Name:O:1,MSISDN:O:1,LMSI:O:1,Serving-Node:O:1,Additional-Serving-Node:O:255,GMLC-Address:O:1,PPR-Address:O:1,RIA-Flags:O:1,Failed-AVP:O:255,Proxy-Info:O:255,Route-Record:O:255", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "PLR-8388620-R-16777255", "Session-Id:F:1,Vendor-Specific-Application-Id:O:255,Auth-Session-State:M:1,Origin-Host:M:1,Origin-Realm:M:1,Destination-Host:M:1,Destination-Realm:M:1,Location-Type:M:1,User-Name:O:1,MSISDN:O:1,LCS-EPS-Client-Name:M:1,LCS-Client-Type:M:1,LCS-Priority:O:1,LCS-QoS:O:1,Supported-GAD-Shapes:O:1,LCS-Privacy-Check-Non-Session:O:1,PLR-Flags:O:1", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "PLA-8388620-A-16777255", "Session-Id:F:1,Vendor-Specific-Application-Id:O:1,Result-Code:O:1,Experimental-Result:O:1,Auth-Session-State:M:1,Origin-Host:M:1,Origin-Realm:M:1,Location-Estimate:O:1,Accuracy-Fulfilment-Indicator:O:1,Age-Of-Location-Estimate:O:1,Velocity-Estimate:O:1,EUTRAN-Positioning-Data:O:1,ECGI:O:1,Serving-Node:O:1,Supported-Features:O:255,Failed-AVP:O:255,Proxy-Info:O:255,Route-Record:O:255", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "ULR-316-R-16777251", "Session-Id:F:1,Vendor-Specific-Application-Id:O:1,Auth-Session-State:O:1,Origin-Host:O:1,Origin-Realm:O:1,Destination-Host:O:1,Destination-Realm:O:1,User-Name:M:1,Terminal-Information:O:1,RAT-Type:O:1,ULR-Flags:O:1,Visited-PLMN-Id:O:1,SGSN-Number:O:1,GMLC-Address:O:1", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "ULA-316-A-16777251", "Session-Id:F:1,Vendor-Specific-Application-Id:O:1,Result-Code:O:1,Experimental-Result:O:1,Auth-Session-State:O:1,Origin-Host:O:1,Origin-Realm:O:1,ULA-Flags:O:1,Subscription-Data:O:1,Failed-AVP:O:255,Proxy-Info:O:255,Route-Record:O:255", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "AIR-318-R-16777251", "Session-Id:F:1,Vendor-Specific-Application-Id:O:1,Auth-Session-State:O:1,Origin-Host:O:1,Origin-Realm:O:1,Destination-Host:O:1,Destination-Realm:O:1,User-Name:M:1,Requested-EUTRAN-Authentication-Info:O:1,Requested-UTRAN-GERAN-Authentication-Info:O:1,Visited-PLMN-Id:O:1,AIR-Flags:O:1", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "AIA-318-A-16777251", "Session-Id:F:1,Vendor-Specific-Application-Id:O:1,Result-Code:O:1,Experimental-Result:O:1,Auth-Session-State:O:1,Origin-Host:O:1,Origin-Realm:O:1,Authentication-Info:O:1,Failed-AVP:O:255,Proxy-Info:O:255,Route-Record:O:255", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "IDR-319-R-16777251", "Session-Id:F:1,Vendor-Specific-Application-Id:O:1,Auth-Session-State:O:1,Origin-Host:O:1,Origin-Realm:O:1,Destination-Host:O:1,Destination-Realm:O:1,User-Name:M:1,Subscription-Data:M:1,IDR-Flags:O:1", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "NOR-323-R-16777251", "Session-Id:F:1,Vendor-Specific-Application-Id:O:1,Auth-Session-State:O:1,Origin-Host:O:1,Origin-Realm:O:1,Destination-Host:O:1,Destination-Realm:O:1,User-Name:M:1,Terminal-Information:O:1", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "LRR-8388621-R-16777255", "Session-Id:F:1,Vendor-Specific-Application-Id:O:255,Auth-Session-State:O:1,Origin-Host:O:1,Origin-Realm:O:1,Destination-Host:O:1,Destination-Realm:O:1,Location-Event:M:1,LCS-EPS-Client-Name:O:1,User-Name:O:1,MSISDN:O:1,IMEI:O:1,Location-Estimate:O:1,Accuracy-Fulfilment-Indicator:O:1,Age-Of-Location-Estimate:O:1,Velocity-Estimate:O:1,EUTRAN-Positioning-Data:O:1,ECGI:O:1,GERAN-Positioning-Info:O:1,Cell-Global-Identity:O:1,UTRAN-Positioning-Info:O:1,Service-Area-Identity:O:1,LCS-Service-Type-ID:O:1,Pseudonym-Indicator:O:1,LCS-QoS-Class:O:1,Serving-Node:O:1,LRR-Flags:O:1,ESMLC-Cell-Info:O:1,Supported-Features:O:255,Failed-AVP:O:255,Proxy-Info:O:255,Route-Record:O:255", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "LRA-8388621-A-16777255", "Session-Id:F:1,Vendor-Specific-Application-Id:O:1,Result-Code:O:1,Experimental-Result:O:1,Auth-Session-State:M:1,Origin-Host:M:1,Origin-Realm:M:1,GMLC-Address:O:1,LRA-Flags:O:1,Supported-Features:O:255,Failed-AVP:O:255,Proxy-Info:O:255,Route-Record:O:255", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "PUR-321-R-16777251 = Session-Id:F:1,Vendor-Specific-Application-Id:O:1,Auth-Session-State:O:1,Origin-Host:O:1,Origin-Realm:O:1,Destination-Host:O:1,Destination-Realm:O:1,User-Name:M:1,Terminal-Information:O:1,RAT-Type:O:1,Visited-PLMN-Id:O:1,SGSN-Number:O:1,GMLC-Address:O:1", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "PUA-321-A-16777251 = Session-Id:F:1,Vendor-Specific-Application-Id:O:1,Result-Code:O:1,Experimental-Result:O:1,Auth-Session-State:O:1,Origin-Host:O:1,Origin-Realm:O:1,Subscription-Data:O:1,Failed-AVP:O:255,Proxy-Info:O:255,Route-Record:O:255", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "CLR-317-R-16777251 = Session-Id:F:1,Vendor-Specific-Application-Id:O:1,Auth-Session-State:O:1,Origin-Host:O:1,Origin-Realm:O:1,Destination-Host:O:1,Destination-Realm:O:1,User-Name:M:1", true);
+    &writeConfigVal(\%diaConfig, "DIACMD", "CLA-317-A-16777251 = Session-Id:F:1,Vendor-Specific-Application-Id:O:1,Result-Code:O:1,Experimental-Result:O:1,Auth-Session-State:O:1,Origin-Host:O:1,Origin-Realm:O:1", true);
+
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "Vendor-Specific-Application-Id", "Vendor-Id:M:1,Auth-Application-Id:O:1,Acct-Application-Id:O:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "User-Identity", "MSISDN:O:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "Experimental-Result", "Vendor-Id:O:1,Experimental-Result-Code:0:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "Serving-Node", "SGSN-Number:O:1,MME-Name:O:1,MME-Realm:O:1,MSC-Number:O:1,3GPP-AAA-Server-Name:O:1,LCS-Capabilities-Sets:O:1,GMLC-Address:O:1,SGSN-Name:O:1,SGSN-Realm:O:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "Additional-Serving-Node", "SGSN-Number:O:1,MME-Name:O:1,MME-Realm:O:1,MSC-Number:O:1,3GPP-AAA-Server-Name:O:1,LCS-Capabilities-Sets:O:1,GMLC-Address:O:1,SGSN-Name:O:1,SGSN-Realm:O:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "LCS-EPS-Client-Name", "LCS-Name-String:O:1,LCS-Format-Indicator:O:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "LCS-QoS", "LCS-QoS-Class:O:1,Horizontal-Accuracy:O:1,Vertical-Accuracy:O:1,Vertical-Requested:O:1,Response-Time:O:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "LCS-Privacy-Check-Non-Session", "LCS-Privacy-Check:M:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "Subscription-Data", "Subscriber-Status:O:1,MSISDN:O:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "Terminal-Information", "IMEI:O:1,Software-Version:O:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "Authentication-Info", "E-UTRAN-Vector:O:7", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "E-UTRAN-Vector", "Item-Number:O:1,RAND:M:1,XRES:M:1,AUTN:M:1,KASME:M:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "Requested-EUTRAN-Authentication-Info", "Number-Of-Requested-Vectors:O:1,Immediate-Response-Preferred:O:1,Re-Synchronization-Info:O:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "Requested-UTRAN-GERAN-Authentication-Info", "Number-Of-Requested-Vectors:O:1,Immediate-Response-Preferred:O:1,Re-Synchronization-Info:O:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "Supported-Features", "Vendor-Id:M:1,Feature-List-ID:M:1,Feature-List:M:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "GERAN-Positioning-Info", "GERAN-Positioning-Data:O:1,GERAN-GANSS-Positioning-Data:O:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "UTRAN-Positioning-Info", "UTRAN-Positioning-Data:O:1,UTRAN-GANSS-Positioning-Data:O:1,UTRAN-Additional-Positioning-Data:O:1", true);
+    &writeConfigVal(\%diaConfig, "GROUPAVP", "ESMLC-Cell-Info", "ECGI:O:1,Cell-Portion-ID:O:1", true);
+	AppendIniFile("$currentRelPath/$gBinDir/$gDiaIniFile", \%diaConfig, false, $endFile);
+}
+
+sub prgwConfig ($$$$) {
+	my $configHash = shift;
+	my $currentRelPath = shift;
+	my $oldRelPath = shift;
+	my $licconfig = shift;
+
+	my $sstinstance = $gPrgwSstDetail{'Instance'};
+	my $pltinstance = $gPltSstDetail{'Instance'};
+	
+	##Bug 39940
+	my @licapps = getLicensedAppsForSst($gPrgwSstDetail{'LicName'}, $licconfig, $pltinstance);
+	my $prgwapps = $gPrgwSstDetail{'Apps'};
+	my $prgwapp = @{$prgwapps}[0];
+	my $stsapp = @{$prgwapps}[1]; 
+	my $sshapp = @{$prgwapps}[2]; 
+	my $nrPrbapp = @{$prgwapps}[3]; 
+	my $ltePrbapp = @{$prgwapps}[4]; 
+	my $gsmPrbapp = @{$prgwapps}[5];
+	
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$prgwapp/) {
+			&writeConfigVal($configHash, "PRGW", "HighEventRateTh", "30000", false);
+			&writeConfigVal($configHash, "PRGW", "LowEventRateTh", "25000", false);
+		
+			&writeConfigVal($configHash, "PRGW", "LUTermEventsToReject", "64", false);
+			&writeConfigVal($configHash, "PRGW", "IATTermEventsToReject", "0", false);
+		
+			&writeConfigVal($configHash, "PRGW", "ClearAlarmCount", 1, false);
+			&writeConfigVal($configHash, "PRGW", "BandWidthCalTime", 60, false);
+			&writeConfigVal($configHash, "PRGW", "MaxBWPerProbe", 0, false);
+			&delParam($configHash, "PRGW", "ProbeMinorThreshold");
+			&delParam($configHash, "PRGW", "ProbeMajorThreshold");
+			&delParam($configHash, "PRGW", "ProbeCriticalThreshold");
+			&delParam($configHash, "PRGW", "MaxOverallProbeBW", 0, false);
+			&delParam($configHash, "PRGW", "OverallProbeMinorThreshold", 30, false);
+			&delParam($configHash, "PRGW", "OverallProbeMajorThreshold", 50, false);
+			&delParam($configHash, "PRGW", "OverallProbeCriticalThreshold", 80, false);
+			&writeConfigVal($configHash, "PRGW", "LUTermEventsToReject", "64", false);
+			&writeConfigVal($configHash, "PRGW", "IATTermEventsToReject", "0", false);			
+			&writeConfigVal($configHash, "PRGW", "PRAMaxOutstanding", "200", false);
+			&writeConfigVal($configHash, "PRGW", "PRAWaitDuration", "2", false);
+			&writeConfigVal($configHash, "PRGW", "PRALocationSessionDuration", "30", false);
+			&writeConfigVal($configHash, "PRGW", "PRAWlsGsmCsMinNumMr", "1", false);
+			&writeConfigVal($configHash, "PRGW", "PRAWlsUmtsCsMinNumMr", "1", false);
+			&writeConfigVal($configHash, "PRGW", "PRAWlsUmtsPsMinNumMr", "1", false);
+			&writeConfigVal($configHash, "PRGW", "PltSendQThreshold", "20000", false);
+			&writeConfigVal($configHash, "PRGW", "ParserThreadQueueThreshold", "20000", false);
+			&writeConfigVal($configHash, "PRGW", "WorkerThreadQueueThreshold", "20000", false);
+		}
+	}
+	
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$prgwapp/ || $licapp =~ /$sshapp/) {
+			if($gUsingVMware == true) {
+				&writeConfigVal($configHash, "PRGW", "CNAppConnDownForFailover", "-1", true);
+				&writeConfigVal($configHash, "PRGW", "CNAppConnDownFailureCnt", "-1", true);
+				&writeConfigVal($configHash, "PRGW", "CNAppConnDownFailureDuration", "-1", true);
+				&writeConfigVal($configHash, "PRGW", "ProbeConnDownForFailover", "-1", true);
+				&writeConfigVal($configHash, "PRGW", "ProbeConnDownFailureCnt", "-1", true);
+				&writeConfigVal($configHash, "PRGW", "ProbeConnDownFailureDuration", "-1", true);
+		
+			} else {
+				&writeConfigVal($configHash, "PRGW", "CNAppConnDownForFailover", "20", false);
+				&writeConfigVal($configHash, "PRGW", "CNAppConnDownFailureCnt", "3", false);
+				&writeConfigVal($configHash, "PRGW", "CNAppConnDownFailureDuration", "50", false);
+				&writeConfigVal($configHash, "PRGW", "ProbeConnDownForFailover", "60", false);
+				&writeConfigVal($configHash, "PRGW", "ProbeConnDownFailureCnt", "2", false);
+				&writeConfigVal($configHash, "PRGW", "ProbeConnDownFailureDuration", "10", false);
+			}
+		}
+	}
+	
+	
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$prgwapp/) {
+			&writeConfigVal($configHash, "PRGW", "ProbeIdlePeriod", "300", false);
+			
+			#Below two are added as part of bug fix 2417
+			&writeConfigVal($configHash, "PRGW", "ProbeReconnectWaitDuraton", "240", false);
+			&writeConfigVal($configHash, "PRGW", "ProbeDataRecvWaitDuration", "30", false);
+			
+			&writeConfigVal($configHash, "MMEHostMappingConfig", "HostMappingSeperator", "pw.", false);
+			&writeConfigVal($configHash, "MMEHostMappngEntries", "", "", false);
+			#Bug 34910 - Commented
+			# #&writeConfigVal($configHash, "PRGW", "UmtsServingCellInterval", "10", false); 
+	
+			lamIntfConfig($configHash, true);
+		}
+	}
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$prgwapp/) {
+			my $appinstance = &getAppInstanceId($gPrgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			my $prgwSection = sprintf("ProbeIpRat_%d_%d", $sstinstance, $appinstance);
+			#PRGW 10.x Support		
+			&PromptPrgwSpecificEntries($configHash, $sstinstance, $appinstance,$licconfig);			
+			&replaceSectionInIni($configHash, "ProbeIpRat", $prgwSection);
+			&writeConfigVal($configHash, $prgwSection, "", "", false);
+			copyProbeIpRatFromLegacy($configHash, $prgwSection);
+		}
+	}
+	
+	#SSH Configs	
+	foreach my $licapp (@licapps) { ##Bug 39940
+		if($licapp =~ /$sshapp/){
+			&writeConfigVal($configHash, "SSH", "S-CSCFAddress", "", false);
+			&writeConfigVal($configHash, "SSH", "I-CSCFAddress", "", false);
+			#Deletion logic added for 8.2 to 10.2.1.x upgradation(Bug 47332)
+			#Bug 42187 KPI for VOLTE Voice
+			my $appinstance = &getAppInstanceId($gPrgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			my $sshSection = sprintf("SSH_%d_%d", $sstinstance, $appinstance);
+			&delParam($configHash, $sshSection, "KpiLogManagement");
+			&delSection($configHash, $sshSection);
+			#&writeConfigVal($configHash, $sshSection, "KpiLogManagement", "false", false);
+			lamIntfConfig($configHash, true);
+			last;
+		}
+	}
+
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$stsapp/) {
+			my $appinstance = &getAppInstanceId($gPrgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			my $prgwSection = sprintf("STS_%d_%d", $sstinstance, $appinstance);
+			&writeConfigVal($configHash, $prgwSection, "pcap.buffersize", "800", false);			
+			&writeConfigVal($configHash, $prgwSection, "TrackMissingSctp", "false", false);
+			last;
+		}
+	}
+
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$nrPrbapp/) {
+			my $appinstance = &getAppInstanceId($gPrgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			my $prgwSection = sprintf("NRPROBE_%d_%d", $sstinstance, $appinstance);
+			my $filterDir = "$gBasePath/data/probe_filters";
+        	-d $filterDir or system("$mkdirCmd -p $filterDir 2> /dev/null > /dev/null") ;
+			&writeConfigVal($configHash, $prgwSection, "ProbeFilterDir", "$filterDir", false);
+			&writeConfigVal($configHash, $prgwSection, "N2InactivityTime", "30", false);
+		}
+	}
+
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ltePrbapp/) {
+			my $appinstance = &getAppInstanceId($gPrgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			my $prgwSection = sprintf("LTEPROBE_%d_%d", $sstinstance, $appinstance);
+			my $filterDir = "$gBasePath/data/probe_filters";
+        	-d $filterDir or system("$mkdirCmd -p $filterDir 2> /dev/null > /dev/null") ;
+			&writeConfigVal($configHash, $prgwSection, "ProbeFilterDir", "$filterDir", false);
+			&writeConfigVal($configHash, $prgwSection, "S1ThreadCnt", "4", false);
+			&writeConfigVal($configHash, $prgwSection, "S11ThreadCnt", "1", false);
+			&writeConfigVal($configHash, $prgwSection, "S6ThreadCnt", "1", false);
+			&writeConfigVal($configHash, $prgwSection, "SgsThreadCnt", "1", false);
+			&writeConfigVal($configHash, $prgwSection, "S1InactivityTime", "30", false);
+			&writeConfigVal($configHash, $prgwSection, "EventBufferTime", "0", false);
+			&writeConfigVal($configHash, $prgwSection, "S1ThreadQThreshold", "150000", false);
+			&writeConfigVal($configHash, $prgwSection, "LogQueueThreshold", "150000", false);
+			&writeConfigVal($configHash, $prgwSection, "ReportIntraEnodebHO", "true", false);
+			&writeConfigVal($configHash, $prgwSection, "ReportS1Sms", "true", false);
+			&writeConfigVal($configHash, $prgwSection, "ServiceReqAge", "1000", false);
+			&writeConfigVal($configHash, $prgwSection, "GenerateKeyOnAia", "true", false);
+			&writeConfigVal($configHash, $prgwSection, "ProtectionModeAlgo", "2", false);
+			&writeConfigVal($configHash, $prgwSection, "CipherAlgo", "2", false);
+        	&writeDiaIni($currentRelPath, true);
+		}
+	}
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$gsmPrbapp/) {
+			my $appinstance = &getAppInstanceId($gPrgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			my $prgwSection = sprintf("GSMPROBE_%d_%d", $sstinstance, $appinstance);
+			my $filterDir = "$gBasePath/data/probe_filters";
+			-d $filterDir or system("$mkdirCmd -p $filterDir 2> /dev/null > /dev/null") ;
+			&writeConfigVal($configHash, $prgwSection, "ProbeFilterDir", "$filterDir", false);
+			&writeConfigVal($configHash, $prgwSection, "GsIntfSsns", "192", false);
+			&writeConfigVal($configHash, $prgwSection, "GbIntfPorts", "50001", false);
+			&delParam($configHash, $prgwSection, "AbisIntfPorts");
+			&writeConfigVal($configHash, $prgwSection, "TAMultiplier", "1", false);
+			&writeConfigVal($configHash, $prgwSection, "UseSctpWorkerThread", "false", false);
+			&writeConfigVal($configHash, $prgwSection, "ReportLocationUpdateRequest", "false", false);
+		}
+	}
+}
+
+sub prgwMerInstall($$$) {
+	my $sstrec = shift;
+	my $releaseDir = shift;
+	my $licconfig = shift;
+	System("$rmCmd  $gLogsDirPath/EventsToBeSet*", 0, "Could not remove: $gLogsDirPath/EventsToBeSet");
+	System("$rmCmd  $gLogsDirPath/OnGoingEvents*", 0, "Could not remove: $gLogsDirPath/EventsToBeSet");
+}
+
+sub prgwMerConfig ($$$$) {
+	my $configHash = shift;
+	my $currentRelPath = shift;
+	my $oldRelPath = shift;
+	my $licconfig = shift;
+
+	my $sstinstance = $gPrgwMerSstDetail{'Instance'};
+	my $pltinstance = $gPltSstDetail{'Instance'};
+
+	my $OpName = &getParam($configHash, "SMSGW", "OperatorName");
+	if ($OpName eq ""){
+		my $done = false;
+                while($done == false) {
+			print "Enter the Name of Network Operator : ";
+			$OpName = trimmer(<STDIN>);
+			if($OpName eq "")
+                        {
+                                print "Field can't be left blank.\n";
+                                $done = false;
+                        }
+                        else {
+                                $done = true;
+			}
+		}
+	}
+
+	&writeConfigVal($configHash, "SMSGW", "SocketTimeOutInSeconds", 30, false);
+	&writeConfigVal($configHash, "SMSGW", "ProbeReEstablishmentIntervalInSeconds", 5, false);
+	&writeConfigVal($configHash, "SMSGW", "ProbeIdlePeriod", 3600, false);
+	&writeConfigVal($configHash, "SMSGW", "OperatorName", $OpName, false);
+	&writeConfigVal($configHash, "SMSGW", "SmsLanguage", "NOT_LANGUAGE", false);
+	&writeConfigVal($configHash, "SMSGW", "IeiInHex", "0B-12", false);
+	&writeConfigVal($configHash, "SMSGW", "NumberCheck", "false", false);
+	&writeConfigVal($configHash, "SMSGW", "BPartyEnhancement", "false", false);
+	&writeConfigVal($configHash, "SMSGW", "InternationalDialingCode", "00", false);
+	&writeConfigVal($configHash, "SMSGW", "HomeCountryCode", "NULL", false);
+	&writeConfigVal($configHash, "SMSGW", "InternationalNumberLength", 7, false);
+	&writeConfigVal($configHash, "SMSGW", "NationalMobileNumberLength", 8, false);
+	&writeConfigVal($configHash, "SMSGW", "NationalFixedNumberLength", 8, false);
+	&writeConfigVal($configHash, "SMSGW", "StatusReportSms", "false", false);
+	&writeConfigVal($configHash, "SMS_USR", "SMSDataPath", "/Disk/home/polaris/SMSDATA", false);
+	&writeConfigVal($configHash, "ZDC_USR", "ZDCDataPath", "/Disk/home/polaris/ZDVoiceCall", false);
+
+	&writeConfigVal($configHash, "SERVICE STATUS", "SmsService",true,true);
+	&writeConfigVal($configHash, "SERVICE STATUS", "ZdcService",true,true);
+
+	my @licapps = getLicensedAppsForSst($gPrgwSstDetail{'LicName'}, $licconfig, $pltinstance);
+	my $prgwapps = $gPrgwSstDetail{'Apps'};
+	my $prgwapp = @{$prgwapps}[0];
+	my $smsgwapp = @{$prgwapps}[1];
+	my $instCnt = 0;
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$prgwapp/) {
+			$instCnt++;
+		}
+	}
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$prgwapp/) {
+			my $appinstance = &getAppInstanceId($gPrgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			my $prgwSection = sprintf("ProbeIpRat_%d_%d", $sstinstance, $appinstance);
+			my $prgwFmt = "rat,ip,dataPort,controlPort,monitoredNodes,probetype";
+			&writeConfigVal($configHash, $prgwSection, "syntax", $prgwFmt, true);
+		}
+		if($licapp =~ /$smsgwapp/) {
+			my $appinstance = &getAppInstanceId($gPrgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			my $prgwSection = sprintf("ProbeIpRat_%d_%d", $sstinstance, $appinstance);
+			&writeConfigVal($configHash, $prgwSection, "", "", false);
+		}
+	}
+
+#workaround to pick the last configuration
+	setupLogsMgrForKpiAndCr($configHash);
+
+}
+
+
+
+sub mlsInstall($$$) {
+	my $sstrec = shift;
+	my $releaseDir = shift;
+	my $licconfig = shift;
+
+# create CDT
+        -d $gCdtPathGsm or system("$mkdirCmd -p $gCdtPathGsm 2> /dev/null > /dev/null") ;
+        system("$chmodCmd -R 777 $gCdtPathGsm 2> /dev/null > /dev/null");
+        system("$cpCmd $gCdtPath/*_GSM_CDT.txt $gCdtPathGsm 2> /dev/null > /dev/null");
+
+        -d $gCdtPathUmts or system("$mkdirCmd -p $gCdtPathUmts 2> /dev/null > /dev/null") ;
+        system("$chmodCmd -R 777 $gCdtPathUmts 2> /dev/null > /dev/null");
+
+        -d $gCdtPathLte or system("$mkdirCmd -p $gCdtPathLte 2> /dev/null > /dev/null") ;
+        system("$chmodCmd -R 777 $gCdtPathLte 2> /dev/null > /dev/null");
+
+	-d $gCdtPathNr or system("$mkdirCmd -p $gCdtPathNr 2> /dev/null > /dev/null") ;
+        system("$chmodCmd -R 777 $gCdtPathNr 2> /dev/null > /dev/null");
+}
+
+sub lamIntfConfig ($$) {
+    my $configHash = shift;
+    my $lteReq = shift;
+
+    my ($cdtFileGsm, $cdtFileUmts, $cdtFileLte, $cdtFileNr) = &getCdtFileNames($configHash);
+
+    my $ip = &getParam($configHash, "DCMServer", "GSMDCMIPAddress");
+# special case, check for legacy paramter also along with current parameter
+    if($ip eq "") {
+        $ip = getIp("Enter GSM LAM IP address", false, true);
+    }
+    &writeConfigVal($configHash, "DCMServer", "GSMDCMIPAddress", "$ip", false);
+
+    my $dcmPort = &getParam($configHash, "DCMServer", "GSMMRFPort");
+# special case, check for legacy paramter also along with current parameter
+    if($dcmPort eq "") {
+        $dcmPort = getPort("Enter GSM LAM Port", $gPortNumbers{3});
+    }
+    &writeConfigVal($configHash, "DCMServer", "GSMMRFPort", "$dcmPort", false);
+    &writeConfigVal($configHash, "DCMServer", "GSMMATFileName", $cdtFileGsm, false);
+    &writeConfigVal($configHash, "DCMServer", "GSMMATLoadPath", "$gCdtPathGsm", false);
+
+    $ip = &getParam($configHash, "DCMServer", "UMTSDCMIPAddress");
+# for legacy install only look for the DCMIPAddress
+    if($ip eq "") {
+        $ip = getIp("Enter UMTS LAM IP address", false, true);
+    }
+    &writeConfigVal($configHash, "DCMServer", "UMTSDCMIPAddress", "$ip", false);
+
+    $dcmPort = &getParam($configHash, "DCMServer", "UMTSMRFPort");
+    if($dcmPort eq "") {
+        $dcmPort = getPort("Enter UMTS LAM Port", $gPortNumbers{3});
+    }
+    &writeConfigVal($configHash, "DCMServer", "UMTSMRFPort", "$dcmPort", false);
+    &writeConfigVal($configHash, "DCMServer", "UMTSMATFileName", $cdtFileUmts, false);
+    &writeConfigVal($configHash, "DCMServer", "UMTSMATLoadPath", "$gCdtPathUmts", false);
+
+    if($lteReq == true) {
+        my $ip = &getParam($configHash, "DCMServer", "LTEDCMIPAddress");
+        if($ip eq "") {
+            $ip = getIp("Enter LTE LAM IP address", false, true);
+        }
+        &writeConfigVal($configHash, "DCMServer", "LTEDCMIPAddress", "$ip", false);
+
+        my $dcmPort = &getParam($configHash, "DCMServer", "LTEMRFPort");
+        if($dcmPort eq "") {
+            $dcmPort = getPort("Enter LTE LAM Port", $gPortNumbers{3});
+        }
+        &writeConfigVal($configHash, "DCMServer", "LTEMRFPort", "$dcmPort", false);
+        &writeConfigVal($configHash, "DCMServer", "LTEMATLoadPath", "$gCdtPathLte", false);
+        &writeConfigVal($configHash, "DCMServer", "LTEMATFileName", $cdtFileLte, false);
+    }
+
+    my $ip = &getParam($configHash, "DCMServer", "NRDCMIPAddress");
+    if($ip eq "") {
+        $ip = getIp("Enter NR LAM IP address", false, true);
+    }
+    &writeConfigVal($configHash, "DCMServer", "NRDCMIPAddress", "$ip", false);
+
+    my $dcmPort = &getParam($configHash, "DCMServer", "NRMRFPort");
+    if($dcmPort eq "") {
+        $dcmPort = getPort("Enter NR LAM Port", $gPortNumbers{3});
+    }
+    &writeConfigVal($configHash, "DCMServer", "NRMRFPort", "$dcmPort", false);
+    &writeConfigVal($configHash, "DCMServer", "NRMATLoadPath", "$gCdtPathNr", false);
+    &writeConfigVal($configHash, "DCMServer", "NRMATFileName", $cdtFileNr, false);
+
+    if($gUsingVMware == true) {
+        &writeConfigVal($configHash, "LamFailOverParams", "LAMConnDownForFailover", "-1", true);
+        &writeConfigVal($configHash, "LamFailOverParams", "LAMConnDownFailureCnt", "-1", true);
+        &writeConfigVal($configHash, "LamFailOverParams", "LAMConnDownFailureDuration", "-1", true);
+    } else {
+        &writeConfigVal($configHash, "LamFailOverParams", "LAMConnDownForFailover", "3600", false);
+        &writeConfigVal($configHash, "LamFailOverParams", "LAMConnDownFailureCnt", "2", false);
+        &writeConfigVal($configHash, "LamFailOverParams", "LAMConnDownFailureDuration", "10", false);
+    }
+}
+sub mlsConfig ($$$$) {
+	my $configHash = shift;
+	my $currentRelPath = shift;
+	my $oldRelPath = shift;
+	my $licconfig = shift;
+	my $pltinstance = $gPltSstDetail{'Instance'};
+	my $sstinstance = $gMlsSstDetail{'Instance'};
+	my $mlsapps = $gMlsSstDetail{'Apps'};
+	my $mlsapp = @{$mlsapps}[0];
+	my @licapps = &getLicensedApps($gMlsSstDetail{'LicName'}, $mlsapp, $licconfig, $pltinstance);
+	foreach my $licapp (@licapps) {
+		my $mlsinstance = &getAppInstanceId($gMlsSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+		my $mlssecname = sprintf("MLS_%d_%d", $sstinstance, $mlsinstance);
+		&delParam($configHash, $mlssecname, "SupportedGSMLACs");
+		&delParam($configHash, $mlssecname, "SupportedUMTSLACs");
+	}
+
+#workaround to pick the last configuration
+	#&writeConfigVal($configHash, "SYSTEM", "SubSystemNames", "mls", true);
+
+	# remove legacy paramter
+
+	my $pltinstance = $gPltSstDetail{'Instance'};
+	my $sstinstance = $gMlsSstDetail{'Instance'};
+	my @licapps = getLicensedAppsForSst($gMlsSstDetail{'LicName'}, $licconfig, $pltinstance);
+	my $mlsapps = $gMlsSstDetail{'Apps'};
+	my $mlsapp = @{$mlsapps}[0];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$mlsapp/) {
+			my $appinstance = &getAppInstanceId($gMlsSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			my $section = sprintf("MLS_%d_%d", $sstinstance, $appinstance);
+			&updateNodeSpecicParam($configHash, $section, "*");
+		}
+	}
+
+	my $mlsapp = @{$mlsapps}[1];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$mlsapp/) {
+			my $appinstance = &getAppInstanceId($gMlsSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			my $section = sprintf("LCA_%d_%d", $sstinstance, $appinstance);
+			&updateNodeSpecicParam($configHash, $section, "*");
+		}
+	}
+# Lam interface configuration
+	my $msp = @{$mlsapps}[0];
+	my $gmlcGw = @{$mlsapps}[1];
+	my $clientHandler = @{$mlsapps}[3];
+	my $ldsGw = @{$mlsapps}[4];
+	
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$msp/ || $licapp =~ /$clientHandler/ || $licapp =~ /$ldsGw/ || $licapp =~ /$gmlcGw/) {
+			lamIntfConfig($configHash, true);
+		}
+	}
+
+	&delParam($configHash, "DCMServer", "MATLoadPath");
+
+	&writeConfigVal($configHash, "BSC_SwitchAddress", "", "", false);
+
+	# Read the LCA port and IP
+	my $LCA = @{$mlsapps}[1];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$LCA/) {
+			my $port = &getParam($configHash, "LCA","HttpListenPort");
+			if($port eq ""){
+				$port = getPort("Enter LCSI HTTP port", $gPortNumbers{2});
+			}
+			&writeConfigVal($configHash, "LCA", "HttpListenPort", $port, false);
+			# Read the LCSI-IP
+			my $httpip = &getParam($configHash, "LCA","LCSI-IP");
+			if($httpip eq ""){
+				$httpip = getIp("Enter LCSI HTTP IP address", false, true);
+			}
+			&writeConfigVal($configHash, "LCA", "LCSI-IP", $httpip, false);
+		}
+	}
+
+# Write Seperate section for each Client Handler Instance
+	my $CH = @{$mlsapps}[3];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$CH/) {
+			my $massLicensed = getParam($licconfig, "FEATURES", "MassLocationServiceSupported");
+			if($massLicensed eq "true" ) {
+				my $mlcReportStorage = &getParam($configHash, "FILE_BASED_INTERFACE", "ReportStorageFolder");
+				if($mlcReportStorage eq "") {
+					$mlcReportStorage = &getInputString("Enter Report Storage Folder Path for File Based Interface");
+				}
+				&writeConfigVal($configHash, "FILE_BASED_INTERFACE", "ReportStorageFolder", $mlcReportStorage, false);
+			}
+
+			my $appinstance = &getAppInstanceId($gMlsSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+
+			# Read existing details
+			my $Mi_httpLicensed = getParam($licconfig, "FEATURES", "MI_HttpEnabled");
+			my $Mi_httpsLicensed = getParam($licconfig, "FEATURES", "MI_HttpsEnabled");
+			if($Mi_httpLicensed eq "false" && $Mi_httpsLicensed eq "false") {
+				$Mi_httpLicensed = "true";
+			}
+			if( $Mi_httpLicensed eq "true") {
+				my $section = sprintf("VirtIpEthIntf_MLS_CH_%d_%d", $sstinstance, $appinstance);
+				my $httpip = &getParam($configHash,"VirtualIp",$section);
+				if($httpip eq ""){
+					$httpip = getIp("Enter Client Handler server HTTP IP address for instance $appinstance ", false, true);
+					$httpip = sprintf("default0-%s",$httpip);
+				}
+				&writeConfigVal($configHash, "VirtualIp", $section, "$httpip", false);
+
+				# Http listen port is common for all Client handler instance
+				my $port = &getParam($configHash, "CH_SVCS", "HttpListenPort");
+				if($port eq "") {
+					$port = getPort("Enter Client Handler server HTTP port", $gPortNumbers{1});
+				}
+				&writeConfigVal($configHash, "CH_SVCS", "HttpListenPort", $port, false);
+			}
+			if( $Mi_httpsLicensed eq "true") {
+				# Http listen port is common for all Client handler instance
+				my $port = &getParam($configHash, "CH_SVCS", "HttpsListenPort");
+				if($port eq "") {
+					$port = getPort("Enter Client Handler server HTTPS port", 11099);
+				}
+				&writeConfigVal($configHash, "CH_SVCS", "HttpsListenPort", $port, false);
+				&writeConfigVal($configHash, "CH_SVCS", "HttpsKeyFile", "MiLcsHttps.key", false);
+				&writeConfigVal($configHash, "CH_SVCS", "HttpsCertFile", "MiLcsHttps.crt", false);
+				
+			}
+			
+			&writeConfigVal($configHash, "CH_SVCS", "LCSClientIpLogging", "false", false);
+			&writeConfigVal($configHash, "CH_SVCS", "MajorThresholdForBSCLC", "0", false);
+			&writeConfigVal($configHash, "CH_SVCS", "MajorThresholdForRNCLC", "0", false);
+			&writeConfigVal($configHash, "CH_SVCS", "MajorThresholdForENodeBLC", "80", false);
+			&writeConfigVal($configHash, "CH_SVCS", "MajorThresholdForNRLC", "80", false);
+			&writeConfigVal($configHash, "CH_SVCS", "TCP-IDLE-Timeout", "50", false);
+			&writeConfigVal($configHash, "CH_SVCS", "OutstandingTxnPerLCSC", "40000", false);
+			&writeConfigVal($configHash, "CH_SVCS", "LocProtVer", "3.3.0", false);
+			&writeConfigVal($configHash, "CH_SVCS", "ThresholdForConsecutiveMsueGfFailures", "8", false);
+			&writeConfigVal($configHash, "CH_SVCS", "ThresholdForConsecutiveMcueGfFailures", "8", false);
+			&writeConfigVal($configHash, "CH_SVCS", "ThresholdForConsecutiveEvrptGfFailures", "8", false);
+			#47698
+			&delParam($configHash, "CH_SVCS", "ThresholdForConsecutiveMtuePFailures");
+			&writeConfigVal($configHash, "CH_SVCS", "TimeForNoReqRcvdMlrrAlert", "60", false);
+			&writeConfigVal($configHash, "CH_SVCS", "SysLevelTimeForNoReqRcvdAlert","60",false);
+			&writeConfigVal($configHash, "CH_SVCS", "ClientLevelTimeForNoReqRcvdAlert","60",false);
+			&writeConfigVal($configHash, "CH_SVCS", "IgnoreBlankLinesBeforeXmlTag", "false", false);
+			my $maxTPS = getParam($licconfig, "FEATURES", "MaxTPS");
+    			my $alarmMaxTPS = "100,100,100,100,100,100";
+			my $alarmMaxOut = "1000,1000,1000,1000,1000,1000";
+			#Bug #2154
+			#&writeConfigVal($configHash, "CH_SVCS", "AlarmTPS", $alarmMaxTPS, false);
+			#&writeConfigVal($configHash, "CH_SVCS", "DurationToClearTPSAlarmInsec", "5,5,5,5,5,5", false);
+			&delParam($configHash, "CH_SVCS", "AlarmTPS");
+			&delParam($configHash, "CH_SVCS", "DurationToClearTPSAlarmInsec");
+			#Bug #2151
+			#&writeConfigVal($configHash, "CH_SVCS", "AlarmOutstandingTxn", $alarmMaxOut, false);
+			#&writeConfigVal($configHash, "CH_SVCS", "DurationToClearOutstandingTxnAlarmInsec", "5,5,5,5,5,5", false);
+			&delParam($configHash, "CH_SVCS", "AlarmOutstandingTxn");
+			&delParam($configHash, "CH_SVCS", "DurationToClearOutstandingTxnAlarmInsec");
+			if($gUsingVMware == true) {
+				&writeConfigVal($configHash, "CH_SVCS", "CNAppConnDownForFailover", "-1", true);
+				&writeConfigVal($configHash, "CH_SVCS", "CNAppConnDownFailureCnt", "-1", true);
+				&writeConfigVal($configHash, "CH_SVCS", "CNAppConnDownFailureDuration", "-1", true);
+			} else {
+				&writeConfigVal($configHash, "CH_SVCS", "CNAppConnDownForFailover", "5", false);
+				&writeConfigVal($configHash, "CH_SVCS", "CNAppConnDownFailureCnt", "3", false);
+				&writeConfigVal($configHash, "CH_SVCS", "CNAppConnDownFailureDuration", "10", false);
+			}
+			&writeConfigVal($configHash, "CH_SVCS", "McuenUliNotReportedDuration", "180", false);
+			&writeConfigVal($configHash, "CH_SVCS", "EvrptnUliNotReportedDuration", "180", false);
+			&writeConfigVal($configHash, "CH_SVCS", "EvrptPeriodicity", "15", false);		
+				
+			#Read [LicensedLCSClients] section from License file
+			my $lcslicclients = &getSectionPararms($licconfig, "LicensedLCSClients");
+			foreach my $licclientInfo (@{$lcslicclients}) {
+				#evrpt1-MassContinuous:1:1 = evrpt1,polaris123,MassContinuous,,,,,,,,10,1,HIGH:MEDIUM:LOW:,1,1.000000
+				my @keyTokens = split(":", $licclientInfo->{'name'});
+				my @valueTokens = split(",", $licclientInfo->{'value'});
+				chomp(@keyTokens);
+				chomp(@valueTokens);				
+				my $sstId = $keyTokens[1];
+				my $appId = $keyTokens[2];
+				#section in PDEApp.ini [MassContinousForkClients_1_1]
+				my $forksectionConfig = sprintf("MassContinousForkClients_%d_%d", $sstinstance, $appinstance);				
+				if($valueTokens[2] eq "MassContinuous"){					
+					if($sstinstance eq int($sstId) and $appinstance eq int($appId)){
+						#Whether client enabled or not in license file
+						my $massContinousSectionLic = sprintf("%s-MassContinuous",$valueTokens[0]);						
+						my $forkValueConfig = &getParam($configHash, $forksectionConfig, $valueTokens[0]);						
+						&writeConfigVal($configHash, $forksectionConfig, $valueTokens[0], $forkValueConfig, false);
+					}
+				}		
+			}
+		}
+	}
+
+	&writeConfigVal($configHash, "ARMGf", "", "", false);
+	&writeConfigVal($configHash, "MLS", "ARMLACRatio", "0.75", false);
+
+	if($gUsingVMware == true) {
+		&writeConfigVal($configHash, "MLS", "CNAppConnDownForFailover", "-1", true);
+		&writeConfigVal($configHash, "MLS", "CNAppConnDownFailureCnt", "-1", true);
+		&writeConfigVal($configHash, "MLS", "CNAppConnDownFailureDuration", "-1", true);
+	} else {
+		&writeConfigVal($configHash, "MLS", "CNAppConnDownForFailover", "20", false);
+		&writeConfigVal($configHash, "MLS", "CNAppConnDownFailureCnt", "3", false);
+		&writeConfigVal($configHash, "MLS", "CNAppConnDownFailureDuration", "50", false);
+	}
+
+	&writeConfigVal($configHash, "MLS", "ImsiList", "", false);
+	&writeConfigVal($configHash, "MLS", "ErrorLogEnabled", "false", false);
+	&writeConfigVal($configHash, "MLS", "NoLdpImsiListPath", $gLogsDirPath, false);
+	&writeConfigVal($configHash, "MLS", "NoLdpImsiListFile", "NoLdpImsiList.txt", false);
+	&writeConfigVal($configHash, "MLS", "MsisdnToImsiKpiDuration", "30", false);
+	#&writeConfigVal($configHash, "MLS", "GeoLocationMissingCount", "true", false);
+	&writeConfigVal($configHash, "MLS", "NonImsStorageLimit", "40000000", false);
+	&writeConfigVal($configHash, "MLS", "ImsStorageLimit", "30000000", false);
+	&writeConfigVal($configHash, "MLS", "DuplicateCheckTimer", "10", false);
+	&writeConfigVal($configHash, "MLS", "DuplicateCheckImsiBlock", "20", false);
+}
+
+sub mdbInstall($$$) {
+	my $sstrec = shift;
+	my $releaseDir = shift;
+	my $licconfig = shift;
+	System("$rmCmd  $gLogsDirPath/MdbFilters*", 0, "Could not remove: $gLogsDirPath/MdbFilters");
+}
+
+sub mdbConfig ($$$$) {
+	my $configHash = shift;
+	my $currentRelPath = shift;
+	my $oldRelPath = shift;
+	my $licconfig = shift;
+	my $sstinst = $gPltSstDetail{'Instance'};
+	writeConfigVal($configHash, "MDB", "MdbMemUsagePercentage", "50:75:99", false);
+	writeConfigVal($configHash, "MDB", "SubscriberInfoFile", "mdb.csv", false);
+	writeConfigVal($configHash, "MDB","SubscriberCountKpiDuration","30",false);
+	writeConfigVal($configHash, "MDB","SubscriberCountRatKpiDuration","30",false);
+	#writeConfigVal($configHash, "MDB", "MDBPersistenceTimeDiff", "720", false);
+
+}
+
+sub tlrInstall($$$) {
+	my $sstrec = shift;
+	my $releaseDir = shift;
+	my $licconfig = shift;
+
+}
+
+sub tlrConfig ($$$$) {
+	my $configHash = shift;
+	my $currentRelPath = shift;
+	my $oldRelPath = shift;
+	my $licconfig = shift;
+	my $tsmlcMode = &getParam($licconfig, "FEATURES", "TsmlcMode");
+	if($tsmlcMode eq "Relay"){
+		return;
+	}
+
+	writeConfigVal($configHash, "TLR", "LocationEstimationTime", "100", false);
+	writeConfigVal($configHash, "TLR", "LocationEstimationTimeRes", "100", false);
+	writeConfigVal($configHash, "TLR", "ActivationEstimationTime", "550", false);
+	writeConfigVal($configHash, "TLR", "ActivationEstimationTimeRes", "50", false);
+	writeConfigVal($configHash, "TLR", "NoOfQMWorkerThreads", "5", false);
+	writeConfigVal($configHash, "TLR", "UmtsWorkerThreadCount", "10", false);
+	writeConfigVal($configHash, "TLR", "UmtsMaxOutstandingSession", "10000", false);
+	writeConfigVal($configHash, "TLR", "EnablePDEYieldCheck", "false", false);
+	writeConfigVal($configHash, "TLR", "YieldThreshold", "80", false);
+	writeConfigVal($configHash, "TLR", "YieldCheckDuration", "5", false);
+	writeConfigVal($configHash, "TLR", "MinLocResponsesForYieldCheck", "10", false);
+	writeConfigVal($configHash, "TLR", "TAEstimationTime", "30", false);
+	writeConfigVal($configHash, "TLR", "TAEstimationTimeRes", "100", false);
+	writeConfigVal($configHash, "TLR", "MsPosCmdEstimationTime", "30", false);
+	writeConfigVal($configHash, "TLR", "MsPosCmdEstimationTimeRes", "100", false);
+	writeConfigVal($configHash, "TLR", "GsmWorkerThreadCount", "10", false);
+	writeConfigVal($configHash, "TLR", "GsmMaxOutstandingSession", "10000", false);
+
+# configure all the tsgw pdes
+	&configureTSGWInfo($configHash, $licconfig);
+
+	my $modeStr = getParam($configHash, "TLR", "QmType");
+	if($modeStr eq "") {
+		$modeStr = "Internal";
+		my $mode = &getInputRange("QoP Manager Type [1-Internal, 2-External]", 1, 2, 1);
+		if ($mode == 1){
+			$modeStr = "Internal";
+		}
+		if ($mode == 2){
+			$modeStr = "External";
+			my $Qip = &getIp("Enter IP address for QoP Manager", false, false);
+			my $Qport = &getPort("Enter Port for QoP Manager ", 35000);
+			writeConfigVal($configHash, "TLR", "QmIpAddress", $Qip, false);
+			writeConfigVal($configHash, "TLR", "QmPort", $Qport, false);
+		}
+		writeConfigVal($configHash, "TLR", "QmType", $modeStr, false);
+	}
+	my $selfip = getParam($configHash, "PLATFORM_SVCS", "NodeIPAddress");
+	writeConfigVal($configHash, "TLR", "QMLocalIpAddress", $selfip, false);
+	writeConfigVal($configHash, "TLR", "TCPLocalIpAddress", $selfip, false);
+
+	writeConfigVal($configHash, "EXTERNAL_PDE_PROTOCOL", "Marker", "49.75.70.63", false);
+	writeConfigVal($configHash, "EXTERNAL_PDE_PROTOCOL", "Majorversion", "1", false);
+	writeConfigVal($configHash, "EXTERNAL_PDE_PROTOCOL", "Minorversion", "0", false);
+}
+
+sub adsInstall($$$) {
+	my $sstrec = shift;
+	my $releaseDir = shift;
+	my $licconfig = shift;
+
+
+}
+
+sub adsConfig ($$$$) {
+	my $configHash = shift;
+	my $currentRelPath = shift;
+	my $oldRelPath = shift;
+	my $licconfig = shift;
+	my $sstinst = $gPltSstDetail{'Instance'};
+
+	#Adding PRFS support
+	my $rxProvider = &getParam($configHash, "AgpsServer", "RinexProvider");
+	if($rxProvider eq "") {
+
+		$rxProvider = &getInputRange("Enter Rinex provider [1-RX NETWORKS, 2-LEICA]", 1, 2, 2);
+		if ($rxProvider eq 1) {
+			my $ip = &getIp("Enter the remote rinex machine IP address", false, false);
+			my $ftpUser = &getInputString("Enter the remote ftp user");
+			my $ftpPasswd = &getInputString("Enter the remote ftp passwd");
+			my $rgpsFilePath = &getInputString("Enter the remote rinex files path");
+
+			&writeConfigVal($configHash, "AgpsServer", "RinexProvider", "RXNETWORKS", false);
+			&writeConfigVal($configHash, "AgpsServer", "RgpsFilePath", "$rgpsFilePath", false);
+
+			#&writeConfigVal($configHash, "AgpsServer", "RgpsIpAddress", "127.0.0.1", false);
+			&writeConfigVal($configHash, "AgpsServer", "RgpsIpAddress", "$ip", false);
+			&writeConfigVal($configHash, "AgpsServer", "RgpsFtpUsername", "$ftpUser", false);
+			&writeConfigVal($configHash, "AgpsServer", "RgpsFtpPassword", "$ftpPasswd", false);
+			&writeConfigVal($configHash, "AgpsServer", "RgpsFileFetchNumRetries", "2", false);
+
+		} elsif ($rxProvider eq 2) {
+			my $rgpsFilePath = "/Disk/home/polaris/rinex/";
+
+			my $prfsBlades = getInputRange("Enter number of redundant PRFS blades", 1, 100, 2);
+			my $rcvrCount = getInputRange("Enter number of GPS receivers count", 1, 100, 2);
+			system("/bin/rm -rf $rgpsFilePath 2> /dev/null > /dev/null") ;
+			my $count = 1;
+			for (; $count <= $prfsBlades; $count++) {
+				system("$mkdirCmd -p $rgpsFilePath/$count 2> /dev/null > /dev/null") ;
+			}
+			system("$chmodCmd -R 777 $rgpsFilePath 2> /dev/null > /dev/null");
+
+			&writeConfigVal($configHash, "AgpsServer", "RinexProvider", "LEICA", false);
+			&writeConfigVal($configHash, "AgpsServer", "PRFSBladesCount", "$prfsBlades", false);
+			&writeConfigVal($configHash, "AgpsServer", "GPSReceiverCount", "$rcvrCount", false);
+			&writeConfigVal($configHash, "AgpsServer", "RgpsFilePath", "$rgpsFilePath", false);
+		}
+	}
+
+	&writeConfigVal($configHash, "AgpsServer", "MinSatForFullNavData", "12", false);
+	&writeConfigVal($configHash, "AgpsServer", "MinSatForValidNav", "4", false);
+	&writeConfigVal($configHash, "AgpsServer", "MinSatForFullAlmData", "12", false);
+	&writeConfigVal($configHash, "AgpsServer", "MinSatForValidAlm", "4", false);
+	&writeConfigVal($configHash, "AgpsServer", "ElevationThreshold", "0", false);
+	&writeConfigVal($configHash, "AgpsServer", "SendTowAssist", "0", false);
+	&writeConfigVal($configHash, "AgpsServer", "RefLocConfidence", "71", false);
+	&writeConfigVal($configHash, "AgpsServer", "DeltaFilePresent", "0", false);
+	&delParam($configHash, "AgpsServer", "UtcWNlsf");
+	&delParam($configHash, "AgpsServer", "UtcDN");
+	&writeConfigVal($configHash, "AgpsServer", "UtcDeltaTlsf", "18", true);
+	&writeConfigVal($configHash, "AgpsServer", "LeapSecUpdateDate", "20161231", true);
+	&writeConfigVal($configHash, "AgpsServer", "Aodo", "27900", false);
+	my $rinexlocalpath = sprintf("%s/AssistanceDataFiles", $gBasePath);
+	my $rinexbackuppath = sprintf("%s/rinexFilesBackup", $rinexlocalpath);
+	-d $rinexlocalpath or system("$mkdirCmd -p $rinexlocalpath 2> /dev/null > /dev/null") ;
+	-d $rinexbackuppath or system("$mkdirCmd -p $rinexbackuppath 2> /dev/null > /dev/null") ;
+	&writeConfigVal($configHash, "AgpsServer", "RinexLocalFilePath", $rinexlocalpath, false);
+
+	&writeConfigVal($configHash, "AgpsServer", "RgpsFileFetchPeriodicity", "360", false);
+	&writeConfigVal($configHash, "AgpsServer", "GpsDataValidityTime", "7200", false);
+
+	if ($rxProvider eq 1) {
+		system("$rmCmd $currentRelPath/$gBinDir/LeicaRinexCopy.sh 2> /dev/null > /dev/null");
+	}
+	elsif ($rxProvider eq 2) {
+		system("$rmCmd $currentRelPath/$gBinDir/RgpsFtpClient.sh 2> /dev/null > /dev/null");
+	}
+	if($gUsingVMware == true) {
+		&writeConfigVal($configHash, "AgpsServer", "AgpsDownForFailover", "-1", true);
+	} else {
+		&writeConfigVal($configHash, "AgpsServer", "AgpsDownForFailover", "3600", false);
+	}
+	&writeConfigVal($configHash, "AgpsServer", "EopFilePath", "/Disk/home/polaris/$gProductLc/AssistanceDataFiles/", false);
+	&writeConfigVal($configHash, "AgpsServer", "EopFileName", "EopFile", false);
+	&writeConfigVal($configHash, "AgpsServer", "EopFileReadInterval", "1", false);
+
+}
+
+sub admInstall($$$) {
+	my $sstrec = shift;
+	my $releaseDir = shift;
+	my $licconfig = shift;
+
+
+}
+
+sub admConfig ($$$$) {
+	my $configHash = shift;
+	my $currentRelPath = shift;
+	my $oldRelPath = shift;
+	my $licconfig = shift;
+	my $pltinstance = $gPltSstDetail{'Instance'};
+
+	my @licapps = getLicensedAppsForSst($gAdmSstDetail{'LicName'}, $licconfig, $pltinstance);
+	my $admapps = $gAdmSstDetail{'Apps'};
+	my $ip = &getParam($configHash, "PLATFORM_SVCS", "NodeIPAddress");
+	my $admapp = @{$admapps}[0];
+	my $wldm = false;
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$admapp/) {
+			$wldm = true;
+			last;
+		}
+	}
+
+	my $admapp = @{$admapps}[1];
+	my $wsdm = false;
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$admapp/) {
+			$wsdm = true;
+			last;
+		}
+	}
+
+	if ($wsdm == true) {
+		my $logFile = "WSDM-Record";
+		&updLogRetentionPeriod($configHash, $logFile, "0", "$gLogsDirPath", $gLogRetentionPeriod, "0");
+
+		&writeConfigVal($configHash, "WSDM_USER_SETTINGS", "PWS_IPAddress", $ip, false);
+		&writeConfigVal($configHash, "WSDM_USER_SETTINGS", "PWS_Port", getNextPort(), true);
+		&writeConfigVal($configHash, "WSDM_USER_SETTINGS", "PWS_IdleTimeout", "15", false);
+		&writeConfigVal($configHash, "WSDM_USER_SETTINGS", "PWS_TlsCertFile", "cacert.pem", false);
+		&writeConfigVal($configHash, "WSDM_USER_SETTINGS", "PWS_TlsKeyFile", "cakey.key", false);
+		&writeConfigVal($configHash, "WSDM_USER_SETTINGS", "UWS_PullDuration", "5", false);
+		&writeConfigVal($configHash, "WSDM_USER_SETTINGS", "UWS_Host", "madis-data.bldr.ncep.noaa.gov", false);
+		&writeConfigVal($configHash, "WSDM_USER_SETTINGS", "UWS_Path", "madisPublic1/data/LDAD/hfmetar/netCDF", false);
+		&writeConfigVal($configHash, "WSDM_USER_SETTINGS", "DataValidDuration", "60", false);
+		&writeConfigVal($configHash, "WSDM_USER_SETTINGS", "DataPurgeDuration", "7", false);
+		&writeConfigVal($configHash, "WSDM_USER_SETTINGS", "DataBackupPeriodicity", "60", false);
+		&writeConfigVal($configHash, "WSDM_USER_SETTINGS", "CliPort", getNextPort(), true);
+		my $bkpDir = "$gLogsDirPath/wsd_backup";
+		&writeConfigVal($configHash, "WSDM_USER_SETTINGS", "DataBackupPath", "$bkpDir", false);
+		-d $bkpDir or system("$mkdirCmd -p $bkpDir 2> /dev/null > /dev/null") ;
+	}
+
+	if ($wldm == true) {
+		#-d "$gLogsDirPath/WLD" or system("$mkdirCmd -p $gLogsDirPath/WLD 2> /dev/null > /dev/null") ;
+
+		my $logFile = "WLDM-Record";
+		&updLogRetentionPeriod($configHash, $logFile, "0", "$gLogsDirPath", $gLogRetentionPeriod, "0");
+
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "MO_CSV_WAP_IDENTIFIER_COLUMN", 2, true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "MO_CSV_DP_LONGITUDE_COLUMN", 5, true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "MO_CSV_DP_LATITUDE_COLUMN", 4, true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "MO_CSV_CABINET_LONGITUDE_COLUMN", 9, true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "MO_CSV_CABINET_LATITUDE_COLUMN", 8, true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "MO_CSV_EXCHANGE_LONGITUDE_COLUMN", 11, true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "MO_CSV_EXCHANGE_LATITUDE_COLUMN", 10, true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "MO_CSV_XLSX_KEY_COLUMN", 3, true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "CSV_FILE_START_DELIMITER", "_", true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "CSV_FILE_END_DELIMITER", "_", true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "CSV_FILE_SUFFIX", ".csv", true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "CSV_FILE_IDENTIFIER", "LOCATION", true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "MO_XLSX_FILE_KEY_COLUMN", 8, true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "MO_XLSX_OBB_EASTING_COLUMN", 22, true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "MO_XLSX_OBB_NORTHING_COLUMN", 23, true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "USE_CSV_LOC", "true", true);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "LocTypeSpecified", "true", true);
+		&writeConfigVal($configHash, "WLDM_UTM_ZONE_MAP_SETTINGS", "", "", false);
+		&writeConfigVal($configHash, "WLDM_RECTANGLE_GEOFENCE_SETTINGS", "", "", false);
+		&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "XlsxSheetOfInterest", "export_output_tags", true);
+
+		#&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "CliPort", getNextPort(), true);
+		#&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "CliSessionTimeOut", 60, false);
+		#my $bkpDir = "$gLogsDirPath/wld_backup";
+		#&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "DataBackupPath", "$bkpDir", false);
+		#-d $bkpDir or system("$mkdirCmd -p $bkpDir 2> /dev/null > /dev/null") ;
+		#&writeConfigVal($configHash, "WLDM_USER_SETTINGS", "DataBackupPeriodity", 1440, false);
+
+
+		my $restartsql = false;
+		my $found = `grep '# disable_log_bin' /etc/my.cnf | grep -v grep `;
+		chomp($found);
+		if($found =~ m/disable_log_bin/i) {
+			`/bin/sed -i 's/# disable_log_bin/disable_log_bin/g' /etc/my.cnf`;
+			$restartsql = true;
+		}
+
+		if($restartsql == true) {
+			`systemctl restart mysqld`;
+		}
+	}
+}
+
+
+sub olgwInstall($$) {
+	my $sstrec = shift;
+	my $releaseDir = shift;
+	my $licconfig = shift;
+}
+
+sub olgwConfig ($$$$)
+{
+	my $configHash = shift;
+	my $currentRelPath = shift;
+	my $oldRelPath = shift;
+	my $licconfig = shift;
+
+	my $sstinst = $gPltSstDetail{'Instance'};
+# Lam interface configuration
+
+	-d $gCdtPathGsm or system("$mkdirCmd -p $gCdtPathGsm 2> /dev/null > /dev/null") ;
+	system("$chmodCmd -R 777 $gCdtPathGsm 2> /dev/null > /dev/null");
+
+	-d $gCdtPathUmts or system("$mkdirCmd -p $gCdtPathUmts 2> /dev/null > /dev/null") ;
+	system("$chmodCmd -R 777 $gCdtPathUmts 2> /dev/null > /dev/null");
+
+	-d $gCdtPathLte or system("$mkdirCmd -p $gCdtPathLte 2> /dev/null > /dev/null") ;
+	system("$chmodCmd -R 777 $gCdtPathLte 2> /dev/null > /dev/null");
+
+	-d $gCdtPathNr or system("$mkdirCmd -p $gCdtPathNr 2> /dev/null > /dev/null") ;
+	system("$chmodCmd -R 777 $gCdtPathNr 2> /dev/null > /dev/null");
+
+	my $lteLicensed = &getParam($licconfig, "FEATURES", "OLGWLteLicensed");
+	if ($lteLicensed eq "true") {
+		lamIntfConfig($configHash, true);
+	} else {
+		lamIntfConfig($configHash, false);
+	}
+
+	#&writeConfigVal($configHash, "BackupPath", "NetworkData", "$gBasePath/dump/SiteInfo", false);
+	&writeConfigVal($configHash, "KPI", "LcsThreshold", "10", false);
+	&writeConfigVal($configHash, "KPI", "OLGWThreshold", "10", false);
+
+	&writeConfigVal($configHash, "OlgwAlertThresholds", "ThresholdForConsecutiveLHFailure", "8", false);
+	&writeConfigVal($configHash, "OlgwAlertThresholds", "ThresholdForConsecutiveLHAtiFailure", "8", false);
+	&writeConfigVal($configHash, "OlgwAlertThresholds", "ThresholdForConsecutiveSLHFailure", "8", false);
+	&writeConfigVal($configHash, "OlgwAlertThresholds", "ThresholdForConsecutiveLGFailure", "8", false);
+	&writeConfigVal($configHash, "OlgwAlertThresholds", "ThresholdForConsecutiveSLGFailure", "8", false);
+	&writeConfigVal($configHash, "OlgwAlertThresholds", "ThresholdForLgSLRResponseFailureMsc", "8", false);
+	&writeConfigVal($configHash, "OlgwAlertThresholds", "SysThresholdForConsecutiveLHFailure", "8", false);
+	&writeConfigVal($configHash, "OlgwAlertThresholds", "SysThresholdForConsecutiveLHAtiFailure", "8", false);
+	&writeConfigVal($configHash, "OlgwAlertThresholds", "SysThresholdForConsecutiveSLHFailure", "8", false);
+	&writeConfigVal($configHash, "OlgwAlertThresholds", "SysThresholdForConsecutiveLGFailure", "8", false);
+	&writeConfigVal($configHash, "OlgwAlertThresholds", "SysThresholdForConsecutiveSLGFailure", "8", false);
+	&writeConfigVal($configHash, "OlgwAlertThresholds", "SysThresholdForLgSLRResponseFailure", "8", false);
+	&writeConfigVal($configHash, "OlgwAlertThresholds", "ThresholdForConsecutiveSHUdrFailure", "8", false);
+	&writeConfigVal($configHash, "OlgwAlertThresholds", "SysThresholdForConsecutiveShUdrFailure", "8", false);
+#&writeConfigVal($configHash, "OlgwAlertThresholds", "SysThresholdForConsecutiveNLhUecmFailure", "8", false);
+    &writeConfigVal($configHash, "OlgwAlertThresholds", "SysThresholdForConsecutiveNLhEeFailure", "8", false);
+#&writeConfigVal($configHash, "OlgwAlertThresholds", "ThresholdForConsecutiveNLgFailure", "8", false);
+#&writeConfigVal($configHash, "OlgwAlertThresholds", "SysThresholdForConsecutiveNLgFailure", "8", false);
+	&delParam ($configHash, "OlgwAlertThresholds", "SysThresholdForConsecutiveNLhUecmFailure");
+#	&delParam ($configHash, "OlgwAlertThresholds", "SysThresholdForConsecutiveNLhEeFailure");
+	&delParam ($configHash, "OlgwAlertThresholds", "ThresholdForConsecutiveNLgFailure");
+	&delParam ($configHash, "OlgwAlertThresholds", "SysThresholdForConsecutiveNLgFailure");
+	&writeConfigVal($configHash, "LCSI_SVCS", "TCP-IDLE-Timeout", "50", false);
+	#&writeConfigVal($configHash, "LCSI_SVCS", "ESRDMappingFile", "/Disk/home/polaris/$gProductLc/dump/ESRDInputFile.csv");
+	#&writeConfigVal($configHash, "LCSI_SVCS", "ESRDMappingFilePollTimeInMinutes", "5");
+	&writeConfigVal($configHash, "LCSI_SVCS", "EnableLamIntf", "true");
+
+	&migrateOlgwInterNetParam($configHash, "InterworkingErrorConfig", "systemFailure", "0,0,0,0,0,0,1", "1");
+	&migrateOlgwInterNetParam($configHash, "InterworkingErrorConfig", "dataMissing", "1,1,1,0,0,1,0", "0");
+	&migrateOlgwInterNetParam($configHash, "InterworkingErrorConfig", "unexpectedDataValue", "1,1,1,0,0,1,1", "1");
+	&migrateOlgwInterNetParam($configHash, "InterworkingErrorConfig", "facilityNotSupported", "1,1,1,0,0,0,1", "1");
+	&migrateOlgwInterNetParam($configHash, "InterworkingErrorConfig", "absentSubscriber", "0,0,0,0,0,0,0", "0");
+	&migrateOlgwInterNetParam($configHash, "InterworkingErrorConfig", "unauthorizedRequestingNetwork", "1,1,1,1,1,0,0", "0");
+	&migrateOlgwInterNetParam($configHash, "InterworkingErrorConfig", "unknownSubscriber", "0,0,0,0,0,0,0", "0");
+	&migrateOlgwInterNetParam($configHash, "InterworkingErrorConfig", "unidentifiedSubscriber", "0,0,0,0,0,0,0", "0");
+	&migrateOlgwInterNetParam($configHash, "InterworkingErrorConfig", "illegalSubscriber", "0,0,0,0,0,0,0", "0");
+	&migrateOlgwInterNetParam($configHash, "InterworkingErrorConfig", "illegalEquipment", "0,0,0,0,0,0,0", "0");
+	&migrateOlgwInterNetParam($configHash, "InterworkingErrorConfig", "unauthorizedLCSClient", "0,1,1,0,1,0,0", "0");
+	&migrateOlgwInterNetParam($configHash, "InterworkingErrorConfig", "positionMethodFailure", "0,0,0,0,1,0,0", "0");
+	&migrateOlgwInterNetParam($configHash, "InterworkingErrorConfig", "atiNotAllowed", "0,0,0,0,0,1,0", "0");
+
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HLRInterworkingErrorCountThresholdForSriLcs","4", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HLRInterworkingErrorCountThresholdForAti","4", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "MSCInterworkingErrorCountThreshold","4", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "SGSNInterworkingErrorCountThreshold","4", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HSSInterworkingErrorCountThresholdForSriLcs","4", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HSSInterworkingErrorCountThresholdForUdr","4", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "MMEInterworkingErrorCountThreshold","4", false);
+
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "ClearHLRMsgInterworkingErrorThresholdForSriLcs","4", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "ClearHLRMsgInterworkingErrorThresholdForAti","4", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "ClearMSCMsgInterworkingErrorThreshold","4", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "ClearSGSNMsgInterworkingErrorThreshold","4", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "ClearHSSMsgInterworkingErrorThresholdForSriLcs","4", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "ClearHSSMsgInterworkingErrorThresholdForUdr","4", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "ClearMMEMsgInterworkingErrorThreshold","4", false);
+
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HLRInterworkingErrorPercentageThresholdForSriLcs","40", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HLRInterworkingErrorPercentageThresholdForAti","40", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "MSCInterworkingErrorPercentageThreshold","40", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "SGSNInterworkingErrorPercentageThreshold","40", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HSSInterworkingErrorPercentageThresholdForSriLcs","40", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HSSInterworkingErrorPercentageThresholdForUdr","40", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "MMEInterworkingErrorPercentageThreshold","40", false);
+
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HLRInterworkingErrorConfiguredDurationToReportForSriLcs","300", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HLRInterworkingErrorConfiguredDurationToReportForAti","300", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "MSCInterworkingErrorConfiguredDurationToReport","300", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "SGSNInterworkingErrorConfiguredDurationToReport","300", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HSSInterworkingErrorConfiguredDurationToReportForSriLcs","300", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HSSInterworkingErrorConfiguredDurationToReportForUdr","300", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "MMEInterworkingErrorConfiguredDurationToReport","300", false);
+
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HLRTotalRequestCountThresholdForSriLcs","10", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HLRTotalRequestCountThresholdForAti","10", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "MSCTotalRequestCountThreshold","10", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "SGSNTotalRequestCountThreshold","10", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HSSTotalRequestCountThresholdForSriLcs","10", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "HSSTotalRequestCountThresholdForUdr","10", false);
+	&writeConfigVal($configHash, "InterworkingErrorHandlingDetails", "MMETotalRequestCountThreshold","10", false);
+
+	&delSection($configHash, "LCSClients");
+	&writeConfigVal($configHash, "LCSClients", "", "", false);
+	&writeConfigVal($configHash, "NDCS", "", "", false);
+	&writeConfigVal($configHash, "MNCS", "", "", false);
+	&writeConfigVal($configHash, "DomesticMMEs", "", "", false);
+	&writeConfigVal($configHash, "DomesticSGSNs", "", "", false);
+
+	my $port = &getParam($configHash,"LCSI_SVCS", "HttpListenPort");
+	if($port eq "") {
+		$port = &getParam($configHash,"LCA", "HttpListenPort");
+	}
+
+	if($port eq "") {
+		$port = getPort("Enter OLGW server HTTP request port", $gPortNumbers{1});
+	}
+	&writeConfigVal($configHash, "LCSI_SVCS", "HttpListenPort", $port, false);
+
+	my $ports = &getParam($configHash,"LCSI_SVCS", "HttpsListenPort");
+	if($ports eq "") {
+		$ports = getPort("Enter OLGW server HTTPS request ports", $gPortNumbers{11});
+	}
+	&writeConfigVal($configHash, "LCSI_SVCS", "HttpsListenPort", $ports, false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "TlsCertFile", "cacert.pem", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "TlsKeyFile", "cakey.key", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "LCSClientIpLogging", "false", false);
+
+	my $httpip = &getParam($configHash,"LCSI_SVCS", "LCSI-IP");
+	&delParam($configHash, "LCSI_SVCS", "LCSI-IP");
+	if($httpip eq "") {
+		$httpip = &getParam($configHash,"LCA", "LCSI-IP");
+	}
+
+	if($httpip eq "") {
+		$httpip = &getParam($configHash, "LCSI_SVCS", "VirtIpEthIntf_1_1");
+		&delParam($configHash, "LCSI_SVCS", "VirtIpEthIntf_1_1");
+	} else {
+		$httpip = sprintf("default0-%s", $httpip);
+	}
+
+	if($httpip eq "") {
+		$httpip = &getParam($configHash,"VirtualIp", "VirtIpEthIntf_OLGW_LCSI_1_1");
+	}
+
+	# delete legacy param from which LCSI IP was read
+    if($httpip eq "") {
+		$httpip = getIp("Enter OLGW server HTTP IP address", false, true);
+		$httpip = sprintf("default0-%s", $httpip);
+	}
+
+	# Will be mentioned in the OPD to update manually
+	#my $virtintf = &getParam($configHash,"VirtualIp", "VirtIpEthIntf_OLGW_LCSI_1_1");
+	#if($virtintf eq "") {
+	#	$virtintf = &getEthIntf("Enter interface to be used for http");
+	#}
+
+	&writeConfigVal($configHash, "VirtualIp", "VirtIpEthIntf_OLGW_LCSI_1_1", "$httpip", false);
+
+	&writeConfigVal($configHash, "LCSI_SVCS", "GSMRawFilePath", "/Disk/home/polaris/$gProductLc/dump/GSM/Network/", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "GSMFileLookupInterval", "5", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "GSMRawFileRemotePath", "/export/home/carrier/data/", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "GSMDataIPAddress", "127.0.0.1", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "GSMDataUser", "carrier", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "GSMDataPassword", "carrier", false);
+    &writeConfigVal($configHash, "LCSI_SVCS", "GSMServerPortNumber", "22");
+    &writeConfigVal($configHash, "LCSI_SVCS", "GSMFileTransferCommand", "sftp");
+
+	&writeConfigVal($configHash, "LCSI_SVCS", "UMTSRawFilePath", "/Disk/home/polaris/$gProductLc/dump/UMTS/Network/", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "UMTSFileLookupInterval", "5", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "UMTSRawFileRemotePath", "/export/home/carrier/data/", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "UMTSDataIPAddress", "127.0.0.1", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "UMTSDataUser", "carrier", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "UMTSDataPassword", "carrier", false);
+    &writeConfigVal($configHash, "LCSI_SVCS", "UMTSServerPortNumber", "22");
+    &writeConfigVal($configHash, "LCSI_SVCS", "UMTSFileTransferCommand", "sftp");
+
+	&writeConfigVal($configHash, "LCSI_SVCS", "LTERawFilePath", "/Disk/home/polaris/$gProductLc/dump/LTE/Network/", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "LTEFileLookupInterval", "5", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "LTERawFileRemotePath", "/export/home/carrier/data/", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "LTEDataIPAddress", "127.0.0.1", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "LTEDataUser", "carrier", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "LTEDataPassword", "carrier", false);
+    &writeConfigVal($configHash, "LCSI_SVCS", "LTEServerPortNumber", "22");
+    &writeConfigVal($configHash, "LCSI_SVCS", "LTEFileTransferCommand", "sftp");
+
+	&writeConfigVal($configHash, "LCSI_SVCS", "NRRawFilePath", "/Disk/home/polaris/$gProductLc/dump/NR/Network/", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "NRFileLookupInterval", "5", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "NRRawFileRemotePath", "/export/home/carrier/data/", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "NRDataIPAddress", "127.0.0.1", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "NRDataUser", "carrier", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "NRDataPassword", "carrier", false);
+    &writeConfigVal($configHash, "LCSI_SVCS", "NRServerPortNumber", "22");
+    &writeConfigVal($configHash, "LCSI_SVCS", "NRFileTransferCommand", "sftp");
+
+	&writeConfigVal($configHash, "LCSI_SVCS", "MsgAckTimeout", "110", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "LocProtVer", "3.3.0", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "CoordFieldSeperator", "SPACE", false);
+
+	&writeConfigVal($configHash, "LCSI_SVCS", "ThresholdForConsecutiveSlisFailures", "8", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "ThresholdForConsecutiveTlrsFailures", "8", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "ThresholdForConsecutiveFTlrsFailures", "8", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "ThresholdForConsecutiveElisFailures", "8", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "ThresholdForConsecutiveSisFailures", "8", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "SysSLRTimeForNoReqRcvdAlert", "60", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "SLRTimeForNoReqRcvdAlertMsc", "60", false);
+
+	&writeConfigVal($configHash, "LCSI_SVCS", "ThresholdForLocIdMapFailureCounterToRaiseAlarm", "16", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "ThresholdForLocIdMapFailureCounterToClearAlarm", "0", false);
+
+	&writeConfigVal($configHash, "LCSI_SVCS", "TimeForNoReqRcvdSlisAlert", "60", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "TimeForNoReqRcvdTlrsAlert", "60", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "TimeForNoReqRcvdFTlrsAlert", "60", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "TimeForNoReqRcvdElisAlert", "60", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "TimeForNoReqRcvdSisAlert", "60", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "SysLevelTimeForNoReqRcvdAlert","60",false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "ClientLevelTimeForNoReqRcvdAlert","60",false);
+
+	&writeConfigVal($configHash, "LCSI_SVCS", "IgnoreBlankLinesBeforeXmlTag", "false", false);
+
+	&writeConfigVal($configHash, "LCSI_SVCS", "SmartphonePurgeIntervalInMinutes", "30", false);
+
+	&writeConfigVal($configHash, "LCSI_SVCS","SendTrackingLastReportFlag", "false", false);
+	&writeConfigVal($configHash, "LCSI_SVCS","SendTrackReportSequenceNum", "false", false);
+
+	if($gUsingVMware == true) {
+		&writeConfigVal($configHash, "OLGW", "CNAppConnDownForFailover", "-1", true);
+		&writeConfigVal($configHash, "OLGW", "CNAppConnDownFailureCnt", "-1", true);
+		&writeConfigVal($configHash, "OLGW", "CNAppConnDownFailureDuration", "-1", true);	
+	} else {
+		&writeConfigVal($configHash, "OLGW", "CNAppConnDownForFailover", "5", false);
+		&writeConfigVal($configHash, "OLGW", "CNAppConnDownFailureCnt", "3", false);
+		&writeConfigVal($configHash, "OLGW", "CNAppConnDownFailureDuration", "10", false);
+	}
+
+	&writeConfigVal($configHash, "MMEHostMappingConfig", "HostMappingSeperator", "pw.", false);
+	&writeConfigVal($configHash, "MMEHostMappngEntries", "", "", false);
+
+	&writeConfigVal($configHash, "LCSI_SVCS", "DurationToClearSRSTPSAlarmInsec", "5", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "DurationToClearMRSTPSAlarmInsec", "5", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "DurationToClearSRSOutstandingTxnAlarmInsec", "5", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "DurationToClearMRSOutstandingTxnAlarmInsec", "5", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "DurationToClearMRSRRPMAlarmInsec", "5", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "LCSIResponseWorkerThreads", "10", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "LeakyBucketFeatureEnabled", "0", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "LEAKY_BUCKET_TPS", "50", false);
+	&writeConfigVal($configHash, "LCSI_SVCS", "LEAKY_BUCKET_MSG_ACK_TIME", "600", false);
+
+	#bug 13165
+	&delParam($configHash, "LCSI_SVCS", "OutstandingTxn");
+	&delParam($configHash, "LCSI_SVCS", "OutstandingEmergencyTxn");
+	&delParam($configHash, "LCSI_SVCS", "OutstandingSisTxn");
+	&delParam($configHash, "LCSI_SVCS", "TpsLimit");
+	&delParam($configHash, "LCSI_SVCS", "GSMRawFileParserScript");
+	&delParam($configHash, "LCSI_SVCS", "UMTSRawFileParserScript");
+	&delParam($configHash, "LCSI_SVCS", "LTERawFileParserScript");
+	&delParam($configHash, "LCSI_SVCS", "OlgwAppReadyIndTimeout");
+	&delParam($configHash, "LCSI_SVCS", "MaxNoOfReadyReqAttempts");
+	&delParam($configHash, "LCSI_SVCS", "MaxFDValue");
+	&delParam($configHash, "LCSI_SVCS", "MaxNoOfWorkerThreads");
+	&delParam($configHash, "LCSI_SVCS", "OutstandingTxnPerLCSC");
+	&delParam($configHash, "LCSI_SVCS", "AlarmTPS");
+	&delParam($configHash, "LCSI_SVCS", "DurationToClearTPSAlarmInsec");
+	&delParam($configHash, "LCSI_SVCS", "AlarmOutstandingTxn");
+	&delParam($configHash, "LCSI_SVCS", "DurationToClearOutstandingTxnAlarmInsec");
+    &delParam($configHash, "SRI-LCS", "Max_outstanding");
+    &delParam($configHash, "SRI-LCS", "SLh_Max_outstanding");
+    &delParam($configHash, "PSL", "Max_outstanding");
+    &delParam($configHash, "PSL", "SLg_Max_outstanding");
+    &delParam($configHash, "UDR", "Max_outstanding");
+    &delParam($configHash, "ATI", "MaxOutstanding");
+
+	&delParam($configHash, "SRI-LCS", "Guard_timer");
+	&delParam($configHash, "SRI-LCS", "SLh_Guard_timer");
+	&delParam($configHash, "PSL", "PslRetryCount");
+	&delParam($configHash, "PSL", "PslRetryGuardTimer");
+	&delParam($configHash, "PSL", "Qos_ResponseTime");
+	&delSection($configHash, "SRI-LCS");
+	&delSection($configHash, "PSL");
+	&delSection($configHash, "ATI");
+	&delSection($configHash, "UDR");
+	&writeConfigVal($configHash, "SL", "Guard_timer", "55", false);
+	&writeConfigVal($configHash, "SL", "PslRetryCount", "0", false);
+	&writeConfigVal($configHash, "SL", "PslRetryGuardTimer", "30", false);
+	&writeConfigVal($configHash, "SL", "Qos_ResponseTime", "1", false);
+	&writeConfigVal($configHash, "LI", "Guard_timer", "55", false);
+	&writeConfigVal($configHash, "USD", "Guard_timer", "55", false);
+    &writeConfigVal($configHash, "SS", "Guard_timer", "55", false);
+    &writeConfigVal($configHash, "SS", "LhSupported", "true", false);
+    &writeConfigVal($configHash, "SS", "SLhSupported", "true", false);
+    &writeConfigVal($configHash, "SS", "NudmUECMSupported", "true", false);
+    &writeConfigVal($configHash, "SS", "ProcedurePriorityOrder", "LH:SLH:NUDM_UECM", false);
+
+	&writeConfigVal($configHash, "Track", "Max_time_to_start", "2419200", false);
+	&writeConfigVal($configHash, "Track", "Min_time_to_start", "600", false);
+	&writeConfigVal($configHash, "Track", "Max_duration", "2419200", false);
+	&writeConfigVal($configHash, "Track", "Min_duration", "120", false);
+	&writeConfigVal($configHash, "Track", "Max_interval", "86400", false);
+	&writeConfigVal($configHash, "Track", "Min_interval", "60", false);
+	&writeConfigVal($configHash, "Track", "TimeToSwitchHAToDefaultValueInShortTlrr", "010000", false);
+	&writeConfigVal($configHash, "Track", "MaxNumOfIntervalSecondsToDecideShortTlrr", "000200", false);
+	&writeConfigVal($configHash, "Track", "DetermineServingSwitchEveryInterval", "0", false);
+    &writeConfigVal($configHash, "MobileNumberPortedOutCauseList", "UNKNOWN_SUB", "7", false);
+    &writeConfigVal($configHash, "MobileNumberPortedOutCauseList", "SYSTEM_FAILURE", "6", false);
+    &writeConfigVal($configHash, "MobileNumberPortedOutCauseList", "DATA_MISSING", "0", false);
+    &writeConfigVal($configHash, "MobileNumberPortedOutCauseList", "UNEXP_DATA_VAL", "0", false);
+    &writeConfigVal($configHash, "MobileNumberPortedOutCauseList", "SERV_NOT_SUPP", "0", false);
+    &writeConfigVal($configHash, "MobileNumberPortedOutCauseList", "ABSENT_SUB", "0", false);
+    &writeConfigVal($configHash, "MobileNumberPortedOutCauseList", "UNAUTH_REQ_NW", "0", false);
+    &writeConfigVal($configHash, "MobileNumberPortedOutCauseList", "ATI_NOT_ALLOWED", "0", false);
+    
+    &writeConfigVal($configHash, "MobileNumberPortedOutCauseList", "NUDM_CONTEXT_NOT_FOUND", "0", false);
+   &writeConfigVal($configHash, "MobileNumberPortedOutCauseList", "NUDM_USER_NOT_FOUND", "3", false);
+   &writeConfigVal($configHash, "MobileNumberPortedOutCauseList", "NUDM_MONITOR_NOT_ALLOWED", "0", false);
+   &writeConfigVal($configHash, "MobileNumberPortedOutCauseList", "NUDM_UNSUPPORTED_MONITORING_EVENT_TYPE", "0", false);
+   &writeConfigVal($configHash, "MobileNumberPortedOutCauseList", "NUDM_UNSUPPORTED_MONITORING_REPORT_OPTIONS", "0", false);
+
+#workaround to pick the last configuration
+	my $logFile = "\*.csv";
+	my $dumpdir = &getParam($configHash, "LCSI_SVCS", "GSMRawFilePath");
+	&updLogRetentionPeriod($configHash, $logFile, "0", "$dumpdir/history", $gLogRetentionPeriod, "0");
+
+	$dumpdir = &getParam($configHash, "LCSI_SVCS", "UMTSRawFilePath");
+	&updLogRetentionPeriod($configHash, $logFile, "0", "$dumpdir/history", $gLogRetentionPeriod, "0");
+
+	$dumpdir = &getParam($configHash, "LCSI_SVCS", "LTERawFilePath");
+	&updLogRetentionPeriod($configHash, $logFile, "0", "$dumpdir/history", $gLogRetentionPeriod, "0");
+
+	my $newPath = "$currentRelPath/$gBinDir";
+	if($oldRelPath ne "" ) {
+		my $file;
+		my $oldPath = "";
+		my %oldRelData = ();
+		&getOldRelDir($oldRelPath, \%oldRelData);
+		$oldPath = "";
+		if($oldRelData{'from'} eq mlccn || $oldRelData{'from'} eq lc($gProductLegacy)) {
+			$oldPath =  $oldRelData{'rel'};
+		} else {
+			$oldPath = "$gLDirPath";
+		}
+		&copyFileFromPrevRel($file, $file, $newPath, $oldPath);
+		$file = getParam($configHash, "LCSI_SVCS", "TlsCertFile");
+		&copyFileFromPrevRel($file, $file, $newPath, $oldPath);
+		$file = getParam($configHash, "LCSI_SVCS", "TlsKeyFile");
+		&copyFileFromPrevRel($file, $file, $newPath, $oldPath);
+	} else {
+		my $oldPath = "$gLDirPath";
+		my $file = getParam($configHash, "LCSI_SVCS", "TlsCertFile");
+		&copyFileFromPrevRel($file, $file, $newPath, $oldPath);
+		$file = getParam($configHash, "LCSI_SVCS", "TlsKeyFile");
+		&copyFileFromPrevRel($file, $file, $newPath, $oldPath);
+	}
+
+}
+
+sub oamInstall($$) {
+	my $sstrec = shift;
+	my $releaseDir = shift;
+	my $licconfig = shift;
+	my $pkgname = $sstrec->{'PkgName'};
+	my @tarfile = split(".tar.gz", $pkgname);
+	my $oaminstaller = "$releaseDir/$gPkgDir/$tarfile[0]";
+	printf("callling installer $oaminstaller..\n");
+	system("$oaminstaller");
+
+}
+
+sub oamConfig ($$$$) {
+	my $configHash = shift;
+	my $currentRelPath = shift;
+	my $oldRelPath = shift;
+	my $licconfig = shift;
+}
+
+sub cgwInstall($$$) {
+	my $sstrec = shift;
+	my $releaseDir = shift;
+	my $licconfig = shift;
+	# nothing needs to be done now
+}
+
+sub cgwConfig ($$$$) {
+	my $configHash = shift;
+	my $currentRelPath = shift;
+	my $oldRelPath = shift;
+	my $licconfig = shift;
+
+	&writeConfigVal($configHash, "CAMEL", "ConfiguredEventDuration", "30", false);
+	&writeConfigVal($configHash, "CAMEL", "EventHighThreshold", "30000", false);
+	&writeConfigVal($configHash, "CAMEL", "EventLowThreshold", "25000", false);
+
+	if($gUsingVMware == true) {
+		&writeConfigVal($configHash, "CAMEL", "CNAppConnDownForFailover", "-1", true);
+		&writeConfigVal($configHash, "CAMEL", "CNAppConnDownFailureCnt", "-1", true);
+		&writeConfigVal($configHash, "CAMEL", "CNAppConnDownFailureDuration", "-1", true);
+	} else {
+		&writeConfigVal($configHash, "CAMEL", "CNAppConnDownForFailover", "5", false);
+		&writeConfigVal($configHash, "CAMEL", "CNAppConnDownFailureCnt", "3", false);
+		&writeConfigVal($configHash, "CAMEL", "CNAppConnDownFailureDuration", "10", false);
+	}
+}
+
+sub hvgwInstall($$$) {
+	my $sstrec = shift;
+	my $releaseDir = shift;
+	my $licconfig = shift;
+}
+
+sub hvgwConfig ($$$$) {
+	my $configHash = shift;
+	my $currentRelPath = shift;
+	my $oldRelPath = shift;
+	my $licconfig = shift;
+
+	my $pltinstance = $gPltSstDetail{'Instance'};
+	my $sstinstance = $gHVGwSstDetail{'Instance'};
+
+	my $hvgwapps = $gHVGwSstDetail{'Apps'};
+	my $hvgwapp = @{$hvgwapps}[0];
+	my @licapps = &getLicensedApps($gHVGwSstDetail{'LicName'}, $hvgwapp, $licconfig, $pltinstance);
+	foreach my $licapp (@licapps) {
+		my $hvgwinstance = &getAppInstanceId($gHVGwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+		my $hvgwsecname = sprintf("HVLRGW_%d_%d", $sstinstance, $hvgwinstance);
+		my $dumpdir = sprintf("%s/hvlr_%d_%d", $gHVlrDumpDir, $sstinstance, $hvgwinstance); # create an empty hlrdump directory
+		-d $dumpdir or system("$mkdirCmd -p $dumpdir 2> /dev/null > /dev/null") ;
+		&writeConfigVal($configHash, $hvgwsecname, "DumpFilePath", $dumpdir, false);
+	}
+	if($gUsingVMware == true) {
+		&writeConfigVal($configHash, "HVLRGW", "CNAppConnDownForFailover", "-1", true);
+		&writeConfigVal($configHash, "HVLRGW", "CNAppConnDownFailureCnt", "-1", true);
+		&writeConfigVal($configHash, "HVLRGW", "CNAppConnDownFailureDuration", "-1", true);
+	} else {
+		&writeConfigVal($configHash, "HVLRGW", "CNAppConnDownForFailover", "5", false);
+		&writeConfigVal($configHash, "HVLRGW", "CNAppConnDownFailureCnt", "3", false);
+		&writeConfigVal($configHash, "HVLRGW", "CNAppConnDownFailureDuration", "10", false);
+	}
+}
+
+sub migrateOlgwInterNetParam($$$$$)
+{
+	my $configHash = shift;
+	my $key = shift;
+	my $param = shift;
+	my $defval = shift;
+	my $newdelta = shift;
+
+	my $value = &getParam($configHash, $key, $param);
+	if($value eq "") {
+		$value = $defval;
+	} else {
+		my $count = ($value =~ tr/,//);
+		if($count == 5) {
+			$value = sprintf("%s,%s", $value, $newdelta);
+		}
+	}
+	&writeConfigVal($configHash, $key, $param, $value, true);
+}
+
+# Product name is obtained from the name of the scritp.
+# scritp name should be of following format
+# <product_name>_<whatever>
+sub getProduct()
+{
+	my $file = basename($0);
+	my @values = split("_", $file);
+	return $values[0];
+}
+
+sub getRelease()
+{
+	my $tarfile = getcwd;
+	chomp $tarfile;
+	$tarfile = basename($tarfile);
+
+	my $release = "R0.0.0.0";
+
+# get the release name from the release directory
+# The release directory name will be of the format
+# MLC_RELEASE_R1.1.1.1
+# The release name comes between RELEASE_ and end
+	if($tarfile =~ m/RELEASE_R(.*?)$/) {
+		$release = $1;
+	} else {
+		logToFile ("Invalid version format of the tar file $tarfile", LOGFATAL);
+	}
+	my @version = split('\.', $release);
+	if( @version != 4 && @version != 3) {
+		logToFile ("Version number $version[0], $version[1] not equal to 3 or 4 in tar file $tarfile", LOGFATAL);
+	}
+
+	return $release;
+}
+
+sub copyFileFromPrevRel($$$$)
+{
+	my $newFile = shift;
+	my $oldFile = shift;
+	my $newRelPath = shift;
+	my $oldRelPath = shift;
+
+	if($oldFile eq "" or $oldRelPath eq "")
+	{
+		return;
+	}
+
+#get absolute path of both the file
+	my $is_absolute = File::Spec->file_name_is_absolute($oldFile);
+	if($is_absolute == 0)
+	{
+		$oldFile = "$oldRelPath/$oldFile";
+	}
+	$oldFile = Cwd::abs_path($oldFile);
+
+#get absolute path of both the file
+	$newFile = "$newRelPath/$newFile";
+	if($newFile ne $oldFile)
+	{
+		if(-f $oldFile)
+		{
+			copy($oldFile, $newFile);
+		}
+	}
+}
+
+sub genPort()
+{
+	for (my $i=0; $i <= $gMaxPortAppIndex; $i++) {
+		$gPortNumbers{$i} = $gBasePort + $i;
+	}
+	#reset LAM port to port used in 6.4
+	$gPortNumbers{3} = 40003;
+}
+
+sub getNextPort() {
+	++$gPortIndex;
+	return $gPortNumbers{$gPortIndex};
+}
+
+sub replaceSectionInIni($$$) {
+	my $configHash = shift;
+	my $oldsection = shift;
+	my $newsection = shift;
+
+	if( exists $configHash->{$oldsection} ) {
+		my @oldentries = @{$configHash->{$oldsection}};
+		my $oldsize = scalar(@oldentries);
+		if($oldsize > 0) {
+			$configHash->{$newsection} = \@oldentries;
+			delete $configHash->{$oldsection};
+		}
+	}
+}
+
+sub copySectionInIni($$$) {
+	my $configHash = shift;
+	my $oldsection = shift;
+	my $newsection = shift;
+
+	if( exists $configHash->{$oldsection} ) {
+		my @oldentries = @{$configHash->{$oldsection}};
+		my $oldsize = scalar(@oldentries);
+		if($oldsize > 0) {
+			$configHash->{$newsection} = \@oldentries;
+		}
+	}
+}
+
+sub replaceParamInIni($$$$$) {
+	my $configHash = shift;
+	my $oldsection = shift;
+	my $newsection = shift;
+	my $oldparam = shift;
+	my $newparm = shift;
+
+	my $value = &getParam($configHash, $oldsection, $oldparam);
+	&delParam($configHash, $oldsection, $oldparam);
+	&writeConfigVal($configHash, $newsection, $newparm, $value, false);
+
+	return $value;
+}
+
+
+sub delSection($$) {
+	my $configHash = shift;
+	my $section = shift;
+	delete $configHash->{$section};
+}
+
+
+sub delParam($$$) {
+	my $configHash = shift;
+	my $section = shift;
+	my $param = shift;
+
+	my $cnt = 0;
+	foreach my $parminfo (@{$configHash->{$section}}) {
+		if( $param eq $parminfo->{'name'} ) {
+			splice @{$configHash->{$section}}, $cnt, 1;
+			last;
+		}
+		$cnt++;
+	}
+}
+
+sub getParam($$$) {
+	my $configHash = shift;
+	my $section = shift;
+	my $param = shift;
+
+	my $empty;
+
+	foreach my $parminfo (@{$configHash->{$section}}) {
+		if( $param eq $parminfo->{'name'} ) {
+			return $parminfo->{'value'};
+		}
+	}
+	return $empty;
+}
+
+sub getSectionPararms($$) {
+	my $configHash = shift;
+	my $section = shift;
+	if(exists $configHash->{$section}) {
+		return $configHash->{$section};
+	} else {
+		my @dummy = ();
+		return \@dummy;
+	}
+}
+
+sub getSectionSize($$) {
+	my $configHash = shift;
+	my $section = shift;
+	my $size = 0;
+
+	if(exists $configHash->{$section}) {
+		foreach my $info (@{$configHash->{$section}}) {
+			if( $info->{'name'} ne "" && $info->{'value'} ne "" ) {
+				$size++;
+			}
+		}
+	}
+
+	return $size;
+}
+
+sub setParam($$$$) {
+	my $configHash = shift;
+	my $section = shift;
+	my $param = shift;
+	my $value = shift;
+
+	my $found = false;
+	my $idx = 0;
+	foreach my $parminfo (@{$configHash->{$section}}) {
+		if( $param eq $parminfo->{'name'} ) {
+			$configHash->{$section}->[$idx]->{'value'} = $value;
+			$found = true;
+			last;
+		}
+		$idx++;
+	}
+
+	if($found == false) {
+		my %paraminfo = ();
+		$paraminfo{'name'} = $param;
+		$paraminfo{'value'} = $value;
+		push @{$configHash->{$section}}, \%paraminfo ;
+	}
+}
+
+sub AppendIniFile($$$$) {
+	my $file = shift;
+	my $configHash = shift;
+	my $append = shift;
+	my $printEnd = shift;
+	my $inifd;
+	if($append == true) {
+		open($inifd, ">>", "$file") or printf("Configuration file $file cannot be opened for writing\n");
+	} elsif ($append == false) {
+		open($inifd, ">", "$file") or printf("Configuration file $file cannot be opened for writing\n");
+	}
+
+	foreach my $section (sort keys %{$configHash} ) {
+		print $inifd "\n[$section]\n";
+		foreach my $parminfo (@{$configHash->{$section}}) {
+			my $name = $parminfo->{'name'};
+			my $value = $parminfo->{'value'};
+			if($value ne "") {
+				print $inifd "$name = $value\n";
+			} elsif ($name ne "") {
+				print $inifd "$name\n";
+			}
+		}
+	}
+
+	if($printEnd == true) {
+		print $inifd "\n[END]\n";
+	}
+	close($inifd);
+}
+
+sub writeIniFile($$) {
+	my $file = shift;
+	my $configHash = shift;
+	my $inifd;
+	open($inifd, ">", "$file") or printf("Configuration file $file cannot be opened for writing\n");
+
+	foreach my $section (sort keys %{$configHash} ) {
+		print $inifd "\n[$section]\n";
+		foreach my $parminfo (@{$configHash->{$section}}) {
+			my $name = $parminfo->{'name'};
+			my $value = $parminfo->{'value'};
+			if($value ne "") {
+				print $inifd "$name = $value\n";
+			} elsif ($name ne "") {
+				print $inifd "$name\n";
+			}
+		}
+	}
+
+	print $inifd "\n[END]\n";
+	close($inifd);
+}
+
+sub readIniFile($$$) {
+	my $file = shift;
+	my $configHash = shift;
+	my $removeSection = shift;
+
+	if(-e "$file")
+	{
+		my $inifd;
+		open($inifd, "<", "$file") or printf("Configuration file $file cannot be opened for reading\n");
+		my @oldEntries = <$inifd>;
+		close($inifd);
+
+		my @values = ();
+		my $section = "";
+		#my @structentries = new();
+		foreach my $line (@oldEntries)
+		{
+			chomp $line;
+# ignore commented lines
+			if($line =~ /^#/){
+				next;
+			}
+			if($line =~ /^;/){
+				next;
+			}
+
+# ignore the legacy platform section
+			if ($line =~ /=/)
+			{
+				if($removeSection == true) {
+					if ($section =~ /APPLICATION_/)
+					{
+						next;
+					}
+					if ($section eq "APPDATA")
+					{
+						next;
+					}
+					if ($section eq "SUPPORTED_GADS")
+					{
+						next;
+					}
+				}
+
+				@values = split('=', $line, 2);
+				chomp(@values);
+				my %paraminfo = ();
+				$paraminfo{'name'} = trimmer($values[0]);
+				$paraminfo{'value'} = trimmer($values[1]);
+				if($paraminfo{'name'} ne "" || $paraminfo{'value'} ne "") {
+					push @{$configHash->{$section}}, \%paraminfo ;
+				}
+				next;
+			}
+			elsif($line =~ /\[/)
+			{
+				my @values = split('\[', $line);
+				$line = $values[1];
+				@values = split('\]', $line);
+				$section = $values[0];
+				next;
+			}
+
+# test for non empty line and non empty section.
+# if yes, these are paramters without the "=" and without
+# value they also need to be retained
+			if($section ne "") {
+				if(($line  ne "") || ($removeSection == false)) {
+					my %paraminfo = ();
+					$paraminfo{'name'} = trimmer($line);
+					$paraminfo{'value'} = "";
+					push @{$configHash->{$section}}, \%paraminfo ;
+				}
+			}
+		}
+	}
+	else
+	{
+		printf("Configuration file $file does not exist\n");
+	}
+}
+
+sub setupLogsMgrForKpiAndCr($) {
+	my $configHash = shift;
+
+	my $logFileOpt;
+	if($gProductLc eq tsmlccn) {
+		$logFileOpt = sprintf("0,%s/KPI,%d,0", $gLogsDirPath, 365);
+	}else{
+		$logFileOpt = sprintf("0,%s/KPI,%d,0", $gLogsDirPath, $gLogRetentionPeriod);
+	}
+	my $logFile = "KPI";
+	&updLogRetentionPeriod($configHash, $logFile, "0", "$gLogsDirPath/$logFile", $gLogRetentionPeriod, "0");
+
+	$logFile = "LocationResult";
+	&updLogRetentionPeriod($configHash, $logFile, "0", "$gLogsDirPath/$logFile", $gLogRetentionPeriod, "1");
+
+	$logFile = "ReqLog";
+	&updLogRetentionPeriod($configHash, $logFile, "0", "$gLogsDirPath/MsgLog", $gLogRetentionPeriod, "1");
+
+	$logFile = &getParam($configHash, "LOGGER", "SyslogFileName");
+	&updLogRetentionPeriod($configHash, $logFile, "0", $gLogsDirPath, $gLogRetentionPeriod, "1");
+}
+
+# this function updates the parmaters which are node specific
+# checkpointing uses this
+sub updateNodeSpecicParam($$$) {
+	my $configHash = shift;
+	my $parm = shift;
+	my $parmv = shift;
+	my $value = &getParam($configHash, "OamProxy", "IgnoreForCkpt");
+	if($value eq "") {
+		$value = sprintf("%s:%s", $parm, $parmv);
+	} else {
+		$value = sprintf("%s,%s:%s", $value, $parm, $parmv);
+	}
+	&writeConfigVal($configHash, "OamProxy", "IgnoreForCkpt", $value, true);
+}
+
+
+sub getBaseInstallPath($)
+{
+	my $domount = shift;
+#print "Enter base install path [default: " . $gBasePath . "]: ";
+#my $gBasePathInput = <STDIN>;
+#chomp $gBasePathInput;
+#$gBasePathInput = trimmer($gBasePathInput);
+#if ($gBasePathInput ne "") { $gBasePath = $gBasePathInput; }
+
+	&setupPaths();
+
+	if ($domount == true) {
+		my %iniConfig = ();
+		my $rednIni = &getRednNodesIniFile($gNodeCnt);
+		&readIniFile($rednIni, \%iniConfig, true);
+		my $mountPath = &getParam(\%iniConfig, "MLC_BLADE", "MOUNT_PATH");
+		&handleMountCmd($mountPath);
+	}
+
+	-d $gBasePath or system("$mkdirCmd -p $gBasePath 2> /dev/null > /dev/null");
+
+	-d $gLogsDirPath or system("$mkdirCmd -p $gLogsDirPath 2> /dev/null > /dev/null") ;
+	# BUG-902: commenting all change modes, as it takes log of time over nas. 
+	# On need selective directories can be added
+	#system("$chmodCmd 777 $gLogsDirPath 2> /dev/null > /dev/null");
+
+	-d $crLogDir or system("$mkdirCmd -p $crLogDir 2> /dev/null > /dev/null") ;
+	# BUG-902: commenting all change modes, as it takes log of time over nas. 
+	# On need selective directories can be added
+	#system("$chmodCmd 777 $crLogDir 2> /dev/null > /dev/null");
+
+	-d $pidFileDir or system("$mkdirCmd -p $pidFileDir 2> /dev/null > /dev/null") ;
+	system("$chmodCmd 777 $pidFileDir 2> /dev/null > /dev/null");
+
+	system("$touchCmd $scriptLogFile 2> /dev/null > /dev/null");
+	system("$chmodCmd 777 $scriptLogFile 2> /dev/null > /dev/null");
+}
+
+sub getInputRange($$$$) {
+	my $prompt  = shift;
+	my $minval  = shift;
+	my $maxval  = shift;
+	my $defval  = shift;
+	my $input = &getPromptInput("$prompt [Default: $defval]");
+	while (true){
+		if ($input eq "") { $input = $defval; }
+		if( $input > $maxval ||  $input < $minval) {
+			printf("Input is not valid. Enter again.\n");
+			#delete $gPromptToInput{$prompt};
+			delete $gPromptToInput{"$prompt [Default: $defval]"};
+			$input = &getPromptInput("$prompt [Default: $defval]");
+			#printf("input is $input ");
+		}
+		else {
+			last;
+		}
+	}
+	return $input;
+}
+
+sub getInputString($) {
+	my $prompt  = shift;
+	my $input = &getPromptInput("$prompt");
+	while (true){
+		$input = trimmer($input);
+		if ($input  eq "") {
+			printf("Input is mandatory. Enter again.\n");
+			delete $gPromptToInput{$prompt};
+			$input = &getPromptInput("$prompt");
+		} else {
+			last;
+		}
+	}
+	return $input;
+}
+
+sub getInputNumber($$) {
+	my $prompt  = shift;
+	my $defval  = shift;
+
+	my $input;
+	if ($defval == 0) {
+		printf("Input is not valid. Enter again.\n");
+		delete $gPromptToInput{$prompt};
+		$input = &getPromptInput("$prompt");
+		while (true){
+			if( $input =~ m/^\d*$/ ) {
+				last;
+			}
+			else {
+				printf("Input is not valid. Enter again.\n");
+				delete $gPromptToInput{$prompt};
+				$input = &getPromptInput("$prompt");
+			}
+		}
+	}else{
+		$input = &getPromptInput("$prompt [Default: $defval]");
+		while (true){
+			if ($input eq "") { $input = $defval; }
+			if( $input =~ m/^\d*/ ) {
+				last;
+			}
+			else {
+				printf("Input is not valid. Enter again.\n");
+				delete $gPromptToInput{$prompt};
+				$input = &getPromptInput("$prompt [Default: $defval]");
+			}
+		}
+	}
+	return $input;
+}
+
+
+sub getIp($$$) {
+	my $prompt  = shift;
+	my $useLocal  = shift;
+	my $printDefault = shift;
+
+	my $ip;
+	if($useLocal == 1) {
+		my %iniConfig = ();
+		my @configips = ();
+		my $rednIni = &getRednNodesIniFile($gNodeCnt);
+		if( -f $rednIni) {
+        	&readIniFile($rednIni, \%iniConfig, true);
+        	my $nodips = &getParam(\%iniConfig, "MLC_BLADE", "MLC_IPS");
+			my @ippairs = split(",", $nodips);
+			foreach my $ipintf (@ippairs) {
+				my @ipfields = split("-", $ipintf);
+				push(@configips, $ipfields[1]);
+			}
+		}
+		my @ips = getSystemIps();
+		push(@ips, @configips);
+
+		my $numIps = scalar (@ips);
+# if only one ip is configured in the system use it for all the
+# ip prompts
+		if($numIps == 1) {
+			return $ips[0];
+		} else {
+			my $defval = "";
+			my $cnt = 0;
+			foreach my $ip (@ips) {
+				$cnt++;
+				if($cnt == 1) {
+					$defval = sprintf("[%d-%s", $cnt, $ip);
+				} else {
+					$defval = sprintf("%s, %d-%s", $defval, $cnt, $ip);
+				}
+			}
+			$defval = sprintf("%s]", $defval);
+			my $ip = &getPromptInput("$prompt $defval");
+			while(true) {
+				if ($ip eq "q" || $ip eq "Q") {
+					logToFile("User requested abort", LOGFATAL | LOGCONS);
+				}
+
+				if($ip < 1 || $ip > $numIps) {
+					printf("Invalid value. Enter valid value or q to quit.\n");
+					delete $gPromptToInput{"$prompt $defval"};
+					$ip = &getPromptInput("$prompt $defval");
+				} else {
+					return $ips[$ip - 1];
+				}
+			}
+		}
+	} else {
+		if ($printDefault == false) {
+			$ip = &getPromptInput("$prompt");
+			while (1) {
+#The commented code will not check for leading space
+				if( $ip =~ m/^(\d\d?\d?)\.(\d\d?\d?)\.(\d\d?\d?)\.(\d\d?\d?)$/ )
+#if( $ip =~ m/(\d\d?\d?)\.(\d\d?\d?)\.(\d\d?\d?)\.(\d\d?\d?)$/ )
+				{
+					if(!($1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255))
+					{
+						printf("Invalid value.\n");
+						delete $gPromptToInput{$prompt};
+						$ip = &getPromptInput("$prompt");
+					}else{
+						last;
+					}
+				} else {
+					printf("Invalid value.\n");
+					delete $gPromptToInput{$prompt};
+					$ip = &getPromptInput("$prompt");
+				}
+			}
+		} else {
+			$ip = &getPromptInput("$prompt [Default: 127.0.0.1]");
+			if ($ip eq "") { $ip = "127.0.0.1" }
+			#The commented code will not check for leading space
+			if( $ip =~ m/^(\d\d?\d?)\.(\d\d?\d?)\.(\d\d?\d?)\.(\d\d?\d?)$/ )
+			#if( $ip =~ m/(\d\d?\d?)\.(\d\d?\d?)\.(\d\d?\d?)\.(\d\d?\d?)$/ )
+			{
+				if(!($1 <= 255 && $2 <= 255 && $3 <= 255 && $4 <= 255))
+				{
+					#print "\n===> IP Address $ip is not valid. Using default value. <===\n";
+					$ip = "127.0.0.1";
+				}
+			} elsif( $ip =~ m/:/ ) {
+			} else {
+				#print "\n===> IP Address $ip is not valid. Using default value. <===\n";
+				$ip = "127.0.0.1";
+			}
+		}
+		return $ip;
+	}
+}
+
+
+sub getPort($) {
+	my $prompt  = shift;
+	my $defval  = shift;
+	my $inputPort = &getPromptInput("$prompt [Default: $defval]");
+	if ($inputPort eq "") { $inputPort = $defval; }
+	if( $inputPort =~ m/^(\d\d?\d?\d?\d?)$/ ) {
+	}
+	else {
+		#print "\n===> Port $inputPort is not valid. Using default value. <===\n";
+		$inputPort = $defval;
+	}
+	return $inputPort;
+}
+
+
+sub getOldRelDir($$) {
+	my $oldRelPath = shift;
+	my $relData = shift;
+
+	my $oldPath = sprintf("%s/$gBinDir", $oldRelPath);
+	my $oldsnmpPath = sprintf("%s/snmp", $oldPath);
+	my $oldsigPath = sprintf("%s/SIGTRANDir", $oldPath);
+	my $fromRel = $gProductLc;
+
+	if ($oldRelPath =~ /\/lc($gProductLegacy)\// ) {
+		$oldPath = sprintf("%s/bin", $oldRelPath);
+		$oldsnmpPath = sprintf("%s/logs/snmp", $oldRelPath);
+		$oldsigPath = sprintf("%s/SIGTRANStack", $oldPath);
+		$fromRel = lc($gProductLegacy);
+	}
+	$relData->{'from'} = $fromRel;
+	$relData->{'rel'} = $oldPath;
+	$relData->{'snmp'} = $oldsnmpPath;
+	$relData->{'sigtran'} = $oldsigPath;
+}
+
+sub getSystemIps() {
+	my @ipaddrs = ();
+	if($gIsLinux == true) {
+		@ipaddrs = `/usr/sbin/ip addr | /bin/grep inet | /bin/grep -v inet6 | /bin/grep -v 127.0.0.1 | /bin/grep -v 0.0.0.0 | /bin/awk '{print \$2}' | /bin/cut -d / -f 1`;
+	} else {
+		@ipaddrs = `/usr/sbin/ifconfig -a | /bin/grep inet | /bin/grep -v 127.0.0.1 | /bin/grep -v 0.0.0.0 | /usr/bin/awk '{print \$2}'`;
+	}
+	chomp(@ipaddrs);
+	return @ipaddrs;
+}
+
+sub copyTrunkCfgFrom7_0($) {
+	my $configHash = shift;
+
+	my $nwsecname = "TRUNK_CONFIG";
+# server id has to be changed to server name
+	my $secentriesref = &getSectionPararms($configHash, $nwsecname);
+	my @secentries = @{$secentriesref};
+	my $peerServerName;
+	foreach my $parminfo (@secentries) {
+# tokenize the values
+		if($parminfo->{'value'} ne "" && $parminfo->{'value'} ne "syntax") {
+			my @values = split(",", $parminfo->{'value'});
+			my $serverid = $values[10];
+			my $serverName;
+			my $inst = $gSgwSstDetail{'Instance'};
+			if($serverid eq "" || $serverid == $inst) {
+				$serverName = &getParam($configHash, "SYSTEM", "SystemName");
+			} else {
+				# prompt for server name
+				if($peerServerName eq "") {
+					my $done = false;
+					$serverName = getInputString("Enter Peer hostname");
+					$peerServerName = $serverName;
+				} else {
+					$serverName = $peerServerName;
+				}
+			}
+
+			my $newval = $values[0];
+			for(my $cnt = 1; $cnt < 10; $cnt++) {
+				$newval = sprintf("%s,%s", $newval, $values[$cnt]);
+			}
+			$newval = sprintf("%s,%s", $newval, $serverName);
+			&delParam($configHash, $nwsecname, $parminfo->{'name'});
+			&writeConfigVal($configHash, $nwsecname, $parminfo->{'name'}, $newval, true);
+		}
+	}
+}
+
+sub copyProbeIpRatFromLegacy($$$$) {
+	my $configHash = shift;
+	my $secname = shift;
+	my $idnames = &getSectionPararms($configHash, "IdToNameMapping");
+
+# mlc has been migrated to configuration in pdeapp.ini
+# check if its new m3ua configuration or old configuration
+# number of tokens should provide the information
+# get all the paramter of sections of old ini
+	my $secentriesref = &getSectionPararms($configHash, $secname);
+	my @secentries = @{$secentriesref};
+
+# check if  configuration is legacy or new
+	my $legacycfg = false;
+	my $nwsyn = &getParam($configHash, $secname, "syntax");
+	if($nwsyn eq "") {
+		$legacycfg = true;
+	}
+
+    my @suffix = split("ProbeIpRat", $secname);
+	@suffix = split("_", $suffix[1]);
+
+	my $prgwFmt = "rat,domain,ip,dataPort,controlPort,monitoredNodes,probeType";
+	&writeConfigVal($configHash, "$secname", "syntax", $prgwFmt, true);
+	if($legacycfg) {
+		my $cnt = 1;
+		foreach my $parminfo (@secentries) {
+		# tokenize the values
+			if($parminfo->{'value'} ne "" && $parminfo->{'name'} ne "") {
+				# rat
+				my $pvalue = $parminfo->{'value'};
+				# ip
+				$pvalue = sprintf("%s,%s", $pvalue, $parminfo->{'name'});
+				# data port
+				my $port = &getParam($configHash, "PRGW", "ProbeDataPort");
+				if($port eq "") {
+					$port = 6501;
+				}
+				$pvalue = sprintf("%s,%u", $pvalue, $port);
+				# control port
+				$port = &getParam($configHash, "PRGW", "ProbeControlPort");
+				if($port eq "") {
+					$port = 6502;
+				}
+				$pvalue = sprintf("%s,%u", $pvalue, $port);
+
+				#monitoredNodes
+				$pvalue = sprintf("%s,", $pvalue);
+
+				my $pname = sprintf("PRGWsc%us%da%d", $cnt, $suffix[1], $suffix[2]);
+				foreach my $idinfo (@{$idnames}) {
+					if($parminfo->{'name'} eq $idinfo->{'name'}) {
+						my @idvalues = split(",", $idinfo->{'value'});
+						$pname = $idvalues[0];
+						$pname =~ s/[^\w]//g;
+						last;
+					}
+				}
+
+				&delParam($configHash, $secname, $parminfo->{'name'});
+				&writeConfigVal($configHash, $secname, $pname, $pvalue, true);
+			}
+			$cnt++;
+		}
+	}
+}
+
+sub migratePreMrColl($$$$$$) {
+	my $configHash = shift;
+	my $newsection = shift;
+	my $oldparam = shift;
+	my $newparm = shift;
+	my $loctimevalue = shift;
+	my $defVal = shift;
+
+	my $mrtimervalue = &replaceParamInIni($configHash, "CallMgr", $newsection, $oldparam, $newparm);
+	if($mrtimervalue eq "") {
+		&writeConfigVal($configHash, $newsection, $newparm, $defVal, false);
+	} else {
+		#convert to float value so multiply with a float number
+		$mrtimervalue = ( ($mrtimervalue * 10.0) / ($loctimevalue * 10.0));
+		$mrtimervalue = sprintf("%.2f", $mrtimervalue);
+		my @tokens = split(",",$defVal);
+		my $value = sprintf("%s,%s,%s", $mrtimervalue, $tokens[1], $tokens[2]);
+		&writeConfigVal($configHash, $newsection, $newparm, $value, true);
+	}
+}
+
+sub getNonEmptyCnt($) {
+	my $valuesarr = shift;
+	my $cnt = 0;
+	foreach my $entry (@{$valuesarr}) {
+		if($entry ne "") {
+			$cnt++;
+		}
+	}
+	return $cnt;
+}
+
+sub getSgwUser($$$) {
+	my $configHash = shift;
+	my $sstinstance = shift;
+	my $sgwinstance = shift;
+
+	my $sgwentry = sprintf("SGW:SGWApp%d:%d:%d", $sgwinstance, $sstinstance, $sgwinstance);
+	my $sgwuser = getParam($configHash, "SGWUserInfo", $sgwentry);
+# special case if only one instance is configured, application name is just SGWApp and not SGWApp1
+	if($sgwuser eq "") {
+		$sgwentry = sprintf("SGW:SGWApp:%d:%d", $sstinstance, $sgwinstance);
+	}
+	$sgwuser = getParam($configHash, "SGWUserInfo", $sgwentry);
+	return $sgwuser;
+}
+
+sub getTSgwUser($$$) {
+	my $configHash = shift;
+	my $sstinstance = shift;
+	my $sgwinstance = shift;
+
+	my $sgwentry = sprintf("SGW:TSGWApp%d:%d:%d", $sgwinstance, $sstinstance, $sgwinstance);
+	my $sgwuser = getParam($configHash, "SGWUserInfo", $sgwentry);
+	# special case if only one instance is configured, application name is just SGWApp and not SGWApp1
+	if($sgwuser eq "") {
+		$sgwentry = sprintf("SGW:TSGWApp:%d:%d", $sstinstance, $sgwinstance);
+	}
+	$sgwuser = getParam($configHash, "SGWUserInfo", $sgwentry);
+	return $sgwuser;
+}
+
+sub getTSgwParam($$$) {
+
+	my $configHash = shift;
+	my $sstinstance = shift;
+	my $sgwinstance = shift;
+
+	my @ret = ();
+
+	my $sgwentry = sprintf("SGW:TSGWApp%d:%d:%d", $sgwinstance, $sstinstance, $sgwinstance);
+	my $sgwuser = getParam($configHash, "TSGWAppInfo", $sgwentry);
+	# special case if only one instance is configured, application name is just SGWApp and not SGWApp1
+	if($sgwuser eq "") {
+		$sgwentry = sprintf("SGW:TSGWApp:%d:%d", $sstinstance, $sgwinstance);
+	}
+	$sgwuser = getParam($configHash, "TSGWAppInfo", $sgwentry);
+	my @tokens = split(",",$sgwuser);
+	# Transport type first
+	if ($tokens[0] =~ /TCP/) {
+		push(@ret, "TCP");
+	} else {
+		push(@ret, "SIGTRAN");
+	}
+	# RAT second
+	push(@ret, $tokens[2]);
+	return @ret;
+}
+
+sub getCdtCustomerName($) {
+	my $cdtfile = shift;
+	my @tokens = split("_",$cdtfile);
+	return $tokens[0];
+}
+
+sub getCdtFileNames($) {
+	my $configHash = shift;
+
+	my $cdtFileGsm = &getParam($configHash,"DCMServer","GSMMATFileName");
+	my $cdtFileUmts = &getParam($configHash,"DCMServer","UMTSMATFileName");
+	my $cdtFileLte = &getParam($configHash,"DCMServer","LTEMATFileName");
+	my $cdtFileNr = &getParam($configHash,"DCMServer","NRMATFileName");
+
+	my $cdtFile = &getCdtCustomerName($cdtFileGsm);
+
+	if($cdtFile eq "") {
+		$cdtFile = &getCdtCustomerName($cdtFileUmts);
+	}
+
+	if($cdtFile eq "") {
+		$cdtFile = &getCdtCustomerName($cdtFileLte);
+	}
+
+	if($cdtFile eq "") {
+		$cdtFile = &getCdtCustomerName($cdtFileNr);
+	}
+
+# customer name is not found from any RAT of the cdt file name
+	if($cdtFile eq "" ) {
+		$cdtFile = getInputString("Enter Customer name");
+	}
+
+	if($cdtFileGsm eq "") {
+		$cdtFileGsm = sprintf("%s_GSM_CDT.txt", $cdtFile);
+	}
+	if($cdtFileUmts eq "") {
+		$cdtFileUmts = sprintf("%s_UMTS_CDT.txt", $cdtFile);
+	}
+	if($cdtFileLte eq "") {
+		$cdtFileLte = sprintf("%s_LTE_CDT.txt", $cdtFile);
+	}
+	if($cdtFileNr eq "") {
+		$cdtFileNr = sprintf("%s_NR_CDT.txt", $cdtFile);
+	}
+
+	return ($cdtFileGsm, $cdtFileUmts, $cdtFileLte, $cdtFileNr);
+}
+
+sub getSgwUserParam($$$) {
+	my $configHash = shift;
+	my $sstinstance = shift;
+	my $sgwinstance = shift;
+
+	my @ret = ();
+
+# copy the smeconf.dat from pervious release to current release during upgrade
+	my $sgwuser = getSgwUser($configHash, $sstinstance, $sgwinstance);
+	my $ssn;
+	my $m3uamode;
+	if ($sgwuser eq ""){
+		$sgwuser = getTSgwUser($configHash, $sstinstance, $sgwinstance);
+	}
+	if ($sgwuser eq "SGWO") {
+		$ssn = 145;
+		$m3uamode = "ASP";
+	} elsif ($sgwuser =~ /SGWG/) {
+		$ssn = 252;
+		$m3uamode = "ASP";
+	} elsif ($sgwuser eq "SGWU") {
+		$ssn = 249;
+		$m3uamode = "IPSP";
+	} elsif ($sgwuser eq "SGWL" || $sgwuser eq "TSGW-ESMLC" 
+				|| $sgwuser eq "SGWN") {
+		#$ssn = "";
+		#$m3uamode = "";
+	} elsif ($sgwuser =~ /PRA/) {
+		#$ssn = "";
+		#$m3uamode = "";
+	} elsif ($sgwuser eq "TLR_PDE") {
+		$ssn = 249;
+		$m3uamode = "IPSP";
+	} elsif ($sgwuser eq "TLR_RNC") {
+		$ssn = 249;
+		$m3uamode = "IPSP";
+	} elsif ($sgwuser eq "OLGW-LTE") {
+		$ssn = 145;
+	} elsif ($sgwuser eq "SGWC") {
+		$ssn = 147;
+		$m3uamode = "ASP";
+	} elsif ($sgwuser eq "TSGW-SMLC" || $sgwuser eq "TSGW-SAS") {
+		$ssn = 249;
+		$m3uamode = "SGP";
+	} else {
+		logToFile("Invalid SGW User licensed: $sgwuser", LOGFATAL | LOGCONS);
+	}
+
+	push(@ret, $sgwuser);
+	push(@ret, $ssn);
+	push(@ret, $m3uamode);
+	return @ret;
+}
+
+sub configureTSGWInfo($$) {
+	my $configHash = shift;
+	my $licconfig = shift;
+
+	my $tsmlcMode = &getParam($licconfig, "FEATURES", "TsmlcMode");
+	if($tsmlcMode eq "Relay"){
+		return;
+	}
+
+	if ($gIsUpgrade == false){
+		my $sgwapps = $gSgwSstDetail{'Apps'};
+		my $sgwapp = @{$sgwapps}[6];
+		my $pdeid = 0;
+
+# loop through 100 platform instance and do for all the SGW instances
+# assumption is that not more  than 100 blades are going to be installed
+		for(my $pltcnt = 1; $pltcnt < 100; $pltcnt++) {
+			my @licapps = &getLicensedAppsComplete($gSgwSstDetail{'LicName'}, $sgwapp, $licconfig, $pltcnt);
+			foreach my $licapp (@licapps) {
+				my @values = split(":", $licapp);
+				my $sstinstance = $values[2];
+				my $sgwinstance = $values[3];
+#Prompt PDE specific information if SGW is interfacing with any PDE
+				$pdeid = &updatePdeInfo($configHash, $sstinstance, $sgwinstance, $licapp, $pdeid, $licconfig);
+				$pdeid++;
+			}
+		}
+		PopulatePMSelectionMode($configHash);
+		$gIsUpgrade = true;
+	}
+}
+
+sub PopulatePMSelectionMode($)
+{
+	my $configHash = shift;
+
+	#Create unique pmList
+	my %seen = ();
+	my @uniqPmList = ();
+	my $item;
+
+	foreach $item (@gPMList) {
+		push(@uniqPmList, $item) unless $seen{$item}++;
+	}
+	#prompt for pdeselectionmethod for selected unique PM
+	my $selModeStr = "";
+
+	foreach $item (@uniqPmList) {
+		my $selMethod = &getInputRange("PDE Selection Method for Positioning Method [$item] [1-Multiple PDEs with RoundRobin, 2-Single Active  PDE]",1, 2, 2);
+		my $selMethodStr="";
+		if ($selMethod eq 1){
+			$selMethodStr = "RR";
+		}else{
+			$selMethodStr = "AS";
+		}
+		if ($selModeStr eq ""){
+			$selModeStr = sprintf("%s:%s", $item,$selMethodStr);
+		}else{
+			$selModeStr = sprintf("%s,%s:%s", $selModeStr,$item,$selMethodStr);
+		}
+	}
+
+	if ($selModeStr ne ""){
+		&writeConfigVal($configHash, "TLR", "PDESelectionMode", $selModeStr, true);
+	}
+}
+
+sub PopulateAppPairMap() {
+	my $licconfig = shift;
+
+	my $secname = "SERVICEIDLIST";
+	my @retval = ();
+	my %sidmap = ();
+
+	my $idnames = &getSectionPararms($licconfig, $secname);
+	foreach my $seckey ( @{$idnames} ) {
+		push @{$sidmap{$seckey->{'value'}}}, $seckey->{'name'};
+	}
+
+	foreach my $seckey ( keys %sidmap ) {
+		my @pairs = @{$sidmap{$seckey}};
+		$appPairMap{$pairs[0]} = $pairs[1];
+		$appPairMap{$pairs[1]} = $pairs[0];
+	}
+}
+
+sub CheckPDEWithOtherPair($$) {
+	my $configHash = shift;
+	my $sstinstance = shift;
+	my $sgwinstance = shift;
+
+	my @ret = ();
+	my $index;
+	my $nkey = sprintf("SGW:TSGWApp%d:%d:%d", $sgwinstance, $sstinstance,$sgwinstance);
+
+	my $pairapp = "";
+	for my $key ( keys %appPairMap ) {
+		if ($key eq $nkey){
+        	$pairapp = $appPairMap{$key};
+        	chomp $pairapp;
+        	last;
+        }
+        else{
+        }
+    }
+    if ($pairapp eq "")
+    {
+    	$ret[0] = 0;
+    }
+    else{
+    	$ret[0] = 1;
+    	my @values = split(":", $appPairMap{$nkey});
+    	my $newkey = sprintf("SGW:TSGWApp:%d:%d", $values[2],$values[3]);
+    	my $gwparm = &getParam($configHash, "NodeListMapping", $newkey);
+    	chomp $gwparm;
+    	if ($gwparm eq ""){
+    		$ret[0] = 0;
+    	}else{
+    		$ret[1] = $gwparm;
+    	}
+    }
+    return @ret;
+}
+
+sub updatePdeInfo($$$$$) {
+	my $configHash = shift;
+	my $sstinstance = shift;
+	my $sgwinstance = shift;
+	my $licapp = shift;
+	my $pdeid = shift;
+	my $licconfig = shift;
+
+	#check if this sgw inst is pair for already prompted instance
+	if ($appPairMapPopulated eq 0)
+	{
+		&PopulateAppPairMap($licconfig);
+		$appPairMapPopulated = 1;
+	}
+
+	#ret[0] - status, ret[1] - pdeList with previuos pair if found
+	my @ret = &CheckPDEWithOtherPair($configHash, $sstinstance, $sgwinstance);
+	#If node found with pair then link same nodes with this instance
+	if ($ret[0] eq 1)
+	{
+		my $nkey = sprintf("SGW:TSGWApp:%d:%d", $sstinstance,$sgwinstance);
+		&writeConfigVal($configHash, "NodeListMapping", $nkey, $ret[1], true);
+
+		# duplicate the configuration for TCP GW also
+		my $gwparm = &getParam($licconfig, "TSGWAppInfo", $nkey);
+		my @values = split(",", $gwparm);
+		if ($values[0] =~ /TCPGWApp/ ) {
+			&writeConfigVal($configHash, "NodeListMapping", $values[0], $ret[1], true);
+		}
+
+		return $pdeid;
+	}
+
+	my $sgwuser = &getTSgwUser($licconfig, $sstinstance, $sgwinstance);
+	my @ret = &getTSgwParam($licconfig, $sstinstance, $sgwinstance);
+	my $tmstr = $ret[0];
+	my $ratStr = $ret[1];
+	my $nodeStr = "Network Element";
+	if ($sgwuser eq "TSGW-SMLC" || $sgwuser eq "TSGW-SAS" || $sgwuser eq "TSGW-ESMLC")
+	{
+		$nodeStr = "PDE";
+	}
+	logToFile("Details for $nodeStr connected with TSGW instance [$sstinstance:$sgwinstance] [Supported Transport: $tmstr]", LOGCONS);
+	my $done = false;
+	my $pdeArr;
+	my $pdeCnt = 1;
+	my $nodename = "";
+	while(!$done)
+	{
+		my $nodetype = 0;	#Default is NE
+		my $pmStr = "";
+		my $maxSessionStr = "";
+		if ($sgwuser eq "SAS" || $sgwuser eq "SMLC")
+		{
+			$nodetype = 1;
+			$nodename = &getInputString("Enter the PDE ID");
+			my $pm = &getInputRange("Position Method [1-WLS, 2-ECID, 3-AGPS_UE_BASED]", 1, 3, 1);
+			if ($pm == 1){
+				$pmStr = "WLS";
+			}
+			if ($pm == 2){
+				$pmStr = "ECID";
+			}
+			if ($pm == 3){
+				$pmStr = "AGPS_UE_BASED";
+			}
+			push (@gPMList, $pmStr);
+			$maxSessionStr = "100";
+
+		}else{
+			if ($ratStr eq "UMTS"){
+				$nodename = &getInputString("Enter the RNCID");
+			} elsif ($ratStr eq "GSM"){
+				$nodename = &getInputString("Enter the BSCID");
+			}
+		}
+
+		my $connectioninfo;
+		if ($tmstr eq "SIGTRAN"){
+			my $ssn = &getInputNumber("Enter SSN", 0);
+			my $pc = &getInputNumber("Enter PointCode",0);
+			$connectioninfo = sprintf("0:%d:%d",$pc,$ssn);
+		} elsif ($tmstr eq "TCP"){
+			my $ip = &getIp("Enter IP address", false, false);
+			my $port = &getPort("Enter Port", 30000 + $pdeCnt);
+			$connectioninfo = sprintf("%s:%d",$ip, $port);
+		}
+
+		my $pdestr = sprintf("%d,%s,%s,%s,%s,%s,%s", $nodetype,$ratStr, $tmstr, $pmStr, $connectioninfo, $maxSessionStr, $nodename);
+		&writeConfigVal($configHash, "NodeInfo", ($pdeid + 1), $pdestr, true);
+
+		if ($pdeCnt == 1){
+			$pdeArr = $pdeid+1;
+		}else{
+			$pdeArr = sprintf("%s,%s",$pdeArr,($pdeid + 1));
+		}
+
+		my $choice = &getPromptInput("Do you want to add another Node in this TSGW instance [y/n] [Default: n]");
+		if ($choice eq "y" || $choice eq "Y") {
+			$pdeid++;
+			$pdeCnt++;
+		} else {
+			my $nkey = sprintf("SGW:TSGWApp:%d:%d", $sstinstance,$sgwinstance);
+			&writeConfigVal($configHash, "NodeListMapping", $nkey, $pdeArr, true);
+
+			# duplicate the configuration for TCP GW also
+			my $gwparm = &getParam($licconfig, "TSGWAppInfo", $nkey);
+			my @values = split(",", $gwparm);
+			if ($values[0] =~ /TCPGWApp/ ) {
+				&writeConfigVal($configHash, "NodeListMapping", $values[0], $pdeArr, true);
+			}
+			$done = true;
+		}
+	}
+	return $pdeid;
+}
+
+sub updateSgwAppConfig($$$$$$$$$$$) {
+	my $configHash = shift;
+	my $licconfig = shift;
+	my $transport = shift;
+	my $standard = shift;
+	my $stackPorts = shift;
+	my $secname = shift;
+	my $sgwssn = shift;
+	my $stackdir = shift;
+	my $mtp2cfg = shift;
+	my $m3uacfg = shift;
+	my $sgwuser = shift;
+	my $currentRelPath = shift;
+
+# LB gateway parameters have to be added to the pdeapp.ini
+	&writeConfigVal($configHash, $secname, "SGWUser", $sgwuser, true);
+	if ($sgwuser =~ /PRA/) {
+		#nothing as of now
+	} elsif ($sgwuser eq "SGWN") {
+		&writeConfigVal($configHash, $secname, "SP_TRANSPORT", $transport, true);
+	} else {
+		&writeConfigVal($configHash, $secname, "MLC_NUMBER", "12345678901", false);
+		&writeConfigVal($configHash, $secname, "SGW_IP", "127.0.0.1", false);
+		&writeConfigVal($configHash, $secname, "SP_TRANSPORT", $transport, true);
+	}
+	my @values = split("_", $secname);
+
+	my $vip = &getParam($configHash, $secname, "VirtIpEthIntf_1_1");
+	&delParam($configHash, $secname, "VirtIpEthIntf_1_1");
+	if($vip eq "") {
+		my $m3uasec = sprintf("M3UA_%u_%u", $values[1], $values[2]);
+		$vip = &getParam($configHash, $m3uasec, "VirtIpEthIntf_1_1");
+		&delParam($configHash, $m3uasec, "VirtIpEthIntf_1_1");
+	}
+
+	if($vip eq "") {
+		$vip = "default0-127.0.0.1";
+	}
+
+	my $vipParm = sprintf("VirtIpEthIntf_SGW_SGWApp_%u_%u", $values[1], $values[2]);
+
+	if ($sgwuser eq "OLGW-LTE") {
+		&writeConfigVal($configHash, $secname, "SlhNumThreads", "6", false);
+		&writeConfigVal($configHash, $secname, "SlhHealthCheckTimer", "60000", false);
+		&writeConfigVal($configHash, $secname, "SlhConnectTimer", "3000", false);
+		&writeConfigVal($configHash, $secname, "SlhNumSession", "3000", false);
+		&writeConfigVal($configHash, $secname, "SlhMaxRetry", "1", true);
+		&writeConfigVal($configHash, $secname, "SlhRetransmitTimer", "20", false);
+		&writeConfigVal($configHash, $secname, "SlhValidityTimer", "60", false);
+		&writeConfigVal($configHash, $secname, "SlhMaxBufferInPool", "3000", false);
+		&writeConfigVal($configHash, $secname, "SlhNodeId", "1", false);
+		&writeConfigVal($configHash, $secname, "SlgNumThreads", "6", false);
+		&writeConfigVal($configHash, $secname, "SlgHealthCheckTimer", "60000", false);
+		&writeConfigVal($configHash, $secname, "SlgConnectTimer", "3000", false);
+		&writeConfigVal($configHash, $secname, "SlgNumSession", "3000", false);
+		&writeConfigVal($configHash, $secname, "SlgMaxRetry", "1", true);
+		&writeConfigVal($configHash, $secname, "SlgRetransmitTimer", "20", false);
+		&writeConfigVal($configHash, $secname, "SlgValidityTimer", "60", false);
+		&writeConfigVal($configHash, $secname, "SlgMaxBufferInPool", "3000", false);
+		&writeConfigVal($configHash, $secname, "SlgNodeId", "1", false);
+		&delParam($configHash, $secname, "SlhOrigHost");
+		&delParam($configHash, $secname, "SlhOrigRealm");
+		&delParam($configHash, $secname, "SlgOrigHost");
+		&delParam($configHash, $secname, "SlgOrigRealm");
+		&delParam($configHash, $secname, "SlhDestRealm");
+		&writeConfigVal($configHash, $secname, "SlhNumAppThreads", "2", false);
+		&writeConfigVal($configHash, $secname, "SlhRouteType", "Direct", false);
+		&writeConfigVal($configHash, $secname, "SlgNumAppThreads", "2", false);
+		&writeConfigVal($configHash, $secname, "DFNListenPortForOAM", $stackPorts->[0], true);
+		&writeConfigVal($configHash, $secname, "OAMListenPortForDFN", $stackPorts->[1], true);
+		&writeConfigVal($configHash, $secname, "SgwOamListenPort", getNextPort(), true);
+		&writeConfigVal($configHash, $secname, "LOCAL_REALM", "polariswireless.com", false);
+		&writeConfigVal($configHash, $secname, "LOCAL_HOST", "diameter.polariswireless.com", false);
+		&writeConfigVal($configHash, "VirtualIp", $vipParm, $vip, false);
+	} elsif (($sgwuser =~ /SGWO-DIA-SH/ ) || ($sgwuser =~ /SGWO-DIA/ )) {
+		&delParam($configHash, $secname, "SlhNumThreads");
+		&delParam($configHash, $secname, "SlhHealthCheckTimer");
+		&delParam($configHash, $secname, "SlhConnectTimer");
+		&delParam($configHash, $secname, "SlhNumSession");
+		&delParam($configHash, $secname, "SlhMaxRetry");
+		&delParam($configHash, $secname, "SlhRetransmitTimer");
+		&delParam($configHash, $secname, "SlhValidityTimer");
+		&delParam($configHash, $secname, "SlhMaxBufferInPool");
+		&delParam($configHash, $secname, "SlhNodeId");
+		&delParam($configHash, $secname, "SlgNumThreads");
+		&delParam($configHash, $secname, "SlgHealthCheckTimer");
+		&delParam($configHash, $secname, "SlgConnectTimer");
+		&delParam($configHash, $secname, "SlgNumSession");
+		&delParam($configHash, $secname, "SlgMaxRetry");
+		&delParam($configHash, $secname, "SlgRetransmitTimer");
+		&delParam($configHash, $secname, "SlgValidityTimer");
+		&delParam($configHash, $secname, "SlgMaxBufferInPool");
+		&delParam($configHash, $secname, "SlgNodeId");
+		&delParam($configHash, $secname, "SlhOrigHost");
+		&delParam($configHash, $secname, "SlhOrigRealm");
+		&delParam($configHash, $secname, "SlgOrigHost");
+		&delParam($configHash, $secname, "SlgOrigRealm");
+		&delParam($configHash, $secname, "SlhDestRealm");
+		&delParam($configHash, $secname, "SlhNumAppThreads");
+		&delParam($configHash, $secname, "SlhRouteType");
+		&delParam($configHash, $secname, "SlgNumAppThreads");
+		&delParam($configHash, $secname, "DFNListenPortForOAM");
+		&delParam($configHash, $secname, "OAMListenPortForDFN");
+		&delParam($configHash, $secname, "SgwOamListenPort");
+		&delParam($configHash, $secname, "SCTP_PORT");
+		&delParam($configHash, $secname, "SCTP_IP");
+		&delParam($configHash, $secname, "SCTP_MODE");
+		&writeConfigVal($configHash, $secname, "LOCAL_REALM", "polariswireless.com", false);
+		&writeConfigVal($configHash, $secname, "LOCAL_HOST", "diameter.polariswireless.com", false);
+		&writeConfigVal($configHash, $secname, "CERWaitTimeIfServerMs", "5000", false);
+		&writeConfigVal($configHash, $secname, "CERWaitTimeIfClientMs", "0", false);
+		&writeConfigVal($configHash, $secname, "DWTimeMs", "30000", false);
+		&writeConfigVal($configHash, $secname, "DiaRspWaitTimeMs", "10000", false);
+		&writeConfigVal($configHash, "VirtualIp", $vipParm, $vip, false);
+
+		&writeConfigVal($configHash, "SCTP", "SctpAssocHeartBeat", "5000", false);
+		&writeConfigVal($configHash, "SCTP", "SctpAssocHeartBeatRetry", "5", false);
+		&writeConfigVal($configHash, "SCTP", "SctpNumInStreams", "5", false);
+		&writeConfigVal($configHash, "SCTP", "SctpNumOutStreams", "5", false);
+		&writeConfigVal($configHash, "SCTP", "SctpRtoInit", "50", false);
+		&writeConfigVal($configHash, "SCTP", "SctpRtoMin", "50", false);
+		&writeConfigVal($configHash, "SCTP", "SctpRtoMax", "500", false);
+        
+        &writeDiaIni($currentRelPath, false);
+
+        my %diaConfig = ();
+		my $idx = 1;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "Sh-Data,1,", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "CSLocationInformation,2,Sh-Data,CSLocationInformation:PSLocationInformation:Extension", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "PSLocationInformation,2,Sh-Data,CSLocationInformation:PSLocationInformation:Extension", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "Extension,2,Sh-Data,CSLocationInformation:PSLocationInformation:Extension", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "CellGlobalId,3,CSLocationInformation,CellGlobalId:VLRNumber:MSCNumber:CurrentLocationRetrieved:AgeOfLocationInformation:Extension", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "ServiceAreaId,3,CSLocationInformation,ServiceAreaId:VLRNumber:MSCNumber:CurrentLocationRetrieved:AgeOfLocationInformation:Extension", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "LocationAreaId,3,CSLocationInformation,LocationAreaId:VLRNumber:MSCNumber:CurrentLocationRetrieved:AgeOfLocationInformation:Extension", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "CurrentLocationRetrieved,3,CSLocationInformation,CellGlobalId:ServiceAreaId:LocationAreaId:VLRNumber:MSCNumber:CurrentLocationRetrieved:AgeOfLocationInformation:Extension", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "AgeOfLocationInformation,3,CSLocationInformation,CellGlobalId:ServiceAreaId:LocationAreaId:VLRNumber:MSCNumber:CurrentLocationRetrieved:AgeOfLocationInformation:Extension", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "Extension,3,CSLocationInformation,CellGlobalId:ServiceAreaId:LocationAreaId:VLRNumber:MSCNumber:CurrentLocationRetrieved:AgeOfLocationInformation:Extension", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "Extension,4,Extension,", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "E-UTRANCellGlobalId,5,Extension,E-UTRANCellGlobalId:TrackingAreaId", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "TrackingAreaId,5,Extension,E-UTRANCellGlobalId:TrackingAreaId", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "CellGlobalId,3,PSLocationInformation,CellGlobalId:SGSNNumber:CurrentLocationRetrieved:AgeOfLocationInformation", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "ServiceAreaId,3,PSLocationInformation,ServiceAreaId:SGSNNumber:CurrentLocationRetrieved:AgeOfLocationInformation", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "LocationAreaId,3,PSLocationInformation,LocationAreaId:SGSNNumber:CurrentLocationRetrieved:AgeOfLocationInformation", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "CurrentLocationRetrieved,3,PSLocationInformation,LocationAreaId:SGSNNumber:CurrentLocationRetrieved:AgeOfLocationInformation", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "AgeOfLocationInformation,3,PSLocationInformation,LocationAreaId:SGSNNumber:CurrentLocationRetrieved:AgeOfLocationInformation", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "Extension,3,Extension,", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "Extension,5,Extension,", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "EPSLocationInformation,6,Extension,", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "E-UTRANCellGlobalId,7,EPSLocationInformation,E-UTRANCellGlobalId:TrackingAreaId:MMEName:CurrentLocationRetrieved:AgeOfLocationInformation", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "TrackingAreaId,7,EPSLocationInformation,E-UTRANCellGlobalId:TrackingAreaId:MMEName:CurrentLocationRetrieved:AgeOfLocationInformation", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "MMEName,7,EPSLocationInformation,E-UTRANCellGlobalId:TrackingAreaId:MMEName:CurrentLocationRetrieved:AgeOfLocationInformation", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "CurrentLocationRetrieved,7,EPSLocationInformation,E-UTRANCellGlobalId:TrackingAreaId:MMEName:CurrentLocationRetrieved:AgeOfLocationInformation", true);
+		$idx++;
+		&writeConfigVal(\%diaConfig, "DTDUserData", "$idx", "AgeOfLocationInformation,7,EPSLocationInformation,E-UTRANCellGlobalId:TrackingAreaId:MMEName:CurrentLocationRetrieved:AgeOfLocationInformation", true);
+		$idx++;
+		AppendIniFile("$currentRelPath/$gBinDir/$gDiaIniFile", \%diaConfig, true, true);
+	} elsif ($sgwuser =~ /PRAG/ ) {
+		return;
+	} elsif ($sgwuser =~ /PRAU/ ) {
+		&writeConfigVal($configHash, "MASS_DIRECT_UMTS_NUM_NBR","UmtsNumNbr", 32, false);
+		return;
+	} elsif ($sgwuser =~ /PRAL/ ) {
+		&writeConfigVal($configHash, $sgwuser, "CELLIDConfiguredDurationCompTime", "5", false);
+		&writeConfigVal($configHash, $sgwuser, "WLSConfiguredDurationCompTime", "500", false);
+		&writeConfigVal($configHash, $sgwuser, "rWLSConfiguredDurationCompTime", "500", false);
+		#&writeConfigVal($configHash, $sgwuser, "WLANConfiguredDurationCompTime", "500", false);
+		&writeConfigVal($configHash, $sgwuser, "ECIDConfiguredDurationCompTime", "10", false);
+		#&writeConfigVal($configHash, $sgwuser, "OTDOAConfiguredDurationCompTime", "500", false);
+		#&writeConfigVal($configHash, $sgwuser, "WLANConfiguredDurationCompTime", "500", false);
+		#&writeConfigVal($configHash, $sgwuser, "TimerResolutionIdleTime", "1000", false);
+		#&writeConfigVal($configHash, $sgwuser, "ConfiguredReqDurationIdleTimeMme", "3600", false);
+		#&writeConfigVal($configHash, $sgwuser, "LTE_MmelevelCallFailureTreshold", "8", false);
+		&writeConfigVal($configHash, $sgwuser, "LTE_CgilevelCallFailureTreshold", "8", false);
+
+		my $secnames = &getSectionPararms($licconfig, "SECTIONS");
+		foreach my $section (@{$secnames}) {
+			if($section->{'name'} =~ /^LDS_LTE/) {
+				my $secNameUser = $section->{'name'};
+				$secNameUser =~ s/POLARIS/USER/g;
+				$secNameUser =~ s/LDS_/SGW_/g;
+
+				if($secNameUser =~ /_LICENSE_/) {
+					#consider only polaris settings for now
+					next;
+				}
+
+				my $clientBased = true;
+				my @locMthds = ( "HYBRID", "AGPS", "AGPSUA", "WLAN", "DBH", "WLS", "OTDOA", "ECID", "CID" );
+				foreach my $locMthd (@locMthds) {
+					if($secNameUser =~ /$locMthd/) {
+						$clientBased = false;
+						last;
+					}
+				}
+
+				my $massDirect = false;
+				if($secNameUser =~ /_MASSDIRECT_/) {
+					$massDirect = true
+				}
+
+				if($clientBased == true) {
+					if($massDirect == false) {
+						next;
+					}
+					&writeConfigVal($configHash, $secNameUser, "PolicyRequestGuardTime", "1000", false);
+					&writeConfigVal($configHash, $secNameUser, "GetLocRequestGuardTimer", "4000", false);
+					next;
+				}
+			}
+		}
+		return;
+    } elsif ($sgwuser =~ /SGWN/) {
+		&writeConfigVal($configHash, $secname, "MRLogging", "false", false);
+		&writeConfigVal($configHash, $secname, "LocationGuardTime", "30000", false);
+		my $uuid = `uuidgen`;
+		$uuid = trimmer($uuid);	
+		my $ip = &getParam($configHash, "PLATFORM_SVCS", "NodeIPAddress");
+		&writeConfigVal($configHash, $secname, "MLC_SELF_NF_INSTANCE_ID", $uuid, false);
+		&writeConfigVal($configHash, $secname, "LMF_Scheme", "http", false);
+		&writeConfigVal($configHash, $secname, "LMF_ServerIP", $ip, false);
+		&writeConfigVal($configHash, $secname, "LMF_ListenPort", "12345", false);
+		&writeConfigVal($configHash, $secname, "LMF_TlsCertFile", "cacert.pem", false);
+		&writeConfigVal($configHash, $secname, "LMF_TlsKeyFile", "cakey.key", false);
+		&writeConfigVal($configHash, $secname, "LMF_ReconnectWaitDuration", "240", false);
+		&writeConfigVal($configHash, $secname, "LMF_CBK_Scheme", "http", false);
+		&writeConfigVal($configHash, $secname, "LMF_CBK_ServerIP", $ip, false);
+		&writeConfigVal($configHash, $secname, "LMF_CBK_ListenPort", "23456", false);
+		#&writeConfigVal($configHash, $secname, "LMF_CBK_TlsCertFile", "cacert.pem", false);
+		#&writeConfigVal($configHash, $secname, "LMF_CBK_TlsKeyFile", "cakey.key", false);
+		&writeConfigVal($configHash, $secname, "TCPKeepAliveEnabled", "false", false);
+		&writeConfigVal($configHash, $secname, "TCPIdleDuration", "3600", false);
+		&delParam($configHash, $secname, "SubscriptionRequired");
+		&writeConfigVal($configHash, "NR_PEER_CFG_SUBSCRIPTION", "", "", false);
+		&delParam($configHash, $secname, "RESEND_NF_REGISTER_INTERVAL_IN_SEC");
+		&delParam($configHash, $secname, "NF_REGISTER_RSP_WAIT_INTERVAL_IN_SEC");
+		&delParam($configHash, $secname, "NF_UPDATE_RSP_WAIT_INTERVAL_IN_SEC");
+
+		&writeConfigVal($configHash, "SGWN", "CELLIDConfiguredDurationCompTime", "5", false);
+		&writeConfigVal($configHash, "SGWN", "WLSConfiguredDurationCompTime", "500", false);
+		#&writeConfigVal($configHash, "SGWN", "rWLSConfiguredDurationCompTime", "500", false);
+		#&writeConfigVal($configHash, "SGWN", "WLANConfiguredDurationCompTime", "500", false);
+		&writeConfigVal($configHash, "SGWN", "ECIDConfiguredDurationCompTime", "10", false);
+		#&writeConfigVal($configHash, "SGWN", "OTDOAConfiguredDurationCompTime", "500", false);
+		#&writeConfigVal($configHash, "SGWN", "WLANConfiguredDurationCompTime", "500", false);
+		#&writeConfigVal($configHash, "SGWN", "TimerResolutionIdleTime", "1000", false);
+		#&writeConfigVal($configHash, "SGWN", "ConfiguredReqDurationIdleTimeMme", "3600", false);
+		&writeConfigVal($configHash, "SGWN", "NR_SystemlevelCallFailureTreshold", "8", false);
+
+		my $secnames = &getSectionPararms($licconfig, "SECTIONS");
+		foreach my $secname (@{$secnames}) {
+			if($secname->{'name'} =~ /^LDS_NR/) {
+				my $secNameUser = $secname->{'name'};
+				$secNameUser =~ s/POLARIS/USER/g;
+
+				if($secNameUser =~ /_LICENSE_/) {
+					#consider only polaris settings for now
+					next;
+				}
+				if($secNameUser =~ /LDS_NR_USER_/) {
+					next;
+				}
+				&delSection($configHash, "LDS_NR_USER_SETTINGS");
+
+				my @locMthds = ( "HYBRID", "AGPS", "DBH", "WLS", "rWLS", "OTDOA", "WLAN", "ECID", "CID" );
+				my $clientBased = true;
+				foreach my $locMthd (@locMthds) {
+					if($secNameUser =~ /$locMthd/) {
+						$clientBased = false;
+						last;
+					}
+				}
+
+				my $massDirect = false;
+				if($secNameUser =~ /_MASSDIRECT_/) {
+					$massDirect = true
+				}
+
+				if($clientBased == true) {
+					if($massDirect == false) {
+						&writeConfigVal($configHash, $secNameUser, "ECID-NRPPa_MaxMRInterval", "1000", false);
+						&writeConfigVal($configHash, $secNameUser, "ECID-NRPPa_MinMRInterval", "500", false);
+						#&writeConfigVal($configHash, $secNameUser, "ECID-LPP_MaxMRInterval", "1000", false);
+						#&writeConfigVal($configHash, $secNameUser, "ECID-LPP_MinMRInterval", "500", false);
+					}
+					next;
+				}
+
+				my $fieldCnt = () = $secNameUser =~ /_/g;
+				if($fieldCnt != 5) {
+					next;
+				}
+
+				my $secPrefix;
+				if($secNameUser =~ m/(.*?)_USER_SETTINGS/) {
+					$secPrefix = $1;
+				}
+
+				if($secNameUser =~ /ECID/) {
+					#&writeConfigVal($configHash, $secNameUser, "ComputationDuration", "500", false);
+					if($massDirect == false) {
+						&writeConfigVal($configHash, $secNameUser, "ECID-NRPPa_MrParameter", "CellId:SS-RSRP:SS-RSRQ:NR-TADV", false);
+						#&writeConfigVal($configHash, $secNameUser, "ECID-LPP_MrParameter", "UERxTx:RSRP:RSRQ", false);
+					}
+				} elsif($secNameUser =~ /CID/) {
+					#&writeConfigVal($configHash, $secNameUser, "ComputationDuration", "100", false);
+				} elsif($secNameUser =~ /WLS/) {
+					if($massDirect == false) {
+						&writeConfigVal($configHash, $secNameUser, "ECID-NRPPa_MrParameter", "CellId:SS-RSRP:SS-RSRQ:NR-TADV", false);
+						#&writeConfigVal($configHash, $secNameUser, "ECID-LPP_MrParameter", "UERxTx:RSRP:RSRQ", false);
+						if($secNameUser =~ /_WLS_/) { 
+							#&writeConfigVal($configHash, $secNameUser, "IRAT-NRPPa_MrParameter", "CellId:GSM:UMTS", false);
+						}
+					}
+				} elsif($secNameUser =~ /AGPS/ || $secNameUser =~ /HYBRID/ || $secNameUser =~ /AGPSUA/ || $secNameUser =~ /OTDOA/ || $secNameUser =~ /WLAN/) {
+					my $fbSec;
+					if($secNameUser =~ /AGPS/  || $secNameUser =~ /HYBRID/) {
+						$fbSec = $secNameUser;
+						if($secNameUser =~ /HYBRID/) {
+							$fbSec = sprintf("%s_AGPS_USER_SETTINGS",$secPrefix);
+						}
+						#use this later to migrate AGPS to AGPSUA
+						&writeConfigVal($configHash, $fbSec, "AGPS-LPP_AssistanceDataDuration", "1000", false);
+						&writeConfigVal($configHash, $fbSec, "AGPS-LPP_InitialAgpsModelsEnabled", "true", false);
+						&writeConfigVal($configHash, $fbSec, "AGPS-LPP_InitialAgpsModels", "8", false);
+						&writeConfigVal($configHash, $fbSec, "AGPS-LPP_IncRspTime", "true", false);
+					}
+					#add hybrid later as adding of hybrid results into adding of AGPAUA by default
+					if($secNameUser =~ /AGPSUA/ ) {
+						$fbSec = $secNameUser;
+						if($secNameUser =~ /HYBRID/) {
+							$fbSec = sprintf("%s_AGPSUA_USER_SETTINGS",$secPrefix);
+						}
+						&writeConfigVal($configHash, $fbSec, "AGPSUA-LPP_AssistanceDataDuration", "1000", false);
+						&writeConfigVal($configHash, $fbSec, "AGPSUA-LPP_InitialAgpsModelsEnabled", "true", false);
+						&writeConfigVal($configHash, $fbSec, "AGPSUA-LPP_InitialAgpsModels", "8", false);
+						&writeConfigVal($configHash, $fbSec, "AGPSUA-LPP_IncRspTime", "true", false);
+					}
+
+					#hybrid doesn't have otdoa as fallback
+					if($secNameUser =~ /OTDOA/) {
+						$fbSec = $secNameUser;
+						if($secNameUser =~ /HYBRID/) {
+							$fbSec = sprintf("%s_OTDOA_USER_SETTINGS",$secPrefix);
+						}
+						&writeConfigVal($configHash, $fbSec, "OTDOA-LPP_AssistanceDataDuration", "1000", false);
+						&writeConfigVal($configHash, $fbSec, "OTDOA-LPP_IncRspTime", "true", false);
+					}
+					$fbSec = sprintf("%s_CID_USER_SETTINGS", $secPrefix);
+					#&writeConfigVal($configHash, $fbSec, "ComputationDuration", "100", false);
+
+					#Seperate ECID not needed for HYBRID
+					if($secNameUser =~ /AGPS/  || $secNameUser =~ /AGPSUA/) {
+						$fbSec = sprintf("%s_ECID_USER_SETTINGS", $secPrefix);
+						if($secNameUser =~ /HYBRID/) {
+							$fbSec = $secNameUser;
+						}
+						&writeConfigVal($configHash, $fbSec, "ECID-NRPPa_MrParameter", "CellId:SS-RSRP:SS-RSRQ:NR-TADV", false);
+						#&writeConfigVal($configHash, $fbSec, "ECID-LPP_MrParameter", "UERxTx:RSRP:RSRQ", false);
+					}
+
+					#hybrid doesn't have wlan as fallback
+					if($secNameUser =~ /WLAN/) {
+						$fbSec = $secNameUser;
+						if($secNameUser =~ /HYBRID/) {
+							$fbSec = sprintf("%s_WLAN_USER_SETTINGS",$secPrefix);
+						}
+						# nothing for WLAN as of now
+					}
+					if($secNameUser =~ /AGPS/  || $secNameUser =~ /AGPSUA/ || $secNameUser =~ /HYBRID/) {
+						$fbSec = sprintf("%s_WLS_USER_SETTINGS", $secPrefix);
+						&writeConfigVal($configHash, $fbSec, "ECID-NRPPa_MrParameter", "CellId:SS-RSRP:SS-RSRQ:NR-TADV", false);
+						#&writeConfigVal($configHash, $fbSec, "ECID-LPP_MrParameter", "UERxTx:RSRP:RSRQ", false);
+						#&writeConfigVal($configHash, $fbSec, "IRAT-LPPa_MrParameter", "CellId:GSM:UMTS", false);
+						#$fbSec = sprintf("%s_rWLS_USER_SETTINGS", $secPrefix);
+						#&writeConfigVal($configHash, $fbSec, "ECID-LPPa_MrParameter", "CellId:SS-RSRP:SS-RSRQ:CSI-RSRP:CSI-RSRQ", false);
+						#&writeConfigVal($configHash, $fbSec, "ECID-LPP_MrParameter", "UERxTx:RSRP:RSRQ", false);
+					}
+				}
+			}
+		}
+
+		my $secnames = &getSectionPararms($licconfig, "SECTIONS");
+		foreach my $section (@{$secnames}) {
+			if($section->{'name'} =~ /^LDS_NR/) {
+				my $secNameUser = $section->{'name'};
+				$secNameUser =~ s/POLARIS/USER/g;
+				$secNameUser =~ s/LDS_/SGW_/g;
+
+				if($secNameUser =~ /_LICENSE_/) {
+					#consider only polaris settings for now
+					next;
+				}
+				if($secNameUser =~ /SGW_NR_USER_/) {
+					next;
+				}
+				&delSection($configHash, "SGW_NR_USER_SETTINGS");
+
+				my $clientBased = true;
+				my @locMthds = ( "HYBRID", "AGPS", "AGPSUA", "WLAN", "HALE", "WLS", "rWLS", "OTDOA", "ECID", "CID" );
+				foreach my $locMthd (@locMthds) {
+					if($secNameUser =~ /$locMthd/) {
+						$clientBased = false;
+						last;
+					}
+				}
+
+				my $massDirect = false;
+				if($secNameUser =~ /_MASSDIRECT_/) {
+					$massDirect = true
+				}
+
+				if($clientBased == true) {
+					if($massDirect == false){
+						&writeConfigVal($configHash, $secNameUser, "AMFSubscriptionGuardTime", "1000", false);
+						&writeConfigVal($configHash, $secNameUser, "UECapabilityCheckGuardTime", "1000", false);
+						&writeConfigVal($configHash, $secNameUser, "PolicyRequestGuardTime", "1000", false);
+						&writeConfigVal($configHash, $secNameUser, "GetLocRequestGuardTimer", "4000", false);
+					}
+					next;
+				}
+			}
+		}
+	} elsif ($sgwuser =~ /SGWL/ || $sgwuser =~ /TSGW-ESMLC/) {
+		
+		my $isLte = false;
+		if ($sgwuser =~ /SGWL/ || $sgwuser =~ /TSGW-ESMLC/) {
+			$isLte = true;
+		}
+		
+		if($isLte == true) {
+			&writeConfigVal($configHash, "SCTP", "SctpAssocHeartBeat", "5000", false);
+			&writeConfigVal($configHash, "SCTP", "SctpAssocHeartBeatRetry", "5", false);
+			&writeConfigVal($configHash, "SCTP", "SctpNumInStreams", "5", false);
+			&writeConfigVal($configHash, "SCTP", "SctpNumOutStreams", "5", false);
+			&writeConfigVal($configHash, "SCTP", "SctpRtoInit", "50", false);
+			&writeConfigVal($configHash, "SCTP", "SctpRtoMin", "50", false);
+			&writeConfigVal($configHash, "SCTP", "SctpRtoMax", "500", false);
+		}
+
+		if($gProductLc eq tsmlccn) {
+			return;
+		}
+
+		&writeConfigVal($configHash, $secname, "MRLogging", "false", false);
+		&writeConfigVal($configHash, $secname, "LocationGuardTime", "30000", false);
+		
+		if($isLte == true) {
+			&writeConfigVal($configHash, "SGWL", "CELLIDConfiguredDurationCompTime", "5", false);
+			&writeConfigVal($configHash, "SGWL", "WLSConfiguredDurationCompTime", "500", false);
+			&writeConfigVal($configHash, "SGWL", "rWLSConfiguredDurationCompTime", "500", false);
+			#&writeConfigVal($configHash, "SGWL", "WLANConfiguredDurationCompTime", "500", false);
+			&writeConfigVal($configHash, "SGWL", "ECIDConfiguredDurationCompTime", "10", false);
+			#&writeConfigVal($configHash, "SGWL", "OTDOAConfiguredDurationCompTime", "500", false);
+			#&writeConfigVal($configHash, "SGWL", "WLANConfiguredDurationCompTime", "500", false);
+			#&writeConfigVal($configHash, "SGWL", "TimerResolutionIdleTime", "1000", false);
+			#&writeConfigVal($configHash, "SGWL", "ConfiguredReqDurationIdleTimeMme", "3600", false);
+			&writeConfigVal($configHash, "SGWL", "LTE_MmelevelCallFailureTreshold", "8", false);
+			&writeConfigVal($configHash, "SGWL", "LTE_CgilevelCallFailureTreshold", "8", false);
+		}
+
+		my $secnames = &getSectionPararms($licconfig, "SECTIONS");
+		foreach my $secname (@{$secnames}) {
+			if($secname->{'name'} =~ /^LDS_LTE/) {
+				my $secNameUser = $secname->{'name'};
+				$secNameUser =~ s/POLARIS/USER/g;
+
+				if($secNameUser =~ /_LICENSE_/) {
+					#consider only polaris settings for now
+					next;
+				}
+				if($secNameUser =~ /LDS_LTE_USER_/) {
+					next;
+				}
+
+				my @locMthds = ( "HYBRID", "AGPS", "DBH", "WLS", "rWLS", "OTDOA", "WLAN", "ECID", "CID" );
+				my $clientBased = true;
+				foreach my $locMthd (@locMthds) {
+					if($secNameUser =~ /$locMthd/) {
+						$clientBased = false;
+						last;
+					}
+				}
+
+				my $massDirect = false;
+				if($secNameUser =~ /_MASSDIRECT_/) {
+					$massDirect = true
+				}
+
+				if($clientBased == true) {
+					if($massDirect == false && $isLte == true) {
+						&writeConfigVal($configHash, $secNameUser, "ECID-LPPa_MaxMRInterval", "1000", false);
+						&writeConfigVal($configHash, $secNameUser, "ECID-LPPa_MinMRInterval", "500", false);
+						&writeConfigVal($configHash, $secNameUser, "ECID-LPP_MaxMRInterval", "1000", false);
+						&writeConfigVal($configHash, $secNameUser, "ECID-LPP_MinMRInterval", "500", false);
+						&writeConfigVal($configHash, $secNameUser, "IRAT-LPPa_MaxMRInterval", "6000", false);
+						&writeConfigVal($configHash, $secNameUser, "IRAT-LPPa_MinMRInterval", "500", false);
+					}
+					next;
+				}
+
+				my $fieldCnt = () = $secNameUser =~ /_/g;
+				if($fieldCnt != 5) {
+					next;
+				}
+
+				my $secPrefix;
+				if($secNameUser =~ m/(.*?)_USER_SETTINGS/) {
+					$secPrefix = $1;
+				}
+
+				if($secNameUser =~ /ECID/) {
+#&writeConfigVal($configHash, $secNameUser, "ComputationDuration", "500", false);
+					if($massDirect == false) {
+						&writeConfigVal($configHash, $secNameUser, "ECID-LPPa_MrParameter", "CellId:RSRP:RSRQ:TA-T1", false);
+						&writeConfigVal($configHash, $secNameUser, "ECID-LPP_MrParameter", "UERxTx:RSRP:RSRQ", false);
+					}
+				} elsif($secNameUser =~ /CID/) {
+#&writeConfigVal($configHash, $secNameUser, "ComputationDuration", "100", false);
+				} elsif($secNameUser =~ /WLS/) {
+					if($massDirect == false) {
+						&writeConfigVal($configHash, $secNameUser, "ECID-LPPa_MrParameter", "CellId:RSRP:RSRQ:TA-T1", false);
+						&writeConfigVal($configHash, $secNameUser, "ECID-LPP_MrParameter", "UERxTx:RSRP:RSRQ", false);
+						if($secNameUser =~ /_WLS_/) { 
+							&writeConfigVal($configHash, $secNameUser, "IRAT-LPPa_MrParameter", "CellId:GSM:UMTS", false);
+						}
+					}
+				} elsif($secNameUser =~ /AGPS/ || $secNameUser =~ /HYBRID/ || $secNameUser =~ /AGPSUA/ || $secNameUser =~ /OTDOA/ || $secNameUser =~ /WLAN/) {
+					my $fbSec;
+					if($secNameUser =~ /AGPS/  || $secNameUser =~ /HYBRID/) {
+						$fbSec = $secNameUser;
+						if($secNameUser =~ /HYBRID/) {
+							$fbSec = sprintf("%s_AGPS_USER_SETTINGS",$secPrefix);
+						}
+						#use this later to migrate AGPS to AGPSUA
+						&writeConfigVal($configHash, $fbSec, "AGPS-LPP_AssistanceDataDuration", "1000", false);
+						&writeConfigVal($configHash, $fbSec, "AGPS-LPP_InitialAgpsModelsEnabled", "true", false);
+						&writeConfigVal($configHash, $fbSec, "AGPS-LPP_InitialAgpsModels", "8", false);
+						&writeConfigVal($configHash, $fbSec, "AGPS-LPP_IncRspTime", "true", false);
+					}
+					#add hybrid later as adding of hybrid results into adding of AGPAUA by default
+					if($secNameUser =~ /AGPSUA/ ) {
+						$fbSec = $secNameUser;
+						if($secNameUser =~ /HYBRID/) {
+							$fbSec = sprintf("%s_AGPSUA_USER_SETTINGS",$secPrefix);
+						}
+						&writeConfigVal($configHash, $fbSec, "AGPSUA-LPP_AssistanceDataDuration", "1000", false);
+						&writeConfigVal($configHash, $fbSec, "AGPSUA-LPP_InitialAgpsModelsEnabled", "true", false);
+						&writeConfigVal($configHash, $fbSec, "AGPSUA-LPP_InitialAgpsModels", "8", false);
+						&writeConfigVal($configHash, $fbSec, "AGPSUA-LPP_IncRspTime", "true", false);
+					}
+
+					#hybrid doesn't have otdoa as fallback
+					if($secNameUser =~ /OTDOA/) {
+						$fbSec = $secNameUser;
+						if($secNameUser =~ /HYBRID/) {
+							$fbSec = sprintf("%s_OTDOA_USER_SETTINGS",$secPrefix);
+						}
+						&writeConfigVal($configHash, $fbSec, "OTDOA-LPP_AssistanceDataDuration", "1000", false);
+						&writeConfigVal($configHash, $fbSec, "OTDOA-LPP_IncRspTime", "true", false);
+					}
+					$fbSec = sprintf("%s_CID_USER_SETTINGS", $secPrefix);
+					#&writeConfigVal($configHash, $fbSec, "ComputationDuration", "100", false);
+
+					if($secNameUser =~ /AGPS/  || $secNameUser =~ /AGPSUA/ || $secNameUser =~ /HYBRID/) {
+						$fbSec = sprintf("%s_ECID_USER_SETTINGS", $secPrefix);
+						&writeConfigVal($configHash, $fbSec, "ECID-LPPa_MrParameter", "CellId:RSRP:RSRQ:TA-T1", false);
+						&writeConfigVal($configHash, $fbSec, "ECID-LPP_MrParameter", "UERxTx:RSRP:RSRQ", false);
+					}
+
+					#hybrid doesn't have wlan as fallback
+					if($secNameUser =~ /WLAN/) {
+						$fbSec = $secNameUser;
+						if($secNameUser =~ /HYBRID/) {
+							$fbSec = sprintf("%s_WLAN_USER_SETTINGS",$secPrefix);
+						}
+						# nothing for WLAN as of now
+					}
+					if($secNameUser =~ /AGPS/  || $secNameUser =~ /AGPSUA/ || $secNameUser =~ /HYBRID/) {
+						$fbSec = sprintf("%s_WLS_USER_SETTINGS", $secPrefix);
+						&writeConfigVal($configHash, $fbSec, "ECID-LPPa_MrParameter", "CellId:RSRP:RSRQ:TA-T1", false);
+						&writeConfigVal($configHash, $fbSec, "ECID-LPP_MrParameter", "UERxTx:RSRP:RSRQ", false);
+						&writeConfigVal($configHash, $fbSec, "IRAT-LPPa_MrParameter", "CellId:GSM:UMTS", false);
+						$fbSec = sprintf("%s_rWLS_USER_SETTINGS", $secPrefix);
+						&writeConfigVal($configHash, $fbSec, "ECID-LPPa_MrParameter", "CellId:RSRP:RSRQ:TA-T1", false);
+						&writeConfigVal($configHash, $fbSec, "ECID-LPP_MrParameter", "UERxTx:RSRP:RSRQ", false);
+					}
+				}
+			}
+		}
+
+		my $secnames = &getSectionPararms($licconfig, "SECTIONS");
+		foreach my $section (@{$secnames}) {
+			if($section->{'name'} =~ /^LDS_LTE/) {
+				my $secNameUser = $section->{'name'};
+				$secNameUser =~ s/POLARIS/USER/g;
+				$secNameUser =~ s/LDS_/SGW_/g;
+
+				if($secNameUser =~ /_LICENSE_/) {
+					#consider only polaris settings for now
+					next;
+				}
+				if($secNameUser =~ /SGW_LTE_USER_/) {
+					next;
+				}
+
+				my $clientBased = true;
+				my @locMthds = ( "HYBRID", "AGPS", "AGPSUA", "WLAN", "DBH", "rWLS", "WLS", "OTDOA", "ECID", "CID" );
+				foreach my $locMthd (@locMthds) {
+					if($secNameUser =~ /$locMthd/) {
+						$clientBased = false;
+						last;
+					}
+				}
+
+				my $massDirect = false;
+				if($secNameUser =~ /_MASSDIRECT_/) {
+					$massDirect = true
+				}
+
+				if($clientBased == true) {
+					if($massDirect == false && $sgwuser eq "SGWL"){
+						&writeConfigVal($configHash, $secNameUser, "UECapabilityCheckGuardTime", "1000", false);
+						&writeConfigVal($configHash, $secNameUser, "PolicyRequestGuardTime", "1000", false);
+						&writeConfigVal($configHash, $secNameUser, "GetLocRequestGuardTimer", "4000", false);
+					}
+					next;
+				}
+			}
+		}
+
+		return;
+	} else {
+		if($gUsingOpensaf && ($gProductLc eq tsmlccn)) {
+			my $paramvalue = &getParam($configHash, $secname, "VirtIpEthIntf_${values[1]}_$values[2]");
+			if($paramvalue eq "") {
+				$paramvalue = &getEthIntf("Enter interface to be used for sgw instance [${values[1]},$values[2]]");
+				&writeConfigVal($configHash, $secname, "VirtIpEthIntf_${values[1]}_$values[2]", "$paramvalue", false);
+			}
+			$paramvalue = &getParam($configHash, $secname, "EthIntfVirtIp_${values[1]}_$values[2]");
+			if($paramvalue eq "") {
+				$paramvalue = &getIp("Enter IP address to be assigned to this Interface [Same IP should be used in external entities connecting with this SGW instance]", false, false);
+				&writeConfigVal($configHash, $secname, "EthIntfVirtIp_${values[1]}_$values[2]", "$paramvalue", false);
+			}
+		}
+
+		&writeConfigVal($configHash, $secname, "SGW_POINT_CODE", "129", false);
+		&writeConfigVal($configHash, $secname, "ADDR_INDICATOR_BIT8", "1", false);
+		if($gProductLc ne tsmlccn) {
+			&writeConfigVal($configHash, $secname, "ROUTE_GTT", "true", false);
+		}else{
+			&writeConfigVal($configHash, $secname, "ROUTE_GTT", "false", false);
+		}
+		&delParam($configHash, $secname, "RncRespTimeForAgps");
+		&delParam($configHash, $secname, "RNCResponseTime");
+
+		&writeConfigVal($configHash, $secname, "GTT_NUM_PLAN", "1", false);
+		&writeConfigVal($configHash, $secname, "GTT_NATURE_ADDR", "4", false);
+		&writeConfigVal($configHash, $secname, "MAP_NATURE_ADDR", "1", false);
+		&writeConfigVal($configHash, $secname, "MANUAL_GT_RULES", "false", false);
+		&writeConfigVal($configHash, $secname, "StackDirectory", $stackdir, true);
+
+		if($m3uacfg ne "") {
+			&writeConfigVal($configHash, $secname, "M3uaSection", $m3uacfg, true);
+		}
+		if($mtp2cfg ne "") {
+			&writeConfigVal($configHash, $secname, "Mtp2ConvSection", $mtp2cfg, true);
+		}
+		&writeConfigVal($configHash, $secname, "Protocol", $standard, false);
+		&writeConfigVal($configHash, $secname, "SGW_SCCP_IP_ADDR", "127.0.0.1", true);
+		&writeConfigVal($configHash, $secname, "SGW_SCCP_LOG_ID", "10", true);
+		&writeConfigVal($configHash, $secname, "SCCP_SGW_PORT", $stackPorts->[0], true);
+		&writeConfigVal($configHash, $secname, "SGW_SCCP_PORT", $stackPorts->[1], true);
+		&writeConfigVal($configHash, $secname, "SMEClientPort", $stackPorts->[5], true);
+		&writeConfigVal($configHash, $secname, "SGW_SUBSYS_NO", $sgwssn, false);
+		my $sgwsio = &getParam($configHash,$m3uacfg, "M3UA_SIO");
+		if($sgwsio eq "") {
+			$sgwsio = getParam($configHash, $secname, "SGW_SIO");
+		}
+		if($sgwsio eq "") {
+			$sgwsio = 131;
+		}
+		&writeConfigVal($configHash, $secname, "SGW_SIO", $sgwsio, false);
+		my $paramvalue = &getParam($configHash, "VirtualIp", $vipParm);
+		if($gUsingOpensaf == true && $transport eq "SIGTRAN"){
+			if($paramvalue eq "") {
+				my $choice = &getPromptInput("SGW[$values[2]] Do you want to select floating IP and interface [y/n] [Default: n]");
+				my $done = false;
+				if ($choice eq "y" || $choice eq "Y")
+				{
+					my $cnt = 1;
+					my @intfarr = ();
+					$vip = "";
+					while(!$done) {
+						if($vip eq "") {
+							my $paramInt = &getEthIntf("Enter one floating IP and interface at a time. Repeat the steps for each of the IP used for multi-homing.\nSGW[$values[2]] Enter interface $cnt", \@intfarr);
+							my $paramIp = &getIp("SGW[$values[2]] Enter interface $paramInt IP address", false, false);
+							push (@intfarr, $paramInt);
+							$vip = "$paramInt-$paramIp";
+						}else{
+							my $paramInt = &getEthIntf("SGW[$values[2]] Enter interface $cnt", \@intfarr);
+							my $paramIp = &getIp("SGW[$values[2]] Enter interface $paramInt IP address", false, false);
+							push (@intfarr, $paramInt);
+							$vip = "$vip,$paramInt-$paramIp";
+						}
+						$choice = &getPromptInput("SGW[$values[2]] Interface count $cnt. Do you want to select another floating IP and interface [y/n] [Default: n]");
+						if ($choice eq "y" || $choice eq "Y") {
+							$done = false;
+						} else {
+							$done = true;
+						}
+						$cnt++;
+					}
+				}
+			}
+		}
+		&writeConfigVal($configHash, "VirtualIp", $vipParm, $vip, false);
+
+		if ($sgwuser =~ /SGWG/) {
+			&writeConfigVal($configHash, $secname, "MRLogging", "false", false);
+			&writeConfigVal($configHash, $secname, "LocationGuardTime", "30000", false);
+
+			&writeConfigVal($configHash, $secname, "AGPSRetransmitTimeData", "0", false);
+			&writeConfigVal($configHash, $secname, "AGPSRetransmitTimeLocReq", "0", false);
+			&writeConfigVal($configHash, $secname, "EnvironmentCharacter", "-1", false);
+			&replaceParamInIni($configHash, $secname, "SGW", "IncrRefNum", "IncrRefNum");
+			&replaceParamInIni($configHash, $secname, "SGW", "IncrExtRefNum", "IncrExtRefNum");
+			&replaceParamInIni($configHash, $secname, "SGW", "SMLCCode", "SMLCCode");
+			&delParam($configHash, $secname, "EnableExtRefNum");
+		}
+
+		if ($sgwuser eq "SGWU") {
+			if($gProductLc ne tsmlccn) {
+				&writeConfigVal($configHash, $secname, "MRLogging", "false", false);
+				&writeConfigVal($configHash, $secname, "LocationGuardTime", "30000", false);
+				&delParam($configHash, "CallMgr", "MeasurementReportTick", "48", false);
+				my $secnames = &getSectionPararms($licconfig, "SECTIONS");
+				foreach my $section (@{$secnames}) {
+					if($section->{'name'} =~ /^LDS_UMTS/) {
+						my $secNameUser = $section->{'name'};
+						$secNameUser =~ s/POLARIS/USER/g;
+						$secNameUser =~ s/LDS_/SGW_/g;
+
+						if($secNameUser =~ /_LICENSE_/) {
+							#consider only polaris settings for now
+							next;
+						}
+
+						my $clientBased = true;
+						my @locMthds = ( "HYBRID", "AGPS", "WLS", "rWLS", "ECID", "CID" );
+						foreach my $locMthd (@locMthds) {
+							if($secNameUser =~ /$locMthd/) {
+								$clientBased = false;
+								last;
+							}
+						}
+
+						if($clientBased == true) {
+							my $mrparam;
+							my $param = &getParam($configHash, $secname, "RTTInfoType1RequiredFlagFor1stPAR");
+							if($param eq "true") {
+								$mrparam = sprintf("RTT1,");
+							}
+
+							$param = &getParam($configHash, $secname, "RTTInfoType2RequiredFlagFor1stPAR");
+							if($param eq "true") {
+								$mrparam = sprintf("%sRTT2,", $mrparam);
+							}
+
+							$param = &getParam($configHash, $secname, "PathLossRequiredFlagFor1stPAR");
+							if($param eq "true") {
+								$mrparam = sprintf("%sPATHLOSS,", $mrparam);
+							}
+
+							$param = &getParam($configHash, $secname, "CPICH_RSCPRequiredFlagFor1stPAR");
+							if($param eq "true") {
+								$mrparam = sprintf("%sRSCP,", $mrparam);
+							}
+
+							$param = &getParam($configHash, $secname, "CPICH_ECN0RequiredFlagFor1stPAR");
+							if($param eq "true") {
+								$mrparam = sprintf("%sECNO", $mrparam);
+							}
+
+							if($mrparam eq "") {
+								$mrparam = "RTT1,RTT2";
+							}
+							&writeConfigVal($configHash, $secNameUser, "MrParameterFor1stPAR", $mrparam, false);
+
+							$param = &getParam($configHash, $secname, "MeasCollTimeFor1stPAR");
+							if($param eq "") {
+								$param = "3000";
+							}
+							&writeConfigVal($configHash, $secNameUser, "MeasCollTimeFor1stPAR", $param, false);
+
+							next;
+						}
+
+						if($secNameUser =~ /AGPS/ || $secNameUser =~ /HYBRID/) {
+							my $value = &getParam($configHash,$secname, "IsAddAsstDataReq");
+							if($value eq "") {
+								$value = "true";
+							}
+							&writeConfigVal($configHash, $secNameUser, "IsAddAsstDataReq", $value, false);
+							$value = &getParam($configHash,$secname, "RncRetransTimeForAgps");
+							if($value eq "") {
+								$value = "1000";
+							}
+							&writeConfigVal($configHash, $secNameUser, "RncRetransTimeForAgps", $value, false);
+						}
+					}
+				}
+				&delParam($configHash, $secname, "IsAddAsstDataReq");
+				&delParam($configHash, $secname, "RncRetransTimeForAgps");
+				&delParam($configHash, $secname, "RTTInfoType2RequiredFlagFor1stPAR");
+				&delParam($configHash, $secname, "RTTInfoType1RequiredFlagFor1stPAR");
+				&delParam($configHash, $secname, "PathLossRequiredFlagFor1stPAR");
+				&delParam($configHash, $secname, "CPICH_RSCPRequiredFlagFor1stPAR");
+				&delParam($configHash, $secname, "CPICH_ECN0RequiredFlagFor1stPAR");
+				&delParam($configHash, $secname, "MeasCollTimeFor1stPAR");
+			}
+		}
+	}
+}
+
+sub updateMtp2Config($$$$$$) {
+	my $configHash = shift;
+	my $stackPorts = shift;
+	my $secname = shift;
+	my $mtp3ip = shift;
+	my $mtp2ip = shift;
+
+# LB gateway parameters have to be added to the pdeapp.ini
+	&writeConfigVal($configHash, $secname, "MTP3ServerPort", "$stackPorts->[3]", true);
+	&writeConfigVal($configHash, $secname, "MTP2ServerPort", "$stackPorts->[4]", true);
+	&writeConfigVal($configHash, $secname, "MTP2IPAddress", "$mtp2ip", true);
+	&writeConfigVal($configHash, $secname, "MTP3IPAddress", "$mtp3ip", false);
+	&writeConfigVal($configHash, $secname, "SERIND_2_SUPPORTED", "0", false);
+
+	updateNodeSpecicParam($configHash, $secname, "*");
+}
+
+sub updateM3uaAppConfig($$$$$$) {
+	my $configHash = shift;
+	my $standard = shift;
+	my $stackPorts = shift;
+	my $secname = shift;
+	my $m3uamode = shift;
+	my $sgwsecname = shift;
+	my $operMode = shift;
+
+	&writeConfigVal($configHash, $secname, "M3UA_PROTOCOL", $standard, true);
+	&writeConfigVal($configHash, $secname, "M3UA_SCCP_PORT", $stackPorts->[2], true);
+	&writeConfigVal($configHash, $secname, "M3UA_PORT", $stackPorts->[3], true);
+	&writeConfigVal($configHash, $secname, "SgwAppSection", $sgwsecname, true);
+	&writeConfigVal($configHash, $secname, "M3UA_NA", "8", false);
+	&writeConfigVal($configHash, $secname, "NW_ASP_ID", "1", false);
+	&writeConfigVal($configHash, $secname, "M3UA_DOUBLE_EXCHANGE_MODE", "ASP_UP_DE", false);
+	&writeConfigVal($configHash, $secname, "SCTP_RTO_INIT", "1000", false);
+	&writeConfigVal($configHash, $secname, "SCTP_HB_INTERVAL", "1000", false);
+	&writeConfigVal($configHash, $secname, "SCTP_PATH_MAX_RETRANS", "3", false);
+	&writeConfigVal($configHash, $secname, "SCTP_PATH_ASSOC_RETRANS", "5", false);
+
+	my $sgwsio = &getParam($configHash,$secname, "M3UA_SIO");
+	if( $sgwsio ne "") {
+		&writeConfigVal($configHash, $sgwsecname, "SGW_SIO", $sgwsio, false);
+	}
+
+	&delParam($configHash, $secname, "HAMode");
+	&delParam($configHash, $secname, "M3UA_SIO");
+	&delParam($configHash, $secname, "M3UA_POINT_CODE");
+	&delParam($configHash, $secname, "M3UA_EXCHANGE_MODE");
+	&delParam($configHash, $secname, "NW_SEND_RC");
+	&delParam($configHash, $secname, "SEND_ASP_UP");
+}
+
+sub updateFaultMonConfig($$$) {
+	my $configHash = shift;
+	my $param = shift;
+	my $addvalue = shift;
+
+	my $value = &getParam($configHash, "FaultMonitor", $param);
+	if($value eq "") {
+		$value = sprintf("%s", $addvalue);
+	} else {
+		$value = sprintf("%s,%s", $value, $addvalue);
+	}
+	&writeConfigVal($configHash, "FaultMonitor", $param, $value, true);
+}
+
+sub updateIgnoreForPm($$) {
+	my $configHash = shift;
+	my $addvalue = shift;
+
+	my $param = "IgnoreModulesForProcessMonitoring";
+	my $value = &getParam($configHash, "OAMAgent", $param);
+	if($value eq "") {
+		$value = sprintf("%s", $addvalue);
+	} else {
+		$value = sprintf("%s,%s", $value, $addvalue);
+	}
+	&writeConfigVal($configHash, "OAMAgent", $param, $value, true);
+}
+
+sub copyULConfigFromLegacy($$$$) {
+    my $configHash = shift;
+    my $oldsecname = shift;
+	my $newsecname = shift;
+
+
+# check if  configuration is legacy or new
+    my $legacycfg = true;
+    my $nwsyn = &getParam($configHash, $oldsecname, "ULUserName");
+    if($nwsyn eq "") {
+        $legacycfg = false;
+    }
+
+    my $prgwFmt = "ULUserName,ULPassWord,ULProducerIp,ULProducerPort,FileTransferMode,ULProducerPath";
+    &writeConfigVal($configHash, $newsecname, "syntax", $prgwFmt, true);
+    if($legacycfg) {
+
+		#User name
+		my $userName = &getParam($configHash, $oldsecname, "ULUserName");
+		my $ulPass = &getParam($configHash, $oldsecname, "ULPassWord");
+		my $ulIp = &getParam($configHash, $oldsecname, "ULProducerIp");
+		my $ulPort = &getParam($configHash, $oldsecname, "ULProducerPort");
+		my $transMode = &getParam($configHash, $oldsecname, "FileTransferMode");
+		my $prodPath = &getParam($configHash, $oldsecname, "ULProducerPath");
+		
+		my $pvalue = sprintf("%s,%s,%s,%s,%s,%s", $userName, $ulPass,$ulIp,$ulPort,$transMode,$prodPath);
+
+
+		&delParam($configHash, $oldsecname, "ULUserName");
+		&delParam($configHash, $oldsecname, "ULPassWord");
+		&delParam($configHash, $oldsecname, "ULProducerIp");
+		&delParam($configHash, $oldsecname, "ULProducerPort");
+		&delParam($configHash, $oldsecname, "FileTransferMode");
+		&delParam($configHash, $oldsecname, "ULProducerPath");
+		&writeConfigVal($configHash, $newsecname, "ULServer1", $pvalue, true);
+        
+    }
+
+}
+sub updLogRetentionPeriod($$$$$) {
+	my $configHash = shift;
+	my $key = shift;
+	my $defuseadm = shift;
+	my $defpath = shift;
+	my $defperiod = shift;
+	my $defusegzip = shift;
+
+
+	my $oldvalue;
+
+	if ($key =~ /_polaris_mlc/) {
+	# polaris log
+		my $secentriesref = &getSectionPararms($configHash, "LogsManager");
+		my @secentries = @{$secentriesref};
+		my $retentionPeriod = $gLogRetentionPeriod;
+		foreach my $parminfo (@secentries) {
+			if ($parminfo->{'name'} =~ /_polaris_mlc/) {
+				$oldvalue = $parminfo->{'value'};
+				&delParam($configHash, "LogsManager", $parminfo->{'name'});
+				last;
+			}
+		}
+	} else {
+		$oldvalue = &getParam($configHash, "LogsManager", $key);
+	}
+
+	my @entries = split(',', $oldvalue);
+
+#always use new useadm value
+	#if($entries[0] ne "") {
+	#	$defuseadm = $entries[0];	
+	#}
+
+# always new new path
+	#if($entries[1] ne "") {
+		#$defpath = $entries[1];	
+	#}
+
+	if($entries[2] ne "") {
+		$defperiod = $entries[2];	
+	}
+
+	if($entries[3] ne "") {
+		$defusegzip = $entries[3];	
+	}
+
+	my $newVal = sprintf("%s,%s,%s,%s", $defuseadm, $defpath, $defperiod, $defusegzip);
+	&writeConfigVal($configHash, "LogsManager", $key, $newVal, true);
+	return;
+}
+
+sub printInstalledComponents($$$$) {
+	my $licssts = shift;
+	my $configHash = shift;
+	my $licconfig = shift;
+	my $release = shift;
+
+	my $sstinstance = $gPrgwSstDetail{'Instance'};
+	my $pltinstance = $gPltSstDetail{'Instance'};
+	my $dateStr = strftime('%Y-%m-%d_%H:%M:%S', localtime(time));
+	my $featureFile = "/tmp/Polaris_OmniLocate_installation_report_${dateStr}.txt";
+
+	my @licapps = getLicensedAppsForSst($gPrgwSstDetail{'LicName'}, $licconfig, $pltinstance);
+	my $prgwapps = $gPrgwSstDetail{'Apps'};
+	my $nrPrbapp = @{$prgwapps}[3]; 
+	my $ltePrbapp = @{$prgwapps}[4]; 
+	my $gsmPrbapp = @{$prgwapps}[5];
+	
+	my $header = "Polaris OmniLocate Installation Report\n";
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$nrPrbapp/) {
+			$featureFile = "/tmp/Polaris_Probes_installation_report_${dateStr}.txt";
+			$header = "Polaris Probes Installation Report\n";
+		}
+	}
+
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ltePrbapp/) {
+			$featureFile = "/tmp/Polaris_Probes_installation_report_${dateStr}.txt";
+			$header = "Polaris Probes Installation Report\n";
+		}
+	}
+
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$gsmPrbapp/) {
+			$featureFile = "/tmp/Polaris_Probes_installation_report_${dateStr}.txt";
+			$header = "Polaris Probes Installation Report\n";
+		}
+	}
+
+	open(PRINTFILE, ">",$featureFile) or die "Could not open $featureFile";
+	logToFile("Installation report file:: $featureFile", LOGINFO | LOGCONS);
+	print PRINTFILE "$header";
+	print PRINTFILE "Date: ${dateStr}\n";
+	print PRINTFILE "OmniLocate Version: $release\n";
+	logToFile("Features Installed::", LOGINFO | LOGCONS);
+
+	my $lteWls = false;
+	my $nrWls = false;
+	my $gsmWls = false;
+	my $umtsWls = false;
+	my $lteEcid = false;
+	my $nrEcid = false;
+	my $gsmEcid = false;
+	my $umtsEcid = false;
+	my $lteWlsMass = false;
+	my $nrWlsMass = false;
+	my $gsmWlsMass = false;
+	my $umtsWlsMass = false;
+	my $slis = false;
+	my $tlrs = false;
+	my $elis = false;
+	my $mlrs = false;
+	my $slrFeatureEnabled = false;
+	my $secnames = &getSectionPararms($licconfig, "SECTIONS");
+	foreach my $secname (@{$secnames}) {
+		if($secname->{'name'} =~ /^LRDTpsMgmt/) {
+			my $tpskeys = &getSectionPararms($licconfig, $secname->{'name'});
+			foreach my $tpskey (@{$tpskeys}) {
+				my $tpsvalue = &getParam($licconfig, $secname->{'name'}, $tpskey->{'name'});
+				my @tpsentries = split(',', $tpsvalue);
+				if($tpsentries[0] =~ /WLS/) {
+					if($tpsentries[2] =~ /LTE/) {
+						if(($tpsentries[3] =~ /MASSDIRECT/) || ($tpsentries[3] =~ /ANY/)) {
+							$lteWlsMass = true;
+						} 
+						if($tpsentries[3] ne "MASSDIRECT") {
+							$lteWls = true;
+						}
+					}	
+					if($tpsentries[2] =~ /NR/) {
+						if(($tpsentries[3] =~ /MASSDIRECT/) || ($tpsentries[3] =~ /ANY/)) {
+							$nrWlsMass = true;
+						} 
+						if($tpsentries[3] ne "MASSDIRECT") {
+							$nrWls = true;
+						}
+					}	
+					if($tpsentries[2] =~ /GSM/) {
+						if(($tpsentries[3] =~ /MASSDIRECT/) || ($tpsentries[3] =~ /ANY/)) {
+							$gsmWlsMass = true;
+						} 
+						if($tpsentries[3] ne "MASSDIRECT") {
+							$gsmWls = true;
+						}
+					}	
+					if($tpsentries[2] =~ /UMTS/) {
+						if(($tpsentries[3] =~ /MASSDIRECT/) || ($tpsentries[3] =~ /ANY/)) {
+							$umtsWlsMass = true;
+						} 
+						if($tpsentries[3] ne "MASSDIRECT") {
+							$umtsWls = true;
+						}
+					}	
+				}
+				if($tpsentries[0] =~ /ECID/) {
+					if($tpsentries[2] =~ /LTE/) {
+						$lteEcid = true;
+					}	
+					if($tpsentries[2] =~ /NR/) {
+						$nrEcid = true;
+					}	
+					if($tpsentries[2] =~ /GSM/) {
+						$gsmEcid = true;
+					}	
+					if($tpsentries[2] =~ /UMTS/) {
+						$umtsEcid = true;
+					}	
+				}
+			}
+		} elsif($secname->{'name'} =~ /^LILCSClient_/) {
+			my $servicevalue = &getParam($licconfig, $secname->{'name'}, "Services");
+			if($servicevalue =~ /SLIS/) {
+				$slis = true;
+			}
+			if($servicevalue =~ /TLRS/) {
+				$tlrs = true;
+			}
+			if($servicevalue =~ /ELIS/) {
+				$elis = true;
+			}
+		} elsif($secname->{'name'} =~ /^ELIS/) {
+			my $featureEnabled = &getParam($licconfig, $secname->{'name'}, "SLREnabled");
+			if($featureEnabled =~ /true/) {
+				$slrFeatureEnabled = true;
+			}
+		} elsif($secname->{'name'} =~ /^LicensedLCSClients/) {
+			my $tpskeys = &getSectionPararms($licconfig, $secname->{'name'});
+			foreach my $tpskey (@{$tpskeys}) {
+				$mlrs = true;
+			}
+		}
+	}
+
+	@licapps = getLicensedAppsForSst($gOlgwSstDetail{'LicName'}, $licconfig, $pltinstance);
+	my $olgwapps = $gOlgwSstDetail{'Apps'};
+	my $olgwapp = @{$olgwapps}[0];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$olgwapp/) {
+			if($slis == true) {
+				#logToFile("\tSLIS", LOGINFO | LOGCONS);
+				#print PRINTFILE "\tSLIS\n";
+			}
+			if($tlrs == true) {
+				#logToFile("\tTLRR", LOGINFO | LOGCONS);
+				#print PRINTFILE "\tTLRR\n";
+			}
+			if($elis == true) {
+				#logToFile("\tELIS", LOGINFO | LOGCONS);
+				#print PRINTFILE "\tELIS\n";
+                if($slrFeatureEnabled == true) {
+				    logToFile("NILR-E911 Support over 4G LTE Installed", LOGINFO | LOGCONS);
+					print PRINTFILE "NILR-E911 Support over 4G LTE Installed\n";
+				    logToFile("NILR-E911 Support over 5G NR Installed", LOGINFO | LOGCONS);
+					print PRINTFILE "NILR-E911 Support over 5G NR Installed\n";
+                }
+			}
+		}
+	}	
+
+	my @licapps = getLicensedAppsForSst($gMlsSstDetail{'LicName'}, $licconfig, $pltinstance);
+	my $mlsapps = $gMlsSstDetail{'Apps'};
+	my $mlsapp = @{$mlsapps}[3];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$mlsapp/) {
+			if($mlrs == true) {
+				#logToFile("\tMLRR", LOGINFO | LOGCONS);
+				#print PRINTFILE "\tMLRR\n";
+			}
+		}
+	}	
+	
+	@licapps = getLicensedAppsForSst($gPrgwSstDetail{'LicName'}, $licconfig, $pltinstance);
+	$prgwapps = $gPrgwSstDetail{'Apps'};
+	my $prgwapp = @{$prgwapps}[0];
+	my $stsapp = @{$prgwapps}[1]; 
+	my $sshapp = @{$prgwapps}[2]; 
+	my $nrPrbapp = @{$prgwapps}[3]; 
+	my $ltePrbapp = @{$prgwapps}[4]; 
+	my $gsmPrbapp = @{$prgwapps}[5];
+	
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$prgwapp/) {
+			my $appinstance = &getAppInstanceId($gPrgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			my $prgwInstLmlSpecificSec = sprintf("PRGW:PRGWAgent:%d:%d", $sstinstance, $appinstance);
+			my $pllInstanceExist = &getParam($licconfig, "UL_INSTANCES", $prgwInstLmlSpecificSec);
+			if($pllInstanceExist ne "") {
+				if ($pllInstanceExist eq "PGL") {
+					if($gsmWls eq true) {
+						#logToFile("\tGSM WLS AND ECID ($pllInstanceExist)", LOGINFO | LOGCONS);
+						#print PRINTFILE "\tGSM WLS AND ECID ($pllInstanceExist)\n";
+					}
+				} elsif ($pllInstanceExist eq "PUL") {
+					if($umtsWls eq true) {
+						#logToFile("\tUMTS WLS AND ECID ($pllInstanceExist)", LOGINFO | LOGCONS);
+						#print PRINTFILE "\tUMTS WLS AND ECID ($pllInstanceExist)\n";
+					}
+				} elsif ($pllInstanceExist eq "PLL") {
+					if($lteWls eq true) {
+						#logToFile("\tLTE WLS AND ECID ($pllInstanceExist)", LOGINFO | LOGCONS);
+						#print PRINTFILE "\tLTE WLS AND ECID ($pllInstanceExist)\n";
+					}
+				} elsif ($pllInstanceExist eq "PNL") {
+					if($nrWls eq true) {
+						#logToFile("\tNR WLS AND ECID ($pllInstanceExist)", LOGINFO | LOGCONS);
+						#print PRINTFILE "\tNR WLS AND ECID ($pllInstanceExist)\n";
+					}
+				} 
+				next;
+			}
+			$pllInstanceExist = &getParam($licconfig, "PRGW_INSTANCES", $prgwInstLmlSpecificSec);
+			if($pllInstanceExist ne "") {
+				if ($pllInstanceExist eq "NR-PW") {
+					#logToFile("\tNR PRGW (PRGW using Polaris NR Probe)", LOGINFO | LOGCONS);
+					#print PRINTFILE "\tNR PRGW (PRGW using Polaris NR Probe)\n";
+				} elsif ($pllInstanceExist eq "LTE-PW") {
+					#logToFile("\tLTE PRGW (PRGW using Polaris LTE Probe)", LOGINFO | LOGCONS);
+					#print PRINTFILE "\tLTE PRGW (PRGW using Polaris LTE Probe)\n";
+				} elsif ($pllInstanceExist eq "LTE") {
+					#logToFile("\tLTE PRGW (PRGW using Keysight LTE Probe)", LOGINFO | LOGCONS);
+					#print PRINTFILE "\tLTE PRGW (PRGW using Keysight LTE Probe)\n";
+				} 
+				next;
+			}
+		} elsif($licapp =~ /$stsapp/) { 
+			#my $mac = &getParam($licconfig, "PRGW_IMS_POLARIS_SETTINGS", "MacAddress");
+			#if($mac ne "") {
+				#logToFile("\tVoLTE", LOGINFO | LOGCONS);
+				#print PRINTFILE "\tVoLTE\n";
+			#}
+			#$mac = &getParam($licconfig, "PRGW_IMS_POLARIS_SETTINGS", "S8Interface.1.MacAddress");
+			#if($mac ne "") {
+			#	logToFile("VoLTE Inbound Roamer Support", LOGINFO | LOGCONS);
+			#	print PRINTFILE "VoLTE Inbound Roamer Support\n";
+			#}
+			logToFile("VoLTE Inbound Roamer Support", LOGINFO | LOGCONS);
+			print PRINTFILE "VoLTE Inbound Roamer Support\n";
+		}
+	}
+
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$nrPrbapp/) {
+			logToFile("Polaris NR Probe Installed", LOGINFO | LOGCONS);
+			print PRINTFILE "Polaris NR Probe Installed\n";
+		}
+	}
+
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ltePrbapp/) {
+			logToFile("Polaris LTE Probe Installed", LOGINFO | LOGCONS);
+			print PRINTFILE "Polaris LTE Probe Installed\n";
+		}
+	}
+
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$gsmPrbapp/) {
+			logToFile("Polaris GSM Probe Installed", LOGINFO | LOGCONS);
+			print PRINTFILE "Polaris GSM Probe Installed\n";
+		}
+	}
+
+
+	@licapps = getLicensedAppsForSst($gSgwSstDetail{'LicName'}, $licconfig, $pltinstance);
+	my $sgwapps = $gSgwSstDetail{'Apps'};
+	my $sgwapp = @{$sgwapps}[0];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$sgwapp/) {
+			my $appinstance = &getAppInstanceId($gSgwSstDetail{'LicName'}, $licapp, $licconfig, $pltinstance, $sstinstance);
+			my $prgwInstLmlSpecificSec = sprintf("SGW:SGWApp:%d:%d", $sstinstance, $appinstance);
+			my $sgwInstance = &getParam($licconfig, "SGWUserInfo", $prgwInstLmlSpecificSec);
+			if($sgwInstance ne "") {
+				if ($sgwInstance eq "SGWN") {
+					if($nrWls eq true) {
+						#logToFile("\t5G WLS ($sgwInstance: SGW for 5G LI)", LOGINFO | LOGCONS);
+						#print PRINTFILE "\t5G WLS ($sgwInstance: SGW for 5G LI)\n";
+					}
+				} elsif ($sgwInstance eq "SGWL") {
+					if($lteWls eq true) {
+						#logToFile("\t4G WLS ($sgwInstance: SGW for 4G LI)", LOGINFO | LOGCONS);
+						#print PRINTFILE "\t4G WLS ($sgwInstance: SGW for 4G LI)\n";
+					}
+				} elsif ($sgwInstance eq "SGWU") {
+					if($umtsWls eq true) {
+						#logToFile("\t3G WLS ($sgwInstance: SGW for 3G LI)", LOGINFO | LOGCONS);
+						#print PRINTFILE "\t3G WLS ($sgwInstance: SGW for 3G LI)\n";
+					}
+	            } elsif ($sgwInstance =~ /SGWG/) {
+					if($gsmWls eq true) {
+						#logToFile("\t2G WLS ($sgwInstance: SGW for 2G LI)", LOGINFO | LOGCONS);
+						#print PRINTFILE "\t2G WLS ($sgwInstance: SGW for 2G LI)\n";
+					}
+				} elsif ($sgwInstance eq "PRAN") {
+					if($nrWlsMass eq true) {
+						#logToFile("\t5G WLS ($sgwInstance: SGW for 5G Mass)", LOGINFO | LOGCONS);
+						#print PRINTFILE "\t5G WLS ($sgwInstance: SGW for 5G Mass)\n";
+					}
+				} elsif ($sgwInstance eq "PRAL") {
+					if($lteWlsMass eq true) {
+						#logToFile("\t4G WLS ($sgwInstance: SGW for 4G Mass)", LOGINFO | LOGCONS);
+						#print PRINTFILE "\t4G WLS ($sgwInstance: SGW for 4G Mass)\n";
+					}
+				} 
+				next;
+			}
+		}
+	}
+	@licapps = getLicensedAppsForSst($gLdsSstDetail{'LicName'}, $licconfig, $pltinstance);
+	my $ldsapps = $gLdsSstDetail{'Apps'};
+	my $ldsapp = @{$ldsapps}[8];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ldsapp/) {
+			if($nrWlsMass eq true) {
+				#logToFile("\t5G WLS (Policy Manager for 5G Mass)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t5G WLS (Policy Manager for 5G Mass)\n";
+			}
+			if($nrWls eq true) {
+				#logToFile("\t5G WLS (Policy Manager for 5G LI)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t5G WLS (Policy Manager for 5G LI)\n";
+			}
+			if($nrEcid eq true) {
+				logToFile("5G-SA Front-End CID Installed", LOGINFO | LOGCONS);
+				print PRINTFILE "5G-SA Front-End CID Installed\n";
+			}
+
+
+			if($lteWlsMass eq true) {
+				#logToFile("\t4G WLS (Policy Manager for 4G Mass)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t4G WLS (Policy Manager for 4G Mass)\n";
+			} 
+			if($lteWls eq true) {
+				#logToFile("\t4G WLS (Policy Manager for 4G LI)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t4G WLS (Policy Manager for 4G LI)\n";
+			}
+			if($lteEcid eq true) {
+				#logToFile("\t4G ECID (Policy Manager for 4G LI)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t4G ECID (Policy Manager for 4G LI)\n";
+			}
+
+			last;
+		}
+	}
+
+	$ldsapp = @{$ldsapps}[0];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ldsapp/) {
+			if($gsmWlsMass eq true) {
+				#logToFile("\t2G WLS (Policy Manager for 2G Mass)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t2G WLS (Policy Manager for 2G Mass)\n";
+			}
+			if($gsmWls eq true) {
+				#logToFile("\t2G WLS (Policy Manager for 2G LI)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t2G WLS (Policy Manager for 2G LI)\n";
+			}
+			if($gsmEcid eq true) {
+				#logToFile("\t2G ECID (Policy Manager for 2G LI)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t2G ECID (Policy Manager for 2G LI)\n";
+			}
+
+
+			if($umtsWlsMass eq true) {
+				#logToFile("\t3G WLS (Policy Manager for 3G Mass)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t3G WLS (Policy Manager for 3G Mass)\n";
+			} 
+			if($umtsWls eq true) {
+				#logToFile("\t3G WLS (Policy Manager for 3G LI)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t3G WLS (Policy Manager for 3G LI)\n";
+			}
+			if($umtsEcid eq true) {
+				#logToFile("\t3G ECID (Policy Manager for 3G LI)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t3G ECID (Policy Manager for 3G LI)\n";
+			}
+
+			last;
+		}
+	}
+
+	my $ldsapp = @{$ldsapps}[4];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ldsapp/) {
+			if($gsmWlsMass eq true) {
+				#logToFile("\t2G WLS (Location Engine for 2G Mass)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t2G WLS (Location Engine for 2G Mass)\n";
+			} 
+			if($gsmWls eq true) {
+				#logToFile("\t2G WLS (Location Engine for 2G LI)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t2G WLS (Location Engine for 2G LI)\n";
+			}
+			last;
+		}
+	}
+
+	my $ldsapp = @{$ldsapps}[5];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ldsapp/) {
+			if($umtsWlsMass eq true) {
+				#logToFile("\t3G WLS (Location Engine for 3G Mass)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t3G WLS (Location Engine for 3G Mass)\n";
+			} 
+			if($umtsWls eq true) {
+				#logToFile("\t3G WLS (Location Engine for 3G LI)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t3G WLS (Location Engine for 3G LI)\n";
+			}
+			last;
+		}
+	}
+
+	my $ldsapp = @{$ldsapps}[6];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ldsapp/) {
+			if($lteWlsMass eq true) {
+				#logToFile("\t4G WLS (Location Engine for 4G Mass)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t4G WLS (Location Engine for 4G Mass)\n";
+			} 
+			if($lteWls eq true) {
+				#logToFile("\t4G WLS (Location Engine for 4G LI)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t4G WLS (Location Engine for 4G LI)\n";
+			}
+			last;
+		}
+	}
+
+	my $ldsapp = @{$ldsapps}[11];
+	foreach my $licapp (@licapps) {
+		if($licapp =~ /$ldsapp/) {
+			if($nrWlsMass eq true || $nrWls eq true) {
+				logToFile("5G-SA WLS Installed", LOGINFO | LOGCONS);
+				print PRINTFILE "5G-SA WLS Installed";
+			} 
+			if($nrWls eq true) {
+				#logToFile("\t5G WLS (Location Engine for 5G LI)", LOGINFO | LOGCONS);
+				#print PRINTFILE "\t5G WLS (Location Engine for 5G LI)\n";
+			}
+			last;
+		}
+	}
+}
+
+sub main()
+{
+
+	$ENV{PATH} = "/sbin:/bin:/usr/bin";
+	Start();
+}
+
+main();
+
+

@@ -1,0 +1,982 @@
+========================================================================
+MLCCN Upgrade — Parallel Dispatch Log
+Command  : ./MLCCN_Install_R12.4.1.26 -c=config upgrade
+Nodes    : 40
+Started  : Tue Apr 28 09:00:00 PDT 2026
+========================================================================
+
+PARALLEL: dispatching upgrade to 40 node(s) concurrently
+
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] LMF_26 (10.44.111.101) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.101 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] LMF_27 (10.44.111.102) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.102 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] LMF_28 (10.44.111.103) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.103 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] LMF_29 (10.44.111.104) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.104 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] LMF_30 (10.44.111.105) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.105 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] LMF_31 (10.44.111.106) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.106 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] LMF_32 (10.44.111.107) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.107 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] LMF_33 (10.44.111.108) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.108 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] LMF_34 (10.44.111.109) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.109 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] LMF_35 (10.44.111.110) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.110 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] OLGW_01 (10.44.110.101) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.101 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] OLGW_02 (10.44.110.102) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.102 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] OLGW_03 (10.44.110.103) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.103 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] OLGW_04 (10.44.110.104) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.104 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] OLGW_05 (10.44.110.105) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.105 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] OLGW_06 (10.44.110.106) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.106 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] OLGW_07 (10.44.110.107) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.107 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] OLGW_08 (10.44.110.108) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.108 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] OLGW_09 (10.44.110.109) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.109 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] OLGW_10 (10.44.110.110) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.110 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] OLGW_11 (10.44.110.111) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.111 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] OLGW_12 (10.44.110.112) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.112 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] OLGW_13 (10.44.110.113) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.113 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] OLGW_14 (10.44.110.114) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.114 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] OLGW_15 (10.44.110.115) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.115 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] PRGW_16 (10.55.110.101) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.101 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] PRGW_17 (10.55.110.102) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.102 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] PRGW_18 (10.55.110.103) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.103 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] PRGW_19 (10.55.110.104) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.104 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] PRGW_20 (10.55.110.105) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.105 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] PRGW_21 (10.55.110.106) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.106 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] PRGW_22 (10.55.110.107) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.107 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] PRGW_23 (10.55.110.108) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.108 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] PRGW_24 (10.55.110.109) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.109 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] PRGW_25 (10.55.110.110) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.110 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] SGW_36 (10.44.112.101) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.112.101 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] SGW_37 (10.44.112.102) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.112.102 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] SGW_38 (10.44.112.103) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.112.103 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] SGW_39 (10.44.112.104) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.112.104 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+[Tue Apr 28 09:00:00 PDT 2026] <=========================================================>
+[Tue Apr 28 09:00:00 PDT 2026] SGW_40 (10.44.112.105) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.112.105 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.111.107:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.111.108:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.111.109:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.105:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.106:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.109:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.111:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.114:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.55.110.101:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.55.110.102:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.55.110.110:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.112.105:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.111.101:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.111.103:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.111.104:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.111.110:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.102:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.104:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.108:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.110:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.112:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.55.110.103:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.55.110.104:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.55.110.105:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.55.110.107:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.55.110.109:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.112.101:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.112.102:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.112.104:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.111.102:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.111.105:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.111.106:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.101:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.103:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.107:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.113:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.115:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.55.110.106:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.55.110.108:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.112.103:/tmp/.install" root password 120
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.101 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.104 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.111 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.101 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.107 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.112.104 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.104 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.101 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.103 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.110 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.112.103 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.105 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.102 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.106 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.102 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.102 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.112 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.104 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.103 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.115 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.107 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.112.105 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.106 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.103 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.113 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.106 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.114 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.112.102 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.105 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.108 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.108 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.109 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.110 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.112.101 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.109 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.105 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.108 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.107 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.109 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output:: Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.110 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.101:12345 upgrade"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:17.txt
+Release 12.4.1.27 successfully activated
+OLGW_04 (10.44.110.104) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.104 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:20.txt
+Release 12.4.1.27 successfully activated
+OLGW_01 (10.44.110.101) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.101 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+SGW: in progress
+SGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:26.txt
+Release 12.4.1.27 successfully activated
+SGW_40 (10.44.112.105) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.112.105 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:28.txt
+Release 12.4.1.27 successfully activated
+OLGW_03 (10.44.110.103) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.103 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+PRGW: in progress
+PRGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:31.txt
+Release 12.4.1.27 successfully activated
+PRGW_17 (10.55.110.102) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.102 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+SGW: in progress
+SGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:31.txt
+Release 12.4.1.27 successfully activated
+SGW_37 (10.44.112.102) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.112.102 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output:: Done
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+LMF: in progress
+LMF: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:40.txt
+Release 12.4.1.27 successfully activated
+LMF_35 (10.44.111.110) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.110 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+LMF: in progress
+LMF: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:42.txt
+Release 12.4.1.27 successfully activated
+LMF_26 (10.44.111.101) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.101 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+LMF: in progress
+LMF: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:42.txt
+Release 12.4.1.27 successfully activated
+LMF_33 (10.44.111.108) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.108 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+PRGW: in progress
+PRGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:42.txt
+Release 12.4.1.27 successfully activated
+PRGW_16 (10.55.110.101) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.101 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:43.txt
+Release 12.4.1.27 successfully activated
+OLGW_13 (10.44.110.113) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.113 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:44.txt
+Release 12.4.1.27 successfully activated
+OLGW_10 (10.44.110.110) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.110 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+PRGW: in progress
+PRGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:44.txt
+Release 12.4.1.27 successfully activated
+PRGW_20 (10.55.110.105) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.105 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+PRGW: in progress
+PRGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:44.txt
+Release 12.4.1.27 successfully activated
+PRGW_24 (10.55.110.109) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.109 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output:: Done
+Command output:: Done
+Command output:: Done
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+LMF: in progress
+LMF: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:48.txt
+Release 12.4.1.27 successfully activated
+LMF_29 (10.44.111.104) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.104 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:48.txt
+Release 12.4.1.27 successfully activated
+OLGW_02 (10.44.110.102) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.102 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:49.txt
+Release 12.4.1.27 successfully activated
+OLGW_15 (10.44.110.115) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.115 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+PRGW: in progress
+PRGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:50.txt
+Release 12.4.1.27 successfully activated
+PRGW_19 (10.55.110.104) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.104 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+PRGW: in progress
+PRGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:50.txt
+Release 12.4.1.27 successfully activated
+PRGW_21 (10.55.110.106) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.106 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+LMF: in progress
+LMF: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:51.txt
+Release 12.4.1.27 successfully activated
+LMF_27 (10.44.111.102) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.102 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+SGW: in progress
+SGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:51.txt
+Release 12.4.1.27 successfully activated
+SGW_38 (10.44.112.103) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.112.103 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+LMF: in progress
+LMF: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:52.txt
+Release 12.4.1.27 successfully activated
+LMF_34 (10.44.111.109) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.109 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+SGW: in progress
+SGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:53.txt
+Release 12.4.1.27 successfully activated
+SGW_39 (10.44.112.104) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.112.104 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:54.txt
+Release 12.4.1.27 successfully activated
+OLGW_06 (10.44.110.106) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.106 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output:: Done
+Command output:: Done
+Command output:: Done
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:57.txt
+Release 12.4.1.27 successfully activated
+OLGW_12 (10.44.110.112) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.112 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+PRGW: in progress
+PRGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:59.txt
+Release 12.4.1.27 successfully activated
+PRGW_22 (10.55.110.107) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.107 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+PRGW: in progress
+PRGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:01:59.txt
+Release 12.4.1.27 successfully activated
+PRGW_23 (10.55.110.108) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.108 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:02:02.txt
+Release 12.4.1.27 successfully activated
+OLGW_11 (10.44.110.111) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.111 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+LMF: in progress
+LMF: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:02:04.txt
+Release 12.4.1.27 successfully activated
+LMF_30 (10.44.111.105) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.105 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:02:06.txt
+Release 12.4.1.27 successfully activated
+OLGW_08 (10.44.110.108) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.108 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:02:06.txt
+Release 12.4.1.27 successfully activated
+OLGW_14 (10.44.110.114) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.114 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output:: Done
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+PRGW: in progress
+PRGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:02:13.txt
+Release 12.4.1.27 successfully activated
+PRGW_18 (10.55.110.103) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.103 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+PRGW: in progress
+PRGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:02:17.txt
+Release 12.4.1.27 successfully activated
+PRGW_25 (10.55.110.110) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.110 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+LMF: in progress
+LMF: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:02:18.txt
+Release 12.4.1.27 successfully activated
+LMF_31 (10.44.111.106) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.106 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+LMF: in progress
+LMF: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:02:21.txt
+Release 12.4.1.27 successfully activated
+LMF_32 (10.44.111.107) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.107 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+LMF: in progress
+LMF: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:02:23.txt
+Release 12.4.1.27 successfully activated
+LMF_28 (10.44.111.103) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.111.103 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:02:23.txt
+Release 12.4.1.27 successfully activated
+OLGW_05 (10.44.110.105) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.105 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output:: Done
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:02:28.txt
+Release 12.4.1.27 successfully activated
+OLGW_09 (10.44.110.109) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.109 root password 30 "rm -rf /tmp/.install"
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:02:29.txt
+Release 12.4.1.27 successfully activated
+OLGW_07 (10.44.110.107) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.107 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+Command output:: Done
+Command output::
+Upgrade Path: /Disk/home/polaris/mlccn
+Upgrading to Release 12.4.1.27 ...
+PLT: in progress
+PLT: done
+SGW: in progress
+SGW: done
+Release 12.4.1.27 successfully upgraded
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_09:02:31.txt
+Release 12.4.1.27 successfully activated
+SGW_36 (10.44.112.101) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.112.101 root password 30 "rm -rf /tmp/.install"
+Command output:: Done
+
+========================================================================
+PARALLEL: all 40 node(s) completed upgrade successfully
+
+── Timing Summary ──────────────────────────────────────────────────────
+  Mode            Elapsed
+  Sequential      4704s   (1h 18m 24s)
+  Parallel        155s   (2m 35s)
+  Time saved      4549s  (1h 15m 49s)  — 96.7% reduction
+  Slowest node    SGW_36 (10.44.112.101)  155s
+  Fastest node    OLGW_04  79s
+  Avg per node    117s  (1m 57s)
+========================================================================

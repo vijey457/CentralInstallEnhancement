@@ -1,0 +1,78 @@
+[Tue Apr 28 00:44:00 PDT 2026] <=========================================================>
+OLGW (10.44.110.154) STATUS: Begin
+[Tue Apr 28 00:44:00 PDT 2026] <=========================================================>
+LMF (10.44.110.156) STATUS: Begin
+[Tue Apr 28 00:44:00 PDT 2026] <=========================================================>
+PRGW (10.55.110.6) STATUS: Begin
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.154 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+Command output::
+Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.6 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+Command output::
+Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.156 root password 30 "rm -rf /tmp/.install; mkdir -p /tmp/.install"
+Command output::
+Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.154:/tmp/.install" root password 120
+Command output::
+Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.55.110.6:/tmp/.install" root password 120
+Command output::
+Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.6 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.154:12345 upgrade"
+Command output::
+ 
+Upgrade Path: /Disk/home/polaris/mlccn
+FATAL;No software release available. Run installFATAL;
+
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.55.110.6 root password 30 "rm -rf /tmp/.install"
+Command output::
+Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py cmd "scp -r /Disk/124127/MLCCN_X86_64_RELEASE_R12.4.1.27 root@10.44.110.156:/tmp/.install" root password 120
+Command output::
+Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.156 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.154:12345 upgrade"
+Command output::
+ 
+Upgrade Path: /Disk/home/polaris/mlccn
+FATAL;No software release available. Run installFATAL;
+
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.156 root password 30 "rm -rf /tmp/.install"
+Command output::
+Done
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.154 root password 300 "cd /tmp/.install/MLCCN_X86_64_RELEASE_R12.4.1.27; ./MLCCN_Install_R12.4.1.26 -a=10.44.110.154:12345 upgrade"
+Command output::
+ 
+Upgrade Path: /Disk/home/polaris/mlccn
+Licensed subsystems are: OLGW SGW
+Installation Path: /Disk/home/polaris/mlccn
+Set up in progress ...
+PLT: in progress
+PLT: done
+OLGW: in progress
+OLGW: done
+SGW: in progress
+SGW: done
+
+MLCCN successfully configured
+MLCCN successfully upgraded to release 12.4.1.27
+Installation report file:: /tmp/Polaris_OmniLocate_installation_report_2026-04-28_00:44:10.txt
+Features Installed::
+Use "activate" option to activate release 12.4.1.27
+
+OLGW (10.44.110.154) STATUS: Completed
+Command input::
+PLT_X86_64_RELEASE_R12.4.1.27/query_mlc.py ssh 10.44.110.154 root password 30 "rm -rf /tmp/.install"
+Command output::
+Done
