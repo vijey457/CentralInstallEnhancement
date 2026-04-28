@@ -1,0 +1,26 @@
+# Ignore temporary and backup files
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+*.DS_Store
+Thumbs.db
+
+# Ignore editor temporary folders
+.vscode/*
+!.vscode/settings.json
+
+# Ignore backup directories and generated install artifacts
+bkp_*
+*.cache
+
+# Ignore OS-specific files
+Desktop.ini
+
+# Ignore Mac Finder metadata
+.AppleDouble
+.LSOverride
+
+# Ignore other common unwanted files
+*.~*
